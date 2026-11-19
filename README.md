@@ -795,13 +795,6 @@ uv run python benchmarks/bench.py
 The browser tests skip when no browser is available; the shared-store tests use
 an in-process fake Redis server. The test suite also runs on Python 3.11.
 
-**Compiling the core.** `uv run python scripts/compile.py` compiles the core
-(`vdom`, `element`, `ssr`, `hooks`) with mypyc in place, which makes rendering and
-updates 1.5-1.7x faster; `--clean` returns to plain Python. It needs a C compiler.
-Compiled modules take precedence over their `.py` files, so compile again after
-editing one; pyreaction logs a warning when a compiled module is older than its
-source. The tests pass either way.
-
 ```
 src/reaction/
   core/       elements, hooks, components, the virtual DOM (vdom.py) and HTML rendering

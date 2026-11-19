@@ -6,9 +6,5 @@ dist/
 wheels/
 *.egg-info
 
-# Compiled with scripts/compile.py (mypyc)
-*.so
-*.pyd
-
 # Virtual environments
 .venv

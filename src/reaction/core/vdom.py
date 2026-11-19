@@ -46,7 +46,6 @@ from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qs
 
-from ._compiled import python_class
 from .element import FRAGMENT, PORTAL, RAW_HTML, RAW_MARK, Component, Element, JsComponent
 from .hooks import ACTIVE_ROOT, BROWSER_ONLY, CURRENT, CURRENT_ACTION, BrowserOnly, Context, EffectSlot, Suspended, same
 
@@ -184,7 +183,6 @@ class ComponentNode:
         return getattr(self.type, "__name__", str(self.type))
 
 
-@python_class
 class Event(dict):
     """Event data from the browser. Keys read as attributes: ``e.value``, ``e.target.checked``.
 

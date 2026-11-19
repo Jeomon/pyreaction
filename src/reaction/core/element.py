@@ -12,8 +12,6 @@ import inspect
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
-from ._compiled import python_class
-
 if TYPE_CHECKING:
     from ._html_types import (
         ATag,
@@ -712,7 +710,6 @@ class _Html:
 html = _Html()
 
 
-@python_class
 class Component:
     """A render function turned into an element factory by :func:`component`."""
 
@@ -748,7 +745,6 @@ def memo(fn: Callable[..., Any] | Component) -> Component:
     return Component(fn.fn if isinstance(fn, Component) else fn, memo=True)
 
 
-@python_class
 class JsComponent:
     """A JavaScript module drawn inside an element; made by :func:`js_component`."""
 
