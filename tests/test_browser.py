@@ -695,3 +695,24 @@ def test_page_keeps_retrying_without_a_limit_in_chrome(page):
     page.wait_for_selector("html[data-pyreaction-offline]", state="attached", timeout=10000)
     page.wait_for_timeout(2000)
     assert page.query_selector("#pyreaction-lost") is None, "the default retries for as long as the page is open"
+
+
+def test_markup_that_differs_is_rebuilt_from_the_server_in_chrome(page):
+    import itertools
+
+    renders = itertools.count()
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        # Differs between the page's HTML and the live render, like a clock would.
+        return html.div(html.p(f"render {next(renders)}", id="which"),
+                        html.button(f"n={n}", id="inc", on_click=lambda: set_n(n + 1)))
+
+    # handoff_timeout=0: the live connection renders again, so the render differs.
+    with serve(App, resume_timeout=0, handoff_timeout=0) as server:
+        open_page(page, server)
+        page.wait_for_function("document.querySelector('#pyreaction-root').dataset.hydration === 'rebuilt'")
+        assert page.text_content("#which") != "render 0", "the live render, not the HTML"
+        page.click("#inc")
+        page.wait_for_function("document.querySelector('#inc').textContent === 'n=1'")

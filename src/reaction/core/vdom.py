@@ -159,8 +159,9 @@ class ComponentNode:
         self.dirty = False
         self.mounted = True
         self.value: Any = element.kwargs.get("value") if isinstance(element.type, Context) else None
-        self.subscribers: set[ComponentNode] = set()
-        self.subscriptions: list[ComponentNode] = []
+        # Context links, made on first use: most components have none.
+        self.subscribers: set[ComponentNode] | None = None
+        self.subscriptions: list[ComponentNode] | None = None
         # Set by an error boundary: receives errors thrown while rendering its descendants.
         self.catch: Callable[[BaseException], None] | None = None
         # Set by a Suspense boundary: told when a descendant waits for data, and
@@ -662,6 +663,18 @@ class Root:
             self._queue = asyncio.Queue()
             self.spawn(self._work())
         self._render_dirty()
+        self._sink = sink
+        self._send_tree("hydrate" if hydrate else "replace")
+        self._run_effects()
+        self._render_browser_only()
+        if self._dirty or self.ops or self._nav or self._errors or self._title_dirty or self._head_dirty:
+            self.flush()
+
+    def _send_tree(self, init: str, rebuild: bool = False) -> None:
+        """Send the whole tree: ``"replace"`` builds it in the browser; ``"hydrate"``
+        lets the browser adopt the matching HTML it already has, so the structure
+        (which node is inside which) is left out."""
+        assert self._sink is not None
         # Operations so far only built the tree; the snapshot replaces them.
         # Element commands made before now still have to run, unless their caller
         # already gave up waiting for the answer.
@@ -671,14 +684,11 @@ class Root:
             self._title_dirty = True
         if self._head or self._resources:
             self._head_dirty = True
-        message = self._message(self.snapshot() + commands)
-        message["init"] = "hydrate" if hydrate else "replace"
-        self._sink = sink
-        sink(message)
-        self._run_effects()
-        self._render_browser_only()
-        if self._dirty or self.ops or self._nav or self._errors or self._title_dirty or self._head_dirty:
-            self.flush()
+        message = self._message(self.snapshot(structure=init != "hydrate") + commands)
+        message["init"] = init
+        if rebuild:
+            message["rebuild"] = True  # the same session: the browser keeps its event numbers
+        self._sink(message)
 
     def detach(self) -> None:
         """Stop sending: the connection dropped. State, queued events and background
@@ -697,6 +707,7 @@ class Root:
         for child in self.container.children:
             self._unmount(child, emit=False)
         self.container.children = []
+        self.ops = []  # operations never sent, e.g. a first-HTML render's
         for task in list(self._tasks):
             task.cancel()
         replies, self._replies = self._replies, {}
@@ -704,12 +715,19 @@ class Root:
             if not future.done():
                 future.set_exception(ConnectionError("the page closed"))
 
-    def snapshot(self) -> list[list[Any]]:
+    def snapshot(self, structure: bool = True) -> list[list[Any]]:
         """Operations that build the current tree from nothing, in document order.
 
         Portals come last, after the page's own tree, since their content lives
-        elsewhere in the document and is not part of the server's HTML.
+        elsewhere in the document and is not part of the server's HTML. Without
+        ``structure`` the ``"A"`` operations that put nodes inside their parents are
+        left out: enough for a browser adopting HTML that already has them.
         """
+        with _gc_paused():  # allocates a list per node: collections here only slow it down
+            ops = self._snapshot()
+        return ops if structure else [op for op in ops if op[0] != "A"]
+
+    def _snapshot(self) -> list[list[Any]]:
         ops: list[list[Any]] = []
         portals: list[HostNode] = []
 
@@ -1400,6 +1418,10 @@ class Root:
             if self.debug:
                 self._errors.append("Warning: " + message + " (does a component read the time or a random number?)")
                 self.request_flush()
+            if self._sink is not None:
+                # The hydrate message had no structure to rebuild from: send all of it.
+                self._render_dirty()
+                self._send_tree("replace", rebuild=True)
         # "#ping" keeps proxies from closing an idle connection; nothing to do.
 
     def _after_handler(self, seq: int, result: Any) -> asyncio.Task[Any] | None:
@@ -1617,7 +1639,7 @@ class Root:
                 value = item.kwargs.get("value")
                 if not same(value, node.value):
                     node.value = value
-                    for sub in list(node.subscribers):
+                    for sub in list(node.subscribers or ()):
                         self.schedule(sub)
             children = item.children
         ops_before = len(self.ops)
@@ -1772,6 +1794,7 @@ class Root:
             self._release_ref(node)
             for child in node.children:
                 self._unmount(child, emit=False)
+            node.children = []  # no parent <-> child cycle left for the garbage collector
             return
         node.mounted = False
         node.dirty = False
@@ -1786,11 +1809,19 @@ class Root:
                     slot.dispose()
                 except Exception as exc:
                     self.report(exc, f"unmounting {node.name}")
-        for provider in node.subscriptions:
-            provider.subscribers.discard(node)
+        for provider in node.subscriptions or ():
+            if provider.subscribers is not None:
+                provider.subscribers.discard(node)
         self._location_subs.discard(node)
         if self._head.pop(node, None) is not None:
             self._head_dirty = True
+        # Hook slots hold closures over this node, and children point back at it:
+        # dropping them lets reference counting free the subtree at once, instead of
+        # leaving hundreds of thousands of objects for the cycle collector.
+        node.children = []
+        node.hooks = []
+        node.subscriptions = None
+        node.subscribers = None
 
     # ---- tree helpers ----------------------------------------------------------
 

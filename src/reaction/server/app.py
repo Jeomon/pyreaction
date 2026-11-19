@@ -14,7 +14,6 @@ import base64
 import hashlib
 import hmac
 import inspect
-import json
 import logging
 import re
 import secrets
@@ -27,6 +26,7 @@ from string import Template
 from typing import Any
 from urllib.parse import urlsplit
 
+import orjson
 from starlette.applications import Starlette
 from starlette.requests import HTTPConnection, Request
 from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
@@ -37,9 +37,9 @@ from starlette.websockets import WebSocket
 from ..core.element import Component, Element
 from ..core.vdom import Root, UploadedFile
 from ..core.ssr import render_children, render_portals, render_to_string
-from .settings import UNSET, resolve
-
 from .encoding import dumps as _dumps
+from .encoding import loads as _loads
+from .settings import UNSET, resolve
 
 __all__ = ["create_app", "embed", "jinja_components", "mount", "page", "prerender", "run", "wrap"]
 
@@ -50,6 +50,11 @@ CLIENT_JS = CLIENT_DIR / "client.js"
 # $-placeholders rather than str.format, so the HTML and CSS need no brace escaping.
 PAGE = Template((CLIENT_DIR / "index.html").read_text(encoding="utf-8"))
 STYLE = (CLIENT_DIR / "style.css").read_text(encoding="utf-8")
+
+# An app that sets no icon gets an empty one, so the browser does not ask for
+# /favicon.ico, which would render the whole app as a page.
+_ICON = re.compile(r"""<link\b[^>]*\brel\s*=\s*["']?[^"'>]*\bicon\b""", re.IGNORECASE)
+_NO_ICON = '<link rel="icon" href="data:,">\n'
 
 # Close code for "the browser is not keeping up": it reconnects with a fresh session.
 TRY_AGAIN_LATER = 1013
@@ -192,7 +197,7 @@ def _origin_allowed(conn: HTTPConnection, allowed: Sequence[str]) -> bool:
 
 def _parse_event(text: str) -> tuple[int, int, str, dict[str, Any]] | None:
     try:
-        message = json.loads(text)
+        message = _loads(text)
     except ValueError:
         return None
     if not (isinstance(message, list) and len(message) == 4):
@@ -226,7 +231,7 @@ def _parse_frame(frame: bytes) -> tuple[dict[str, Any], bytes] | None:
     if n > _MAX_HEADER or len(frame) < 4 + n:
         return None
     try:
-        header = json.loads(frame[4 : 4 + n])
+        header = _loads(frame[4 : 4 + n])
     except ValueError:
         return None
     if not isinstance(header, dict) or not isinstance(header.get("u"), str):
@@ -235,6 +240,23 @@ def _parse_frame(frame: bytes) -> tuple[dict[str, Any], bytes] | None:
     if len(data) > UPLOAD_CHUNK:
         return None
     return header, data
+
+
+class _Handoff:
+    """A first-HTML render kept for its page's live connection (see ``handoff_timeout``)."""
+
+    __slots__ = ("root", "timer", "loop", "cookie", "url", "base")
+
+    def __init__(
+        self, root: Root, timer: asyncio.TimerHandle, loop: asyncio.AbstractEventLoop,
+        cookie: str | None, url: str, base: str,
+    ) -> None:
+        self.root = root
+        self.timer = timer
+        self.loop = loop
+        self.cookie = cookie
+        self.url = url
+        self.base = base
 
 
 class _Uploads:
@@ -357,6 +379,8 @@ def create_app(
     reconnect_max: int = UNSET,
     reconnect_attempts: int = UNSET,
     resume_timeout: float = UNSET,
+    handoff_timeout: float = UNSET,
+    max_handoffs: int = UNSET,
     debug: bool = UNSET,
 ) -> Starlette:
     """An ASGI app serving ``app`` on every GET path.
@@ -391,10 +415,16 @@ def create_app(
     says the connection was lost, with a button to reload. ``debug`` shows errors
     in the browser.
 
+    A page's first HTML is rendered once, and its live connection takes over that
+    render instead of rendering again, when it connects within ``handoff_timeout``
+    seconds (0: always render again) from the same browser (same cookies). At most
+    ``max_handoffs`` renders wait like this at once; the oldest makes way, and a
+    page whose render was not kept renders again when it connects.
+
     The options ``debug``, ``allowed_origins`` (comma-separated), ``max_upload_size``,
     ``max_pending_events``, ``max_pending_ops``, ``data_timeout``, ``stream``,
-    ``threaded``, ``reconnect_max``, ``reconnect_attempts`` and ``resume_timeout``
-    not passed here are read from ``PYREACTION_<OPTION>`` environment variables
+    ``threaded``, ``reconnect_max``, ``reconnect_attempts``, ``resume_timeout``,
+    ``handoff_timeout`` and ``max_handoffs`` not passed here are read from ``PYREACTION_<OPTION>`` environment variables
     (``PYREACTION_DEBUG=1``), else take their defaults.
     """
     debug = resolve("debug", debug)
@@ -408,6 +438,8 @@ def create_app(
     reconnect_max = resolve("reconnect_max", reconnect_max)
     reconnect_attempts = resolve("reconnect_attempts", reconnect_attempts)
     resume_timeout = resolve("resume_timeout", resume_timeout)
+    handoff_timeout = resolve("handoff_timeout", handoff_timeout)
+    max_handoffs = resolve("max_handoffs", max_handoffs)
     make = _as_factory(app)
 
     def new_root(url: str, connection: Any, base: str = "") -> Root:
@@ -432,6 +464,42 @@ def create_app(
         entry = parked.pop(sid, None)
         if entry is not None:
             discard(entry[0])
+
+    # First-HTML renders waiting for their page's live connection, by token, oldest first.
+    handoffs: dict[str, _Handoff] = {}
+
+    def drop_handoff(token: str) -> None:
+        entry = handoffs.pop(token, None)
+        if entry is not None:
+            entry.timer.cancel()
+            entry.root.close()
+
+    def hand_off(token: str, root: Root, request: Request, url: str, base: str) -> None:
+        while len(handoffs) >= max_handoffs:
+            drop_handoff(next(iter(handoffs)))
+        # The mount operations were for a browser building the page; it adopts the
+        # HTML instead. Element commands still have to run once it connects.
+        root.ops = [op for op in root.ops if op[0] == "m"]
+        loop = asyncio.get_running_loop()
+        timer = loop.call_later(handoff_timeout, drop_handoff, token)
+        handoffs[token] = _Handoff(root, timer, loop, request.headers.get("cookie"), url, base)
+
+    def take_handoff(ws: WebSocket, url: str, base: str) -> Root | None:
+        entry = handoffs.pop(ws.query_params.get("k", ""), None)
+        if entry is None:
+            return None
+        entry.timer.cancel()
+        # Only the browser the page was rendered for (its cookies), for the same URL,
+        # served by the same event loop the render's work runs on.
+        same = (
+            entry.loop is asyncio.get_running_loop()
+            and entry.cookie == ws.headers.get("cookie")
+            and (entry.url, entry.base) == (url, base)
+        )
+        if not same:
+            entry.root.close()
+            return None
+        return entry.root
 
     checked_static = False
     this_app: list[Any] = [None]  # set below, once the app exists
@@ -463,6 +531,8 @@ def create_app(
             head_tags = root.head_html()
             status = root.status
             root_path = request.scope.get("root_path", "")
+            # Lets the page's live connection take over this render (see hand_off).
+            token = secrets.token_urlsafe(18) if handoff_timeout > 0 and max_handoffs > 0 else ""
             links = "".join(
                 f'<link rel="stylesheet" href="{escape(root_path + static_path)}/{escape(name)}">\n'
                 for name in stylesheets
@@ -471,7 +541,7 @@ def create_app(
                 lang=escape(lang),
                 title=escape(page_title),
                 style=STYLE,
-                head=links + head + head_tags,
+                head=links + head + head_tags + ("" if _ICON.search(head + head_tags) else _NO_ICON),
                 body=body,
                 portals=portals,
                 stream=_STREAM_SPLIT,
@@ -481,10 +551,15 @@ def create_app(
                 page=escape(request.scope.get(_PAGE_PATH, "")),
                 reconnect_max=int(reconnect_max),
                 reconnect_attempts=int(reconnect_attempts),
+                handoff=token,
             ).split(_STREAM_SPLIT)
             waiting = {n for node, n in boundaries.items() if node.waiting}
             if not waiting:
-                return HTMLResponse(parts[0] + parts[1], status_code=status, headers=root.headers)
+                response = HTMLResponse(parts[0] + parts[1], status_code=status, headers=root.headers)
+                if token:
+                    hand_off(token, root, request, url, base)
+                    handed_off = True
+                return response
             handed_off = True
             return StreamingResponse(
                 _stream_page(root, parts, boundaries, waiting, deadline),
@@ -560,6 +635,10 @@ def create_app(
                 root.connection = ws
                 root.set_location(url)
                 root.attach(send, hydrate=True)
+            elif (root := take_handoff(ws, url, base)) is not None:
+                # The render that made this page's HTML: no need to render it again.
+                root.connection = ws
+                root.attach(send, hydrate=ws.query_params.get("h") == "1")
             else:
                 root = new_root(url, ws, base)
                 # Load data as the page's HTML did, so this render matches it and the
@@ -610,7 +689,10 @@ def create_app(
     ]
     if static_dir is not None:
         table.append(Mount(static_path, StaticFiles(directory=static_dir), name="static"))
-    table += [Route("/", page), Route("/{path:path}", page)]
+    async def no_icon(request: Request) -> Response:
+        return Response(status_code=404)  # asked for despite the empty icon: not a page
+
+    table += [Route("/favicon.ico", no_icon), Route("/", page), Route("/{path:path}", page)]
     this_app[0] = _MountableApp(debug=debug, routes=table)
     return this_app[0]
 
@@ -707,7 +789,9 @@ def page(host: Any, path: str, **options: Any) -> Callable[[Callable[..., Any]],
 
     if "static_dir" in options:
         raise TypeError("@page does not serve static files; mount them on the app itself")
-    sub_app = create_app(_page_element, **options)
+    # Dependencies with yield close after the GET's response, so the live page
+    # renders with its own (handoff_timeout=0): never with the GET's render.
+    sub_app = create_app(_page_element, **{**options, "handoff_timeout": 0})
     route = "/" + path.strip("/") if path.strip("/") else "/"
     under = route.rstrip("/")
 
@@ -976,7 +1060,7 @@ def jinja_components(
     prefix = options.get("prefix", "/_pyreaction")
 
     def sign(name: str, props: dict[str, Any]) -> str:
-        payload = base64.urlsafe_b64encode(json.dumps([name, props], separators=(",", ":")).encode()).decode()
+        payload = base64.urlsafe_b64encode(orjson.dumps([name, props], option=orjson.OPT_NON_STR_KEYS)).decode()
         mac = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:32]
         return f"{payload}.{mac}"
 
@@ -985,7 +1069,7 @@ def jinja_components(
         good = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:32]
         if not payload or not hmac.compare_digest(mac, good):
             return None
-        name, props = json.loads(base64.urlsafe_b64decode(payload))
+        name, props = _loads(base64.urlsafe_b64decode(payload))
         return (name, props) if name in registry else None
 
     @as_component
@@ -1000,7 +1084,7 @@ def jinja_components(
     def render_tag(context: Any, name: str, /, **props: Any) -> Markup:
         if name not in registry:
             raise KeyError(f"{name!r} is not one of the components given to jinja_components()")
-        json.dumps(props)  # props travel as JSON; fail here, in the template, if they cannot
+        orjson.dumps(props, option=orjson.OPT_NON_STR_KEYS)  # props travel as JSON; fail here, in the template, if they cannot
         request = context.get("request")
         path = getattr(request, "path", None) or getattr(getattr(request, "url", None), "path", None) or "/"
         query = "?c=" + sign(name, props)
@@ -1082,7 +1166,7 @@ def prerender(
     :func:`create_app` (``title``, ``head``, ``stylesheets``, ``data_timeout``...).
     Call it outside an event loop (in async code, run it in a thread).
     """
-    asgi = create_app(app, stream=False, **options)
+    asgi = create_app(app, stream=False, **{"handoff_timeout": 0, **options})
     script = re.compile(r'<script src="[^"]*/client\.js"[^>]*></script>\n?')
 
     async def render_all() -> dict[str, str]:

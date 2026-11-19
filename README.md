@@ -77,7 +77,6 @@ Optional extras, added the same way (`"pyreaction[redis,jinja] @ git+..."`):
 
 | Extra | For |
 | --- | --- |
-| `fast` | faster JSON encoding with orjson |
 | `redis` | stores shared between worker processes (`RedisBackend`) |
 | `wsgi` | putting pages in front of a WSGI app such as Flask (`wrap`) |
 | `jinja` | the `{% component %}` template tag (`jinja_components`) |
@@ -640,6 +639,8 @@ variables. Code wins over `[tool.pyreaction]`, which wins over the environment.
 | `reconnect_max` | `8000` | `PYREACTION_RECONNECT_MAX` | longest delay between reconnect attempts, in ms |
 | `reconnect_attempts` | `0` (no limit) | `PYREACTION_RECONNECT_ATTEMPTS` | failed attempts in a row before the page gives up |
 | `resume_timeout` | `30.0` | `PYREACTION_RESUME_TIMEOUT` | seconds a dropped page's state is kept for a reconnect |
+| `handoff_timeout` | `5.0` | `PYREACTION_HANDOFF_TIMEOUT` | seconds a first-HTML render waits for its page's live connection (0: render again) |
+| `max_handoffs` | `64` | `PYREACTION_MAX_HANDOFFS` | first-HTML renders that may wait at once; the oldest makes way |
 
 A project's settings:
 
@@ -663,13 +664,17 @@ to `PYREACTION_HOST` (else `127.0.0.1`) and `PYREACTION_PORT`, then `PORT`
 with uvicorn; any ASGI server can serve `create_app(App)`. In a container, set
 `PORT` and the `PYREACTION_*` variables instead of editing code.
 
-**Sessions and workers.** Each open page is a live session on the server. If the
+**Sessions and workers.** Each open page is a live session on the server. The
+render that made a page's HTML waits up to `handoff_timeout` seconds for the
+page's live connection, which takes it over instead of rendering again (only for
+the same browser cookies and URL; at most `max_handoffs` wait at once). If the
 connection drops, the page dims and reconnects with growing, randomised delays.
 The server keeps the dropped session for `resume_timeout` seconds, so a reconnect
 within that time continues with its state; after that, or on another worker
 process, or after a deploy, the page renders afresh at the same URL. Any number
-of workers can serve the app. To resume sessions across workers, route reconnects
-to the same worker (sticky sessions), and share stores with `RedisBackend`.
+of workers can serve the app. To resume sessions or take over renders across
+workers, route a page's connections to the worker that served it (sticky
+sessions), and share stores with `RedisBackend`.
 
 With `reconnect_attempts` set, a page that cannot reconnect stops after that many
 attempts and shows "Connection to the server was lost." with a Reload button
@@ -720,11 +725,15 @@ minutes. The page reconnects by itself when that happens.
 ## How it works
 
 1. A GET renders the component tree at the requested URL, waits for its data, and
-   returns the HTML, keeping nothing in memory. Content waiting in a `Suspense`
-   boundary is streamed into the same response when ready.
+   returns the HTML. Content waiting in a `Suspense` boundary is streamed into the
+   same response when ready. The render is kept for a few seconds for the page's
+   live connection.
 2. `client.js`, a single script with no dependencies, opens a WebSocket for the
-   same URL. The server renders again and sends the tree; when it matches the
-   page, the browser adopts the existing nodes in place, as React hydrates.
+   same URL. The server takes over the kept render (or renders again) and sends
+   each node's id, attributes and events, but not the structure the HTML already
+   has; the browser adopts the existing nodes in place, as React hydrates. If the
+   HTML differs (a render that reads the clock), the browser asks for the whole
+   tree and rebuilds the page.
 3. A state change re-renders only the affected components. The diff in
    `core/vdom.py` matches children by key and sends operations such as "set the
    text of node 12" or "move node 40 before node 9", keeping moves to a minimum.

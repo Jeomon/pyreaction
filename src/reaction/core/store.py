@@ -7,11 +7,12 @@ backend: a write anywhere re-renders the readers everywhere.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from collections.abc import Callable
 from typing import Any, Generic, Protocol, TypeVar
+
+import orjson
 
 from .hooks import same, use_sync_external_store
 
@@ -107,10 +108,10 @@ class Store(Generic[T]):
         result: list[T] = []
 
         def step(old_text: str | None) -> str | None:
-            old = self._initial if old_text is None else json.loads(old_text)
+            old = self._initial if old_text is None else orjson.loads(old_text)
             new = fn(old)
             result[:] = [new]
-            return None if same(new, old) else json.dumps(new)
+            return None if same(new, old) else orjson.dumps(new, option=orjson.OPT_NON_STR_KEYS).decode()
 
         written = self._backend.write(self._name, step)
         if written is not None:
@@ -119,7 +120,7 @@ class Store(Generic[T]):
 
     def _received(self, version: int, text: str) -> None:
         if version > self._version:
-            self._apply(version, json.loads(text))
+            self._apply(version, orjson.loads(text))
 
     def _apply(self, version: int, value: Any) -> None:
         with self._lock:

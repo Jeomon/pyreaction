@@ -85,7 +85,7 @@ class _Builder(HTMLParser):
 
     def _close(self) -> None:
         tag, attrs, children = self.stack.pop()
-        self._children().append(Element(tag, None, attrs, {}, tuple(children)))
+        self._children().append(Element(tag, None, attrs, None, tuple(children)))
 
     def handle_data(self, data: str) -> None:
         if not self.skipping and data:

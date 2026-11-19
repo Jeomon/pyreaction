@@ -13,7 +13,7 @@ from html import escape
 from typing import Any
 
 from .element import PORTAL, RAW_HTML, Element, JsComponent
-from .vdom import ComponentNode, HostNode, Root, TextNode
+from .vdom import ComponentNode, HostNode, Root, TextNode, _gc_paused
 
 __all__ = ["render_children", "render_head", "render_portals", "render_to_static_markup", "render_to_string"]
 
@@ -32,7 +32,8 @@ def render_to_string(target: Root | Element, boundaries: dict[Any, int] | None =
     """
     root = target if isinstance(target, Root) else Root(target)
     out: list[str] = []
-    _children(root.container.children, out, raw=False, boundaries=boundaries)
+    with _gc_paused():
+        _children(root.container.children, out, raw=False, boundaries=boundaries)
     if root is not target:
         root.close()
     return "".join(out)
@@ -107,7 +108,7 @@ def render_head(elements: list[Element]) -> str:
     """Tags for the page's <head>, each marked so the browser can replace them later."""
     out = []
     for el in elements:
-        marked = Element(el.type, el.key, {**el.attrs, "data-pyreaction-head": ""}, {}, el.children)
+        marked = Element(el.type, el.key, {**el.attrs, "data-pyreaction-head": ""}, None, el.children)
         out.append(render_to_string(marked))
     return "".join(out)
 

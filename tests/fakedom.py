@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from html import escape
+from html.parser import HTMLParser
 from typing import Any
 
 from reaction.core.ssr import VOID
@@ -105,6 +107,102 @@ class FakeDom:
 
     def html(self) -> str:
         return self.root.inner()
+
+    def adopt(self, page: str, ops: list[list[Any]]) -> None:
+        """Take over ``page``'s markup with a hydrate message, as client.js does: the
+        HTML gives the structure, the operations give node ids, attributes and events.
+        ``page`` is a whole page, an ``embed()`` snippet, or a fragment of markup."""
+        if any(op[0] == "P" for op in ops):
+            raise AssertionError("FakeDom.adopt does not handle portals")
+        found = _dom_order(_body(page), self.root)
+        made = [op for op in ops if op[0] in ("c", "t", "j")]
+        mismatch = len(made) != len(found) or any(
+            (n.tag is not None or n.text != op[2]) if op[0] == "t" else n.tag != op[2] for op, n in zip(made, found)
+        )
+        if mismatch:
+            raise AssertionError(f"the HTML does not match the render: {[op[:3] for op in made]} vs {found}")
+        for op, node in zip(made, found):
+            self.nodes[op[1]] = node
+            if op[0] == "c":
+                node.attrs, node.events = dict(op[3]), dict(op[4])
+            elif op[0] == "j":
+                node.js = {"module": op[3], "export": op[4], "props": op[5]}
+        self.apply([op for op in ops if op[0] == "m"])
+
+
+def _body(page: str) -> str:
+    """The app's markup inside a page or an ``embed()`` snippet."""
+    marker = re.search(r'<div id="pyreaction-[\w-]*">', page) or re.search(r'<div id="pyreaction-root">', page)
+    if marker is None:
+        return page
+    rest = page[marker.end():]
+    for end in ("</div>\n", "</div><script"):
+        if end in rest:
+            return rest[: rest.index(end)]
+    return rest
+
+
+class _Builder(HTMLParser):
+    """Parses markup into Nodes the way client.js's domOrder walks the DOM."""
+
+    def __init__(self, root: Node) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack = [root]
+        self.order: list[Node] = []
+        self.skip = 0  # inside a fallback or portal box: not part of the tree
+        self.opaque = 0  # inside raw HTML or a textarea: the element is, its contents are not
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        names = dict(attrs)
+        if self.skip or "data-pyreaction-fallback" in names or "data-pyreaction-portal" in names:
+            if tag not in VOID:
+                self.skip += 1
+            return
+        if "data-pyreaction-slot" in names:  # a js_component's Python children
+            return
+        node = Node(tag)
+        if not self.opaque:
+            self.order.append(node)
+            self._add(node)
+        if tag not in VOID:
+            self.stack.append(node)
+            if self.opaque or tag == "textarea" or "data-pyreaction-raw" in names:
+                self.opaque += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.skip:
+            if tag not in VOID:
+                self.skip -= 1
+            return
+        if len(self.stack) > 1 and self.stack[-1].tag == tag:
+            self.stack.pop()
+            if self.opaque:
+                self.opaque -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self.skip or self.opaque:
+            return
+        node = Node(None, data)
+        self.order.append(node)
+        self._add(node)
+
+    def handle_comment(self, data: str) -> None:
+        if not self.skip and not self.opaque and data == "$":  # an empty text node
+            node = Node(None, "")
+            self.order.append(node)
+            self._add(node)
+
+    def _add(self, node: Node) -> None:
+        parent = self.stack[-1]
+        parent.children.append(node)
+        node.parent = parent
+
+
+def _dom_order(markup: str, root: Node) -> list[Node]:
+    builder = _Builder(root)
+    builder.feed(markup)
+    builder.close()
+    return builder.order
 
 
 def tree_html(root: Any) -> str:

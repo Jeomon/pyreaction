@@ -178,7 +178,7 @@ def check_embedded(client, page_url):
     with client.websocket_connect(f"/widget/_pyreaction/ws?p={page_url}&h=1") as ws:
         first = json.loads(ws.receive_text())
         dom = FakeDom()
-        dom.apply(first["ops"])
+        dom.adopt(page, first["ops"])
         button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
         ws.send_text(json.dumps([1, button, "click", {}]))
         dom.apply(json.loads(ws.receive_text())["ops"])
@@ -225,11 +225,11 @@ def tag_page(html_text):
     return box.group(1), box.group(2), ws
 
 
-def click_once(client, ws_path, p):
+def click_once(client, ws_path, p, page):
     with client.websocket_connect(f"{ws_path}&p={p}&h=1") as ws:
         first = json.loads(ws.receive_text())
         dom = FakeDom()
-        dom.apply(first["ops"])
+        dom.adopt(page, first["ops"])
         before = dom.html()
         button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
         ws.send_text(json.dumps([1, button, "click", {}]))
@@ -262,7 +262,7 @@ def test_component_tag_in_fastapi_jinja_templates():
         assert box == "<button>hi ada 5 at /shop</button>", "server-rendered with the template's props"
         assert ws.startswith("/components/_pyreaction/ws?c=")
         assert 'src="/components/_pyreaction/client.js"' in page
-        assert click_once(client, ws, "/shop") == (
+        assert click_once(client, ws, "/shop", page) == (
             "<button>hi ada 5 at /shop</button>", "<button>hi ada 6 at /shop</button>",
         )
 
@@ -281,7 +281,7 @@ def test_component_tag_in_a_flask_template_through_wrap():
         page = client.get("/shop").text
         _, box, ws = tag_page(page)
         assert box == "<button>hi bo 0 at /shop</button>", "the location is Flask's request.path"
-        assert click_once(client, ws, "/shop")[1] == "<button>hi bo 1 at /shop</button>"
+        assert click_once(client, ws, "/shop", page)[1] == "<button>hi bo 1 at /shop</button>"
 
 
 def test_component_tag_only_names_listed_components_and_signed_props():

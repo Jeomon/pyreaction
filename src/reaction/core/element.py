@@ -189,6 +189,22 @@ def js(code: str) -> EventHandler:
     return EventHandler(None, code=code)
 
 
+class _EmptyDict(dict):
+    """The one empty dict shared by every element without attributes, events or
+    keyword arguments, so 10,000 rows do not hold 30,000 empty dicts. Elements are
+    never changed in place; this refuses writes so a mistake shows at once."""
+
+    __slots__ = ()
+
+    def _read_only(self, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError("an element's props are read-only: build a new dict instead")
+
+    __setitem__ = __delitem__ = setdefault = update = pop = popitem = clear = __ior__ = _read_only
+
+
+_EMPTY: dict[str, Any] = _EmptyDict()
+
+
 class Element:
     """One node of a description tree: a DOM tag, a component call, or a fragment."""
 
@@ -207,11 +223,11 @@ class Element:
     ) -> None:
         self.type = type
         self.key = key
-        self.attrs = attrs if attrs is not None else {}
-        self.events = events if events is not None else {}
+        self.attrs = attrs if attrs else _EMPTY
+        self.events = events if events else _EMPTY
         self.children = children
         self.args = args
-        self.kwargs = kwargs if kwargs is not None else {}
+        self.kwargs = kwargs if kwargs else _EMPTY
         self.ref = ref
 
     def __eq__(self, other: object) -> bool:
@@ -492,7 +508,7 @@ class _TagFactory:
             props = {**children[0], **props}
             children = children[1:]
         if not props:
-            el = Element(self.tag, None, {}, {}, children)
+            el = Element(self.tag, None, None, None, children)
         else:
             if self.tag == "form" and callable(props.get("action")):
                 # React 19's <form action={fn}>: the Form component, with pending state.

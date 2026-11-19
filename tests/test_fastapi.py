@@ -89,9 +89,10 @@ def test_live_page_under_the_mount(base):
     # The browser sends the path inside the app and the base; an older or embedded
     # page may send the full path, which works too.
     for p in ("/users/7", f"{base}/users/7"):
+        page = client.get(f"{base}/users/7").text
         with client.websocket_connect(f"{base}/_pyreaction/ws?p={p}&b={base}&h=1") as ws:
             dom = FakeDom()
-            dom.apply(json.loads(ws.receive_text())["ops"])
+            dom.adopt(page, json.loads(ws.receive_text())["ops"])
             assert dom.html() == "<p>user 7</p>"
 
     with client.websocket_connect(f"{base}/_pyreaction/ws?p=/&b={base}") as ws:
@@ -353,7 +354,7 @@ def test_page_live_connection_resolves_the_dependencies_again():
     log = []
     api = _page_api(log)
     client = TestClient(api, cookies={"user": "ada"})
-    with client.websocket_connect("/orders/7/_pyreaction/ws?p=/orders/7&h=1") as ws:
+    with client.websocket_connect("/orders/7/_pyreaction/ws?p=/orders/7") as ws:
         first = json.loads(ws.receive_text())
         dom = FakeDom()
         dom.apply(first["ops"])

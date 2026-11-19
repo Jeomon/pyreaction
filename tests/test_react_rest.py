@@ -225,7 +225,7 @@ def test_browser_only_renders_once_live_and_the_page_is_adopted():
     with client.websocket_connect("/_pyreaction/ws?p=/&h=1") as ws:
         first = json.loads(ws.receive_text())
         dom = FakeDom()
-        dom.apply(first["ops"])
+        dom.adopt(page, first["ops"])
         assert "sizing..." in dom.html(), "the first live tree matches the server's HTML"
         assert dom.html().replace('<div hidden="">', '<div hidden="">') == body.replace("<!---->", "").replace(
             "<!--pr-s:1-->", "").replace("<!--/pr-s:1-->", "")

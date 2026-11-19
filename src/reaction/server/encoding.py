@@ -1,5 +1,4 @@
-"""Messages to the browser as JSON text: with orjson when installed (the ``fast``
-extra), else the standard library, giving the same text either way.
+"""JSON to and from the browser, with orjson.
 
 Props and attributes should be JSON values, but a Python value that is not one
 must not stop the page: dates and times are sent in ISO format, an Enum as its
@@ -18,7 +17,9 @@ import logging
 import math
 from typing import Any
 
-__all__ = ["dumps"]
+import orjson
+
+__all__ = ["dumps", "loads"]
 
 logger = logging.getLogger("reaction")
 
@@ -63,22 +64,22 @@ _encoder = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False, allow_nan
 
 
 def _dumps_std(data: Any) -> str:
+    """The standard library's encoder, for the values orjson refuses."""
     try:
         return _encoder.encode(data)
     except ValueError:  # NaN or infinity somewhere (or a cycle, raised again by _finite)
         return _encoder.encode(_finite(data))
 
 
-try:
-    import orjson
+_OPTIONS = orjson.OPT_NON_STR_KEYS
 
-    _OPTIONS = orjson.OPT_NON_STR_KEYS
 
-    def dumps(data: Any) -> str:
-        try:
-            return orjson.dumps(data, default=_fallback, option=_OPTIONS).decode()
-        except TypeError:  # what orjson cannot write at all, e.g. an int past 64 bits
-            return _dumps_std(data)
+def dumps(data: Any) -> str:
+    """``data`` as compact JSON text."""
+    try:
+        return orjson.dumps(data, default=_fallback, option=_OPTIONS).decode()
+    except TypeError:  # what orjson cannot write at all, e.g. an int past 64 bits
+        return _dumps_std(data)
 
-except ImportError:  # pragma: no cover - depends on the optional extra
-    dumps = _dumps_std
+
+loads = orjson.loads

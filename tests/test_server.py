@@ -49,13 +49,14 @@ def wait_for(condition, timeout=2.0):
 def test_socket_renders_again_and_handles_events():
     effects.clear()
     client = TestClient(create_app(Counter))
-    client.get("/")
+    page = client.get("/").text
     assert effects == [], "effects must wait for the browser"
     with connect(client) as ws:
         first = json.loads(ws.receive_text())
         assert first["init"] == "hydrate"
+        assert not [op for op in first["ops"] if op[0] == "A"], "the HTML already has the structure"
         dom = FakeDom()
-        dom.apply(first["ops"])
+        dom.adopt(page, first["ops"])
         assert dom.html() == "<div><button>+</button><span>0</span></div>"
         wait_for(lambda: effects == [0])
         button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
@@ -73,25 +74,30 @@ def test_reconnect_without_markup_replaces():
         assert json.loads(ws.receive_text())["init"] == "replace"
 
 
-def test_page_loads_hold_no_sessions():
-    """Item 2: a GET used to park a live session for 30 s; now it keeps nothing."""
+def test_page_loads_hold_a_bounded_number_of_renders():
+    """A GET keeps its render for the page's live connection, but never more than
+    max_handoffs of them: pages that never connect (bots) cannot add up."""
 
     @component
     def Big():
         return html.div([html.p(i) for i in range(200)])
 
-    client = TestClient(create_app(Big))
-    client.get("/")
-    gc.collect()
-    tracemalloc.start()
-    before, _ = tracemalloc.get_traced_memory()
-    for _ in range(200):
-        client.get("/")
-    # The finished tree is cyclic garbage (nodes point at their parents); collect it.
-    gc.collect()
-    after, _ = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    assert (after - before) / 200 < 1_000, f"{(after - before) / 200:.0f} bytes kept per page load"
+    def kept_after(loads, **options):
+        with TestClient(create_app(Big, **options)) as client:
+            client.get("/")
+            gc.collect()
+            tracemalloc.start()
+            before, _ = tracemalloc.get_traced_memory()
+            for _ in range(loads):
+                client.get("/")
+            gc.collect()
+            after, _ = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        return after - before
+
+    assert kept_after(200, handoff_timeout=0) / 200 < 1_000, "without handoffs a GET keeps nothing"
+    few, many = kept_after(100, max_handoffs=8), kept_after(400, max_handoffs=8)
+    assert many < few * 1.5 + 50_000, f"{few} bytes after 100 loads, {many} after 400: should not grow"
 
 
 def test_cross_origin_socket_is_refused():
@@ -208,11 +214,12 @@ def _button(message):
 def test_reconnect_with_the_session_id_keeps_state():
     # One TestClient context = one event loop, as one server process would have.
     with TestClient(create_app(Counter)) as client:
+        page = client.get("/").text
         with connect(client) as ws:
             first = json.loads(ws.receive_text())
             sid = first["sid"]
             dom = FakeDom()
-            dom.apply(first["ops"])
+            dom.adopt(page, first["ops"])
             button = _button(first)
             ws.send_text(json.dumps([1, button, "click", {}]))
             dom.apply(json.loads(ws.receive_text())["ops"])
@@ -223,7 +230,7 @@ def test_reconnect_with_the_session_id_keeps_state():
             assert again["resumed"] is True and again["init"] == "hydrate"
             assert again["sid"] != sid, "a fresh id each connection: an old one cannot be reused"
             resumed = FakeDom()
-            resumed.apply(again["ops"])
+            resumed.adopt(dom.html(), again["ops"])  # the browser still shows the page
             assert resumed.html() == "<div><button>+</button><span>1</span></div>"
             assert _button(again) == button, "node ids are kept"
             ws.send_text(json.dumps([2, button, "click", {}]))
@@ -401,7 +408,7 @@ def test_both_encoders_send_the_same_text_for_awkward_values(caplog):
         '"enum":"red","point":{"x":1,"y":2},"tags":["x"],"tuple":[1,2],"decimal":"1.50"}'
     )
     assert encoding._dumps_std(data) == expected
-    assert encoding.dumps(data) == expected, "orjson (when installed) gives the same text"
+    assert encoding.dumps(data) == expected, "orjson gives the same text"
     assert "Sent a Decimal to the browser as text" in caplog.text
     loop = []
     loop.append(loop)
@@ -455,3 +462,126 @@ def test_an_update_that_cannot_be_sent_closes_the_page_and_reports_it():
 
     assert update_after_click(App, on_error=lambda exc, where, conn: errors.append((type(exc), where))) == 1011
     assert errors == [(ValueError, "sending an update to the browser")]
+
+
+def test_the_favicon_never_renders_the_app():
+    renders = []
+
+    @component
+    def App():
+        renders.append(use_location().path)
+        return html.p("hi")
+
+    with TestClient(create_app(App)) as client:
+        page = client.get("/").text
+        assert '<link rel="icon" href="data:,">' in page, "so the browser does not ask"
+        icon = client.get("/favicon.ico")
+        assert (icon.status_code, icon.content) == (404, b"")
+    assert renders == ["/"]
+    head = '<link rel="shortcut icon" href="/static/me.png">'
+    with TestClient(create_app(App, head=head)) as client:
+        page = client.get("/").text
+        assert head in page and 'href="data:,"' not in page, "an app's own icon is kept"
+
+    @component
+    def WithIcon():
+        return html.div(html.link(rel="icon", href="/static/logo.svg"), "hi")
+
+    with TestClient(create_app(WithIcon)) as client:
+        assert 'href="data:,"' not in client.get("/").text, "an icon from a component counts too"
+
+
+def test_a_mismatch_gets_the_whole_tree_in_the_same_session():
+    with TestClient(create_app(Counter)) as client:
+        with connect(client) as ws:
+            first = json.loads(ws.receive_text())
+            assert first["init"] == "hydrate" and not [op for op in first["ops"] if op[0] == "A"]
+            ws.send_text(json.dumps([0, 0, "#mismatch", {"path": "/"}]))
+            again = json.loads(ws.receive_text())
+            assert again["init"] == "replace" and again["rebuild"] is True
+            dom = FakeDom()
+            dom.apply(again["ops"])
+            assert dom.html() == "<div><button>+</button><span>0</span></div>"
+            assert _button(again) == _button(first), "the same session and node ids"
+            ws.send_text(json.dumps([1, _button(again), "click", {}]))
+            dom.apply(json.loads(ws.receive_text())["ops"])
+            assert dom.html() == "<div><button>+</button><span>1</span></div>"
+
+
+# ---- the live connection takes over the first-HTML render ---------------------------------------
+
+
+def _handoff_token(page):
+    import re
+
+    return re.search(r'data-handoff="([^"]*)"', page).group(1)
+
+
+def _counting_app():
+    renders = []
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        renders.append(use_location().path)
+        return html.div(html.button("+", on_click=lambda: set_n(n + 1)), html.span(n))
+
+    return App, renders
+
+
+def test_the_live_connection_takes_over_the_first_render():
+    App, renders = _counting_app()
+    with TestClient(create_app(App)) as client:
+        page = client.get("/").text
+        token = _handoff_token(page)
+        assert token and renders == ["/"]
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&k={token}") as ws:
+            first = json.loads(ws.receive_text())
+            assert renders == ["/"], "not rendered again"
+            dom = FakeDom()
+            dom.adopt(page, first["ops"])
+            ws.send_text(json.dumps([1, _button(first), "click", {}]))
+            dom.apply(json.loads(ws.receive_text())["ops"])
+            assert dom.html() == "<div><button>+</button><span>1</span></div>"
+        # Single use: the same token again renders afresh.
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&k={token}") as ws:
+            ws.receive_text()
+        assert renders == ["/", "/", "/"]
+
+
+def test_a_render_is_only_handed_to_the_same_browser_and_url():
+    App, renders = _counting_app()
+    with TestClient(create_app(App), cookies={"session": "ada"}) as client:
+        token = _handoff_token(client.get("/").text)
+        client.cookies.set("session", "eve")
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&k={token}") as ws:
+            ws.receive_text()
+        assert renders == ["/", "/"], "other cookies: rendered for this connection"
+        client.cookies.set("session", "ada")
+        token = _handoff_token(client.get("/").text)
+        with client.websocket_connect(f"/_pyreaction/ws?p=/other&h=1&k={token}") as ws:
+            ws.receive_text()
+        assert renders[-1] == "/other", "another URL: rendered for it"
+
+
+def test_handoffs_expire_and_are_limited_in_number():
+    App, renders = _counting_app()
+    with TestClient(create_app(App, handoff_timeout=0.1)) as client:
+        token = _handoff_token(client.get("/").text)
+        time.sleep(0.3)
+        client.get("/_pyreaction/client.js")  # let the server's loop run the expiry
+        renders.clear()
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&k={token}") as ws:
+            ws.receive_text()
+        assert renders == ["/"], "expired: rendered again"
+    App, renders = _counting_app()
+    with TestClient(create_app(App, max_handoffs=2)) as client:
+        tokens = [_handoff_token(client.get("/").text) for _ in range(3)]
+        renders.clear()
+        for token in tokens:
+            with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&k={token}") as ws:
+                ws.receive_text()
+        assert renders == ["/"], "the oldest made way for the newer two"
+    App, renders = _counting_app()
+    with TestClient(create_app(App, handoff_timeout=0)) as client:
+        assert _handoff_token(client.get("/").text) == "", "turned off"

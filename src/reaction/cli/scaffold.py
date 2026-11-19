@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import shutil
@@ -12,6 +11,8 @@ import sys
 from importlib import metadata
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+import orjson
 
 from .. import __version__
 
@@ -30,7 +31,7 @@ def _install_source() -> tuple[str, str] | None:
         return None
     if not raw:
         return None
-    info = json.loads(raw)
+    info = orjson.loads(raw)
     url = info.get("url", "")
     vcs = info.get("vcs_info")
     if vcs and vcs.get("vcs") == "git" and not url.startswith("file://"):

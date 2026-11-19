@@ -31,6 +31,7 @@
   let ack = 0;
   let retry = 0;
   let sid = null; // this session's id on the server, for resuming after a drop
+  let handoff = script.dataset.handoff || ""; // single use: the page's first render
   // While a view transition runs, later messages wait so they apply in order.
   let animating = null;
   const waiting = [];
@@ -493,24 +494,26 @@
     }
     const own = segments[0];
     const found = domOrder(mount);
-    if (!matches(own, found)) {
+    const boxes = segments.slice(1).map((seg, k) => {
+      const box = document.querySelector(`[data-pyreaction-portal="${k}"]`);
+      return { seg, box, inside: box ? domOrder(box) : null };
+    });
+    // A hydrate message has no structure (the HTML has it), so a page whose markup
+    // differs cannot be built from it: the caller asks the server for the whole tree.
+    if (!matches(own, found) || boxes.some((b) => !b.box || !matches(b.seg, b.inside))) {
       console.warn("pyreaction: the page's markup differs from this render (clock, randomness?); rebuilding it");
       mount.dataset.hydration = "rebuilt";
-      return replace(ops);
+      return false;
     }
     mount.dataset.hydration = "adopted";
     nodes = new Map([[0, mount]]);
     adopt(own, found);
     const kept = new Set();
-    segments.slice(1).forEach((seg, k) => {
-      const box = document.querySelector(`[data-pyreaction-portal="${k}"]`);
-      const inside = box ? domOrder(box) : null;
-      if (box && matches(seg, inside)) {
-        register(seg[0][1], box);
-        kept.add(box);
-        adopt(seg, inside);
-      } else apply(seg); // a portal whose markup differs is built afresh
-    });
+    for (const { seg, box, inside } of boxes) {
+      register(seg[0][1], box);
+      kept.add(box);
+      adopt(seg, inside);
+    }
     // Boxes nothing adopted: from the server's HTML or the last session.
     for (const box of document.querySelectorAll("[data-pyreaction-portal]")) {
       if (box.__id === undefined || (!kept.has(box) && nodes.get(box.__id) !== box)) box.remove();
@@ -660,6 +663,9 @@
     if (mount.firstChild) url.searchParams.set("h", "1");
     // Ask to resume the last session, which the server keeps for a while.
     if (sid) url.searchParams.set("s", sid);
+    // The first connection takes over the render that made this page's HTML.
+    if (handoff) url.searchParams.set("k", handoff);
+    handoff = "";
     socket = new WebSocket(url);
     socket.onopen = () => {
       retry = 0;
@@ -693,7 +699,8 @@
         // A resumed session keeps its node ids and event numbers, so events made
         // while offline still apply. A new one numbers everything afresh: nothing
         // queued for the old one, and no pending input edit, may carry over.
-        if (!data.resumed) {
+        // data.rebuild: the same session, sending the whole tree after a mismatch.
+        if (!data.resumed && !data.rebuild) {
           recentEvents.clear(); // their numbers belong to the old session
           outbox.length = 0;
           seq = 0;
@@ -702,8 +709,10 @@
       }
       ack = data.ack;
       if (data.init === "hydrate") {
-        hydrate(data.ops);
-        if (mount.dataset.hydration === "rebuilt") send([0, 0, "#mismatch", { path: here() }]);
+        if (hydrate(data.ops) === false) {
+          send([0, 0, "#mismatch", { path: here() }]); // the server answers with the whole tree
+          return;
+        }
       } else if (data.init === "replace") replace(data.ops);
       else apply(data.ops);
       if (data.title != null) document.title = data.title;

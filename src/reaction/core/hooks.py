@@ -282,6 +282,18 @@ def create_context(default: T = None, name: str = "Context") -> Context[T]:  # t
     return Context(default, name)
 
 
+def _subscribe(provider: ComponentNode, node: ComponentNode) -> None:
+    """Re-render ``node`` when ``provider``'s value changes (the links are made on first use)."""
+    if provider.subscribers is None:
+        provider.subscribers = set()
+    if node in provider.subscribers:
+        return
+    provider.subscribers.add(node)
+    if node.subscriptions is None:
+        node.subscriptions = []
+    node.subscriptions.append(provider)
+
+
 class _ContextSlot:
     __slots__ = ("provider",)
 
@@ -291,8 +303,7 @@ class _ContextSlot:
             provider = provider.parent
         self.provider = provider
         if provider is not None:
-            provider.subscribers.add(node)
-            node.subscriptions.append(provider)
+            _subscribe(provider, node)
 
 
 def use_context(ctx: Context[T]) -> T:
@@ -507,9 +518,7 @@ def use(resource: Any) -> Any:
             provider = provider.parent
         if provider is None:
             return resource.default
-        if node not in provider.subscribers:
-            provider.subscribers.add(node)
-            node.subscriptions.append(provider)
+        _subscribe(provider, node)
         return provider.value
     if isinstance(resource, asyncio.Future):
         if resource.done():
