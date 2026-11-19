@@ -1,16 +1,26 @@
-"""The ``pyreaction`` command: ``init`` a project, then ``dev`` or ``run`` it."""
+"""The ``pyreaction`` command: ``init`` a project, then ``dev`` or ``run`` it.
+
+With no command, ``pyreaction`` serves the project for production, as ``run``
+does: ``pyreaction --port 8000`` is ``pyreaction run --port 8000``.
+"""
 
 from __future__ import annotations
 
 import argparse
+import sys
 
 from .. import __version__
 from .scaffold import cmd_init, template_names
 from .serve import cmd_dev, cmd_run
 
+COMMANDS = ("init", "dev", "run")
+
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pyreaction", description="React-style UIs in Python.")
+    parser = argparse.ArgumentParser(
+        prog="pyreaction",
+        description="React-style UIs in Python. With no command, serves the project for production (like `run`).",
+    )
     parser.add_argument("--version", action="version", version=f"pyreaction {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -28,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, func, text in (
         ("dev", cmd_dev, "serve the project, restarting on every save"),
-        ("run", cmd_run, "serve the project"),
+        ("run", cmd_run, "serve the project for production (the default)"),
     ):
         p = sub.add_parser(name, help=text)
         p.add_argument("--host", default="127.0.0.1")
@@ -40,5 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args_in = list(sys.argv[1:] if argv is None else argv)
+    # No command (or only options such as --port): serve for production.
+    if not args_in or (args_in[0] not in COMMANDS and args_in[0] not in ("-h", "--help", "--version")):
+        args_in.insert(0, "run")
+    args = build_parser().parse_args(args_in)
     return args.func(args)

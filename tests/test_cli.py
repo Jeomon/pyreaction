@@ -47,3 +47,26 @@ def test_commands_outside_a_project_explain_what_to_do(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(SystemExit, match="pyreaction init"):
         cli.main(["run"])
+
+
+def test_no_command_means_run(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "build_parser", _parser_recording(seen))
+    cli.main([])
+    cli.main(["--port", "9000", "--host", "0.0.0.0"])
+    cli.main(["dev", "--port", "8001"])
+    assert seen == [("run", "127.0.0.1", 8000), ("run", "0.0.0.0", 9000), ("dev", "127.0.0.1", 8001)]
+
+
+def _parser_recording(seen):
+    real = cli.build_parser
+
+    def build():
+        parser = real()
+        for action in parser._subparsers._group_actions:
+            for name, sub in action.choices.items():
+                if name in ("run", "dev"):
+                    sub.set_defaults(func=lambda a, name=name: seen.append((name, a.host, a.port)) or 0)
+        return parser
+
+    return build

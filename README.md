@@ -33,8 +33,9 @@ my-app/
 
 When you save a `.py` file, `pyreaction dev` restarts the server and open pages
 reconnect and redraw by themselves; component state starts over. Changes to
-files in `public/` show on the next refresh. `pyreaction run` serves without
-reloading (`--host`, `--port`). `dev` also turns on debug mode (errors shown in
+files in `public/` show on the next refresh. For production, `pyreaction` on its
+own serves without reloading or debug output (`uv run pyreaction --host 0.0.0.0
+--port 8000`); `pyreaction run` is the same. `dev` also turns on debug mode (errors shown in
 the page, warnings for lists without keys).
 
 ```toml
