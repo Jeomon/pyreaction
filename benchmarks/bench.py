@@ -91,6 +91,12 @@ def main():
     n = timed("swap two rows", update(swap))
     print(f"{'':<40} {n} ops")
 
+    fresh = iter(range(ROWS, ROWS * 10))
+    n = timed("insert a row at the top", update(lambda: setters["rows"](lambda r: [(i := next(fresh), f"row {i}"), *r])))
+    print(f"{'':<40} {n} ops")
+    n = timed("remove the first row", update(lambda: setters["rows"](lambda r: r[1:])))
+    print(f"{'':<40} {n} ops")
+
     timed("shuffle all rows", update(lambda: setters["rows"](lambda r: random.sample(r, len(r)))), repeat=3)
 
     root = Root(StoreTable())

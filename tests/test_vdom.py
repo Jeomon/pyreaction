@@ -586,3 +586,91 @@ def test_an_only_text_child_is_the_elements_own_text():
         assert shown in h.html()
     assert sent[:2] == [["r", 5], ["r", 6]], "child nodes are removed before the text replaces them"
     assert sent[-1] == ["p", 2, "#text", "hi"]
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_small_list_edits_keep_every_kept_item_mounted(seed):
+    """Edits at the ends and in the middle, as lists usually change: every key still
+    present keeps its component (and state); the ops leave the DOM matching the tree."""
+    rng = random.Random(seed)
+    setters = {}
+    mounts = []
+
+    @component
+    def Item(k):
+        use_effect(lambda: mounts.append(k) or None, [])
+        return html.li(k)
+
+    @component
+    def App():
+        items, set_items = use_state(list(range(10)))
+        setters["items"] = set_items
+        return html.ul("start", [Item(k, key=k) if k % 7 else html.li(k, key=k) for k in items], "end")
+
+    h = Harness(App())
+    items = list(range(10))
+    fresh = iter(range(100, 1000))
+    for _ in range(8):
+        before = set(items)
+        edit = rng.choice(["prepend", "append", "drop_first", "drop_last", "insert", "remove", "move", "swap"])
+        nxt = list(items)
+        if edit == "prepend":
+            nxt[:0] = [next(fresh) for _ in range(rng.randint(1, 3))]
+        elif edit == "append":
+            nxt += [next(fresh) for _ in range(rng.randint(1, 3))]
+        elif edit == "drop_first" and nxt:
+            del nxt[: rng.randint(1, 2)]
+        elif edit == "drop_last" and nxt:
+            del nxt[-rng.randint(1, 2):]
+        elif edit == "insert":
+            nxt.insert(rng.randint(0, len(nxt)), next(fresh))
+        elif edit == "remove" and nxt:
+            nxt.pop(rng.randrange(len(nxt)))
+        elif edit == "move" and nxt:
+            nxt.insert(rng.randint(0, len(nxt) - 1), nxt.pop(rng.randrange(len(nxt))))
+        elif edit == "swap" and len(nxt) > 1:
+            i, j = rng.sample(range(len(nxt)), 2)
+            nxt[i], nxt[j] = nxt[j], nxt[i]
+        mounts.clear()
+        setters["items"](nxt)
+        h.flush()
+        assert h.html() == "<ul>start" + "".join(f"<li>{k}</li>" for k in nxt) + "end</ul>"
+        assert not [k for k in mounts if k in before], f"{edit}: kept items were remounted"
+        items = nxt
+
+
+def test_type_change_at_either_end_remounts_only_that_child():
+    setters = {}
+
+    @component
+    def App():
+        tags, set_tags = use_state(["p", "p", "p"])
+        setters["tags"] = set_tags
+        return html.div([html(t, i, key=i) for i, t in enumerate(tags)])
+
+    h = Harness(App())
+    before = ["p", "p", "p"]
+    for tags in (["b", "p", "p"], ["b", "p", "i"], ["p", "p", "p"]):
+        setters["tags"](tags)
+        ops = h.flush()
+        assert h.html() == "<div>" + "".join(f"<{t}>{i}</{t}>" for i, t in enumerate(tags)) + "</div>"
+        changed = sum(a != b for a, b in zip(tags, before))
+        assert len([op for op in ops if op[0] == "r"]) == changed, "only the changed tags are replaced"
+        before = tags
+
+
+def test_duplicate_keys_are_warned_and_still_render(caplog):
+    setters = {}
+
+    @component
+    def App():
+        keys, set_keys = use_state(["a", "b", "a"])
+        setters["keys"] = set_keys
+        return html.ul([html.li(f"{k}{i}", key=k) for i, k in enumerate(keys)])
+
+    h = Harness(App())
+    assert "Duplicate key 'a'" in caplog.text
+    for keys in (["a", "b", "a"], ["c", "a", "b", "a"], ["a", "a", "a"], ["b", "a"]):
+        setters["keys"](keys)
+        h.flush()  # checks the fake DOM against the tree
+        assert h.html() == "<ul>" + "".join(f"<li>{k}{i}</li>" for i, k in enumerate(keys)) + "</ul>"

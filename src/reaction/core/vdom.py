@@ -1485,30 +1485,87 @@ class Root:
         _flatten_items(items, (), pairs, unkeyed)
         if unkeyed and len(unkeyed) > 1:
             self._warn_unkeyed(parent)
-        by_key = {child.key: child for child in old}
         result: list[Any] = []
-        seen: set[Any] = set()
-        # A different length, a new node, or an old one in another place reshapes the list.
-        reshaped = len(pairs) != len(old)
-        for key, item in pairs:
-            if key in seen:
-                logger.warning("Duplicate key %r under %s", key[-1], getattr(parent, "name", parent.type))
-                key = (key, len(result))
-            seen.add(key)
-            prev = by_key.pop(key, None)
-            item_type = str if type(item) is str else item.type
-            # Tag names are compared by value: strings built at runtime are not interned.
-            if prev is not None and (prev.type is item_type or prev.type == item_type):
-                self._update(prev, item)
-                if not reshaped and old[len(result)] is not prev:
-                    reshaped = True
-                result.append(prev)
-            else:
-                if prev is not None:
-                    self._unmount(prev, emit=True)
-                reshaped = True
+        if not old:
+            # Mounting: every child is new. (Half the calls of a first render, so
+            # kept to the minimum: no ends to match and no table of old keys.)
+            seen: set[Any] = set()
+            for i, (key, item) in enumerate(pairs):
+                if key in seen:
+                    logger.warning("Duplicate key %r under %s", key[-1], getattr(parent, "name", parent.type))
+                    key = (key, i)
+                seen.add(key)
                 result.append(self._mount(item, key, parent))
-        for leftover in by_key.values():
+            if result:
+                self._reshapes += 1
+            return result
+        n_old, n_new = len(old), len(pairs)
+        # Children that kept their key and type at either end need no lookup table:
+        # in a list that changed in place (most updates) that is all of them, and an
+        # insertion or removal leaves only the part between the two ends. The front
+        # is updated as it is matched; the back is matched first (the middle needs
+        # its keys) and updated after the middle, so children update in their new
+        # order. Tag names are compared by value: runtime strings are not interned.
+        update = self._update
+        start = 0
+        limit = min(n_old, n_new)
+        while start < limit:
+            key, item = pairs[start]
+            prev = old[start]
+            item_type = str if type(item) is str else item.type
+            if prev.key != key or not (prev.type is item_type or prev.type == item_type):
+                break
+            update(prev, item)
+            result.append(prev)
+            start += 1
+        end_old, end_new = n_old, n_new
+        while end_old > start and end_new > start:
+            key, item = pairs[end_new - 1]
+            prev = old[end_old - 1]
+            item_type = str if type(item) is str else item.type
+            if prev.key != key or not (prev.type is item_type or prev.type == item_type):
+                break
+            end_old -= 1
+            end_new -= 1
+        # A different length, a new node, or an old one in another place reshapes the list.
+        reshaped = n_old != n_new
+        leftovers: Iterable[Any] = ()
+        if start < end_new:
+            by_key = {old[i].key: old[i] for i in range(start, end_old)}
+            # The ends' keys are the old children's there, so they cannot repeat each
+            # other; only a key between them can repeat one of theirs.
+            seen = set()
+            if start:
+                seen.update(pairs[i][0] for i in range(start))
+            if end_new < n_new:
+                seen.update(pairs[i][0] for i in range(end_new, n_new))
+            for i in range(start, end_new):
+                key, item = pairs[i]
+                if key in seen:
+                    logger.warning("Duplicate key %r under %s", key[-1], getattr(parent, "name", parent.type))
+                    key = (key, i)
+                seen.add(key)
+                prev = by_key.pop(key, None)
+                item_type = str if type(item) is str else item.type
+                if prev is not None and (prev.type is item_type or prev.type == item_type):
+                    update(prev, item)
+                    if not reshaped and old[i] is not prev:
+                        reshaped = True
+                    result.append(prev)
+                else:
+                    if prev is not None:
+                        self._unmount(prev, emit=True)
+                    reshaped = True
+                    result.append(self._mount(item, key, parent))
+            leftovers = by_key.values()
+        elif start < end_old:
+            leftovers = old[start:end_old]  # only removals between the ends
+        shift = n_old - n_new
+        for i in range(end_new, n_new):
+            prev = old[i + shift]
+            update(prev, pairs[i][1])
+            result.append(prev)
+        for leftover in leftovers:
             self._unmount(leftover, emit=True)
         if reshaped:
             self._reshapes += 1
