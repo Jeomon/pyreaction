@@ -69,15 +69,13 @@ The package is `pyreaction`, the import is `reaction`, and the command is
 - Python 3.11 or newer
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
-pyreaction is not on PyPI yet; install it from the Git repository:
-
 ```shell
-uv add "pyreaction @ git+https://github.com/Jeomon/pyreaction"
+uv add pyreaction
 # or
-pip install "pyreaction @ git+https://github.com/Jeomon/pyreaction"
+pip install pyreaction
 ```
 
-Optional extras are added the same way, as in `"pyreaction[redis,jinja] @ git+..."`:
+Optional extras are added the same way, as in `pyreaction[redis,jinja]`:
 
 | Extra | For |
 | --- | --- |
@@ -89,7 +87,7 @@ Optional extras are added the same way, as in `"pyreaction[redis,jinja] @ git+..
 ### Start a project
 
 ```shell
-uvx --from git+https://github.com/Jeomon/pyreaction reaction init my-app
+uvx pyreaction init my-app
 cd my-app
 uv run dev        # http://127.0.0.1:8000, restarts on every save
 ```
@@ -122,7 +120,7 @@ def order(order_id: int, user=Depends(current_user)):
     return OrderPage(order_id=order_id, user=user)
 ```
 
-  Run it as usual with `uvicorn main:api`. See [Integrations](docs/integrations.md#fastapi).
+  Run it as usual with `uvicorn main:api`. See [Integrations](https://github.com/Jeomon/pyreaction/blob/main/docs/integrations.md#fastapi).
 </details>
 
 <details>
@@ -137,7 +135,7 @@ from reaction import wrap
 application = wrap(get_asgi_application(), Dashboard, "/dashboard")
 ```
 
-  Run it with `uvicorn mysite.asgi:application`. See [Integrations](docs/integrations.md#django-flask-and-other-frameworks).
+  Run it with `uvicorn mysite.asgi:application`. See [Integrations](https://github.com/Jeomon/pyreaction/blob/main/docs/integrations.md#django-flask-and-other-frameworks).
 </details>
 
 <details>
@@ -151,7 +149,7 @@ from reaction import wrap
 app = wrap(flask_app, Dashboard, "/dashboard")
 ```
 
-  Run it with `uvicorn main:app`. See [Integrations](docs/integrations.md#django-flask-and-other-frameworks).
+  Run it with `uvicorn main:app`. See [Integrations](https://github.com/Jeomon/pyreaction/blob/main/docs/integrations.md#django-flask-and-other-frameworks).
 </details>
 
 <details>
@@ -170,7 +168,7 @@ api.mount("/components", jinja_components(templates.env, [Counter, Chart], secre
 {% component "myapp.widgets.Chart", values=[1, 2, 3] %}
 ```
 
-  See [Integrations](docs/integrations.md#jinja-templates).
+  See [Integrations](https://github.com/Jeomon/pyreaction/blob/main/docs/integrations.md#jinja-templates).
 </details>
 
 ## 🖥️ Running pyreaction
@@ -184,7 +182,7 @@ api.mount("/components", jinja_components(templates.env, [Counter, Chart], secre
 
 `reaction run` and `reaction dev` take `--host` and `--port`, which default to
 `PYREACTION_HOST`/`127.0.0.1` and `PYREACTION_PORT`/`PORT`/`8000`. Behind a proxy,
-pass the WebSocket upgrade through; [Deployment](docs/deployment.md) has an Nginx
+pass the WebSocket upgrade through; [Deployment](https://github.com/Jeomon/pyreaction/blob/main/docs/deployment.md) has an Nginx
 example and notes on workers and sticky sessions.
 
 ## ⚙️ Configuration
@@ -202,27 +200,27 @@ most often changed:
 | `max_upload_size` | 10 MiB | `PYREACTION_MAX_UPLOAD_SIZE` | bytes per uploaded file |
 | `reconnect_attempts` | `0` (no limit) | `PYREACTION_RECONNECT_ATTEMPTS` | failed attempts before a page gives up |
 
-[Configuration](docs/configuration.md) lists all of them.
+[Configuration](https://github.com/Jeomon/pyreaction/blob/main/docs/configuration.md) lists all of them.
 
 ## 📚 Documentation
 
 | | |
 | --- | --- |
-| [Getting started](docs/getting-started.md) | install, a single-file app, a project |
-| [Elements and events](docs/elements-and-events.md) | describing the page, handlers, file uploads |
-| [Hooks](docs/hooks.md) | state, effects and the rest |
-| [Data, forms and pending state](docs/data-and-forms.md) | loading data, Suspense, form actions, optimistic updates |
-| [Routing and the page head](docs/routing.md) | URLs, links, redirects, `<title>` and `<meta>` |
-| [Built-in components and the DOM](docs/components.md) | refs, portals, long lists, error boundaries, JavaScript widgets |
-| [Shared state](docs/state.md) | stores shared between pages, processes, or within one page |
-| [Integrations](docs/integrations.md) | FastAPI, Django, Flask, Jinja templates, static pages |
-| [Testing](docs/testing.md) | a fake browser for unit tests, a live server for Playwright |
-| [Configuration](docs/configuration.md) | every option, in code, `pyproject.toml` or the environment |
-| [Deployment and security](docs/deployment.md) | workers, proxies, compression, origins, limits |
-| [API reference](docs/api.md) | everything `reaction` exports |
-| [How it works](docs/how-it-works.md) | the request, the live connection, and the update protocol |
+| [Getting started](https://github.com/Jeomon/pyreaction/blob/main/docs/getting-started.md) | install, a single-file app, a project |
+| [Elements and events](https://github.com/Jeomon/pyreaction/blob/main/docs/elements-and-events.md) | describing the page, handlers, file uploads |
+| [Hooks](https://github.com/Jeomon/pyreaction/blob/main/docs/hooks.md) | state, effects and the rest |
+| [Data, forms and pending state](https://github.com/Jeomon/pyreaction/blob/main/docs/data-and-forms.md) | loading data, Suspense, form actions, optimistic updates |
+| [Routing and the page head](https://github.com/Jeomon/pyreaction/blob/main/docs/routing.md) | URLs, links, redirects, `<title>` and `<meta>` |
+| [Built-in components and the DOM](https://github.com/Jeomon/pyreaction/blob/main/docs/components.md) | refs, portals, long lists, error boundaries, JavaScript widgets |
+| [Shared state](https://github.com/Jeomon/pyreaction/blob/main/docs/state.md) | stores shared between pages, processes, or within one page |
+| [Integrations](https://github.com/Jeomon/pyreaction/blob/main/docs/integrations.md) | FastAPI, Django, Flask, Jinja templates, static pages |
+| [Testing](https://github.com/Jeomon/pyreaction/blob/main/docs/testing.md) | a fake browser for unit tests, a live server for Playwright |
+| [Configuration](https://github.com/Jeomon/pyreaction/blob/main/docs/configuration.md) | every option, in code, `pyproject.toml` or the environment |
+| [Deployment and security](https://github.com/Jeomon/pyreaction/blob/main/docs/deployment.md) | workers, proxies, compression, origins, limits |
+| [API reference](https://github.com/Jeomon/pyreaction/blob/main/docs/api.md) | everything `reaction` exports |
+| [How it works](https://github.com/Jeomon/pyreaction/blob/main/docs/how-it-works.md) | the request, the live connection, and the update protocol |
 
-Runnable apps are in [`examples/`](examples): a todo list, routed pages, a login
+Runnable apps are in [`examples/`](https://github.com/Jeomon/pyreaction/tree/main/examples): a todo list, routed pages, a login
 flow, JavaScript widgets, and a FastAPI app.
 
 ## 🔒 Security
@@ -234,8 +232,8 @@ flow, JavaScript widgets, and a FastAPI app.
   `js_component_from_string` are sent as written: never build them from user input.
 - Uploads, queued events and pending updates are capped per page.
 
-[Deployment and security](docs/deployment.md#security) has the details. To report a
-vulnerability, see [SECURITY.md](SECURITY.md); please do not open a public issue.
+[Deployment and security](https://github.com/Jeomon/pyreaction/blob/main/docs/deployment.md#security) has the details. To report a
+vulnerability, see [SECURITY.md](https://github.com/Jeomon/pyreaction/blob/main/SECURITY.md); please do not open a public issue.
 
 ## 📝 Limitations
 
@@ -248,13 +246,16 @@ vulnerability, see [SECURITY.md](SECURITY.md); please do not open a public issue
   takes about 80 ms to serve, during which other pages on that process wait.
 - **Resuming after a drop needs the same process.** With several workers, route a
   page's connections to the worker that served it (sticky sessions).
-- **Not on PyPI yet**, and the API may still change before 1.0.
+- **Before 1.0**, the API may still change between minor versions; see the
+  [changelog](https://github.com/Jeomon/pyreaction/blob/main/CHANGELOG.md).
+- **The import name is `reaction`**, which an unrelated, unmaintained PyPI package
+  (`reaction`, 2020) also uses. Do not install both in one environment.
 
 ## 🤝 Contributing
 
-Bug reports and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md)
+Bug reports and pull requests are welcome. [CONTRIBUTING.md](https://github.com/Jeomon/pyreaction/blob/main/CONTRIBUTING.md)
 explains the setup, the tests and type checks, and what a change needs.
-[CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
+[CHANGELOG.md](https://github.com/Jeomon/pyreaction/blob/main/CHANGELOG.md) lists what changed in each version.
 
 ## 🙏 References
 
@@ -282,14 +283,14 @@ Meta Platforms, Inc.; the name is used only to describe what pyreaction follows.
 ## 🪪 License
 
 pyreaction is free and open-source software, released under the
-[MIT License](LICENSE). You may use, copy, modify, merge, publish, distribute,
+[MIT License](https://github.com/Jeomon/pyreaction/blob/main/LICENSE). You may use, copy, modify, merge, publish, distribute,
 sublicense and sell it, in personal and commercial projects alike, provided the
 copyright notice and the license text are included in all copies or substantial
 portions of the software.
 
 The software is provided "as is", without warranty of any kind; the authors are
 not liable for any claim or damages arising from its use. Contributions to
-pyreaction are accepted under the same license (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+pyreaction are accepted under the same license (see [CONTRIBUTING.md](https://github.com/Jeomon/pyreaction/blob/main/CONTRIBUTING.md)).
 
 ## 📄 Citation
 

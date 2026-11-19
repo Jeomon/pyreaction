@@ -11,15 +11,18 @@ authors = [
 requires-python = ">=3.11"
 keywords = ["react", "ui", "components", "hooks", "asgi", "websocket"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: Software Development :: User Interfaces",
+    "Typing :: Typed",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Framework :: AsyncIO",
-    # PyPI rejects any upload with this classifier: not published there yet (see
-    # CHANGELOG.md). Remove it for the first release.
-    "Private :: Do Not Upload",
 ]
 dependencies = [
     "starlette>=0.37",

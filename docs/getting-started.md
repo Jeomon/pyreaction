@@ -4,16 +4,15 @@ Install pyreaction, run a single file, or start a project.
 
 ## Installation
 
-Requires Python 3.11 or newer. pyreaction is not on PyPI yet; install it from
-the Git repository:
+Requires Python 3.11 or newer.
 
 ```sh
-uv add "pyreaction @ git+https://github.com/Jeomon/pyreaction"
+uv add pyreaction
 # or
-pip install "pyreaction @ git+https://github.com/Jeomon/pyreaction"
+pip install pyreaction
 ```
 
-Optional extras, added the same way (`"pyreaction[redis,jinja] @ git+..."`):
+Optional extras, added the same way (`pyreaction[redis,jinja]`):
 
 | Extra | For |
 | --- | --- |
@@ -32,7 +31,7 @@ uvicorn; pass `host=`, `port=` and any [configuration option](configuration.md).
 ### A project
 
 ```sh
-uvx --from git+https://github.com/Jeomon/pyreaction reaction init my-app
+uvx pyreaction init my-app
 cd my-app
 uv run dev        # http://127.0.0.1:8000, restarts on every save
 uv run pro        # production server

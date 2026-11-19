@@ -6,8 +6,12 @@ welcome and are handled first.
 
 ## Supported versions
 
-pyreaction is before its first release. Fixes go into the `main` branch; once
-versions are published, the latest one will be supported.
+Security fixes go into the latest release. Before 1.0 only the newest 0.x
+version is supported: upgrade to get a fix.
+
+| Version | Supported |
+| --- | --- |
+| 0.1.x | yes |
 
 ## Reporting a vulnerability
 

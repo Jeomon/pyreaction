@@ -7,7 +7,9 @@ between minor versions.
 
 ## [Unreleased]
 
-The first public version, 0.1.0. Not yet on PyPI.
+## [0.1.0] - 2026-11-20
+
+The first public version.
 
 ### Added
 
@@ -69,4 +71,5 @@ for each change and its numbers.
 - Faster diffing, unmounting and HTML rendering (selecting one row: 12 to 7.6 ms;
   removing the first row: 19 to 9 ms; HTML: 16 to 10 ms).
 
-[Unreleased]: https://github.com/Jeomon/pyreaction/commits/main
+[Unreleased]: https://github.com/Jeomon/pyreaction/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Jeomon/pyreaction/releases/tag/v0.1.0
