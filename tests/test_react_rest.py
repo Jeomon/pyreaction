@@ -419,3 +419,52 @@ def test_event_read_needs_a_browser_event():
     with pytest.raises(RuntimeError, match="did not come from a browser"):
         Event({"value": 1}).read("x")
     assert Event({"target": {"value": 2}}).target.value == 2
+
+
+# ---- js_component_from_string ---------------------------------------------------------------
+
+
+def test_js_component_from_string_is_a_data_url_module():
+    import base64
+
+    from reaction import js_component_from_string
+
+    code = 'export function mount(el) { el.textContent = "héllo" }'
+    Widget = js_component_from_string(code, "mount", tag="span")
+    assert Widget.module.startswith("data:text/javascript;base64,") and Widget.export == "mount"
+    assert base64.b64decode(Widget.module.split(",", 1)[1]).decode() == code
+    assert render_to_string(Widget(fallback="…")) == '<span><div data-pyreaction-fallback style="display:contents">…</div></span>'
+
+
+# ---- image() and use_linked_inputs() ---------------------------------------------------------
+
+
+def test_image_shows_data_in_memory():
+    from reaction import image
+
+    assert render_to_string(image("png", b"\x89PNG", alt="chart", class_name="c")) == (
+        '<img src="data:image/png;base64,iVBORw==" alt="chart" class="c">'
+    )
+    assert 'src="data:image/svg+xml;base64,PHN2Zy8+"' in render_to_string(image("svg", "<svg/>"))
+
+
+def test_linked_inputs_share_one_value():
+    from reaction import use_linked_inputs
+
+    seen = []
+
+    @component
+    def App():
+        a, b = use_linked_inputs(
+            [{"id": "a", "type": "range"}, {"id": "b", "type": "number", "key": "b"}],
+            on_change=seen.append, cast=int, initial_value="3",
+        )
+        return html.div(a, b)
+
+    with render(App()) as page:
+        assert page.html() == '<div><input id="a" type="range" value="3"><input id="b" type="number" value="3"></div>'
+        page.type("#a", "40")
+        assert page.html() == '<div><input id="a" type="range" value="40"><input id="b" type="number" value="40"></div>'
+        page.type("#b", "")
+        assert 'value=""' in page.html()
+    assert seen == [40], "cast to int; the empty value is ignored"

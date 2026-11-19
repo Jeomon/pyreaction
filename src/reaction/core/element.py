@@ -6,9 +6,9 @@ event handlers, so the reconciler only ever compares ready-to-send values.
 
 from __future__ import annotations
 
-import inspect
-
+import base64
 import functools
+import inspect
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -771,4 +771,25 @@ def js_component(module: str, export: str = "default", tag: str = "div") -> JsCo
     markup); they stay live Python components. ``fallback`` (an element or HTML
     string) shows until the module has loaded, in the server's HTML too.
     """
+    return JsComponent(module, export, tag)
+
+
+def js_component_from_string(code: str, export: str = "default", tag: str = "div") -> JsComponent:
+    """A :func:`js_component` whose module is written inline, for a small widget
+    that does not deserve its own file::
+
+        Clock = js_component_from_string('''
+            export default function mount(element, props, emit) {
+              const tick = () => (element.textContent = new Date().toLocaleTimeString(props.locale));
+              tick();
+              const timer = setInterval(tick, 1000);
+              return { update(next) { props = next; tick(); }, unmount() { clearInterval(timer); } };
+            }
+        ''')
+
+    The browser imports ``code`` as a module from a ``data:`` URL, so it can import
+    other modules by full URL (``https://...``) but not by relative path. Pages
+    whose Content-Security-Policy limits ``script-src`` need ``data:`` allowed.
+    """
+    module = "data:text/javascript;base64," + base64.b64encode(code.encode()).decode("ascii")
     return JsComponent(module, export, tag)

@@ -12,7 +12,19 @@ patched into the browser over a WebSocket.
 """
 
 from .core.boundary import ErrorBoundary
-from .core.components import Activity, Form, FormStatus, Head, Profiler, StrictMode, ViewTransition, Suspense, use_form_status
+from .core.components import (
+    Activity,
+    Form,
+    FormStatus,
+    Head,
+    Profiler,
+    StrictMode,
+    Suspense,
+    ViewTransition,
+    image,
+    use_form_status,
+    use_linked_inputs,
+)
 from .core.element import (
     Children,
     Component,
@@ -29,6 +41,7 @@ from .core.element import (
     is_valid_element,
     js,
     js_component,
+    js_component_from_string,
     memo,
     portal,
 )
@@ -79,7 +92,17 @@ from .core.ssr import render_to_static_markup, render_to_string
 from .core.resources import preconnect, prefetch_dns, preinit, preinit_module, preload, preload_module
 from .core.store import RedisBackend, Store, StoreBackend, use_store
 
-__version__ = "0.1.0"
+def _version() -> str:
+    # The version is written once, in pyproject.toml; this reads the installed copy.
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("pyreaction")
+    except PackageNotFoundError:  # run from a source tree that was never installed
+        return "0.0.0"
+
+
+__version__ = _version()
 
 __all__ = [
     "forward_ref",
@@ -133,12 +156,16 @@ __all__ = [
     "prerender",
     "create_context",
     "embed",
+    "jinja_components",
     "event",
     "fragment",
     "h",
     "html",
     "js",
     "js_component",
+    "js_component_from_string",
+    "image",
+    "use_linked_inputs",
     "memo",
     "parse_html",
     "preload_module",
@@ -183,7 +210,7 @@ __all__ = [
 
 def __getattr__(name: str):
     # The server pulls in Starlette; load it only when it is asked for.
-    if name in ("create_app", "embed", "mount", "page", "prerender", "run", "wrap"):
+    if name in ("create_app", "embed", "jinja_components", "mount", "page", "prerender", "run", "wrap"):
         from . import server
 
         return getattr(server, name)

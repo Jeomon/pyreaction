@@ -620,3 +620,35 @@ def test_flask_app_with_pages_under_ui_in_chrome(page):
         page.go_back()
         page.wait_for_selector("#at")
         assert page.evaluate("location.pathname") == "/ui/"
+
+
+def test_js_component_from_string_in_chrome(page):
+    from reaction import js_component_from_string
+
+    Counter = js_component_from_string("""
+        export default function mount(element, props, emit, slot) {
+          const button = document.createElement("button");
+          button.id = "js-btn";
+          const draw = (p) => (button.textContent = `${p.label}: ${p.count}`);
+          button.onclick = () => emit("bump", { by: 2 });
+          draw(props);
+          element.append(button, slot);
+          return { update: draw, unmount() { button.remove(); } };
+        }
+    """)
+
+    @component
+    def App():
+        count, set_count = use_state(0)
+        return html.main(
+            Counter(html.p(f"python sees {count}", id="py"), label="clicks", count=count,
+                    on_bump=lambda e: set_count(count + e.by)),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.wait_for_selector("#js-btn")
+        assert page.text_content("#js-btn") == "clicks: 0"
+        page.click("#js-btn")
+        page.wait_for_function("document.querySelector('#js-btn').textContent === 'clicks: 2'")
+        assert page.text_content("#py") == "python sees 2"

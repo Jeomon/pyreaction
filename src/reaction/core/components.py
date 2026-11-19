@@ -1,9 +1,10 @@
-"""Built-in components: forms with pending state, Suspense, Activity and Head."""
+"""Built-in components: forms with pending state, Suspense, Activity, Head, and small widgets."""
 
 from __future__ import annotations
 
+import base64
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from .element import Element, component, html
@@ -11,8 +12,52 @@ from .hooks import BROWSER_ONLY, CURRENT, Ref, create_context, use_context, use_
 
 __all__ = [
     "Activity", "Form", "FormStatus", "Head", "Profiler", "StrictMode", "Suspense", "ViewTransition",
-    "use_form_status",
+    "image", "use_form_status", "use_linked_inputs",
 ]
+
+
+def image(format: str, value: str | bytes, **attrs: Any) -> Element:
+    """An ``<img>`` showing image data you have in memory, e.g. a chart drawn with
+    matplotlib: ``image("png", buffer.getvalue(), alt="Sales")``.
+
+    ``format`` is the image type (``"png"``, ``"jpeg"``, ``"gif"``, ``"webp"``;
+    ``"svg"`` for SVG text). The data travels inside the page as base64, so keep it
+    small; serve large images as files instead.
+    """
+    if format == "svg":
+        format = "svg+xml"
+    data = value.encode() if isinstance(value, str) else value
+    return html.img(src=f"data:image/{format};base64,{base64.b64encode(data).decode('ascii')}", **attrs)
+
+
+def use_linked_inputs(
+    attributes: Sequence[dict[str, Any]],
+    on_change: Callable[[Any], Any] | None = None,
+    cast: Callable[[str], Any] = lambda value: value,
+    initial_value: str = "",
+    ignore_empty: bool = True,
+) -> list[Element]:
+    """Inputs that always show the same value: typing in one updates the others.
+
+    Returns one ``<input>`` per dict in ``attributes`` (its props, e.g.
+    ``{"type": "range", "max": 100}``; give each a ``key`` when their number
+    changes). ``on_change`` gets ``cast(value)`` whenever one changes, except for
+    an empty value when ``ignore_empty``::
+
+        slider, box = use_linked_inputs(
+            [{"type": "range", "max": 100}, {"type": "number"}], on_change=set_level, cast=int,
+        )
+    """
+    value, set_value = use_state(initial_value)
+
+    def sync(e: Any) -> Any:
+        new = e.value if e.value is not None else ""
+        set_value(new)
+        if on_change is None or (ignore_empty and new == ""):
+            return None
+        return on_change(cast(new))
+
+    return [html.input(**{**attrs, "value": value, "on_change": sync}) for attrs in attributes]
 
 
 class FormStatus:

@@ -38,6 +38,8 @@ redis = ["redis>=5"]
 wsgi = [
     "a2wsgi>=1.10",
 ]
+# The {% component %} tag for Jinja templates: jinja_components().
+jinja = ["jinja2>=3.1"]
 
 [dependency-groups]
 dev = [

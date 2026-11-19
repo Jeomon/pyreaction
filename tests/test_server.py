@@ -267,3 +267,66 @@ def test_resume_timeout_zero_closes_at_once():
         with connect(client) as ws:
             assert "sid" in json.loads(ws.receive_text())
         wait_for(lambda: cleaned == [1])
+
+
+def test_a_page_that_floods_events_is_disconnected_and_resumes():
+    from reaction.core import vdom
+
+    roots = []
+    most = [0]  # the most events ever waiting at once
+    attach = vdom.Root.attach
+    dispatch = vdom.Root.dispatch
+
+    def count(self, *args):
+        dispatch(self, *args)
+        most[0] = max(most[0], self.pending_events)
+
+    def spy(self, *args, **kwargs):
+        roots.append(self)
+        return attach(self, *args, **kwargs)
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+
+        def slow():
+            time.sleep(0.005)
+            set_n(lambda v: v + 1)
+
+        return html.button(f"n={n}", on_click=slow)
+
+    app = create_app(App, max_pending_events=50)
+    vdom.Root.attach = spy
+    vdom.Root.dispatch = count
+    try:
+        with TestClient(app) as client:
+            with client.websocket_connect("/_pyreaction/ws?p=/") as ws:
+                first = json.loads(ws.receive_text())
+                sid = first["sid"]
+                button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
+                for i in range(500):
+                    ws.send_text(json.dumps([i + 1, button, "click", {}]))
+                with pytest.raises(WebSocketDisconnect) as closed:
+                    while True:
+                        ws.receive_text()
+                assert closed.value.code == 1013
+            root = roots[0]
+            assert most[0] <= 50, "the server never queued past the limit"
+            deadline = time.monotonic() + 5
+            while (root.pending_events or root._busy) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # Only the events read before the limit ran; the page resumes with them.
+            from reaction import to_vdom
+
+            label = to_vdom(root)["children"][0]["children"][0]
+            assert 1 <= int(label.removeprefix("n=")) < 500, label
+            with client.websocket_connect(f"/_pyreaction/ws?p=/&s={sid}&h=1") as ws:
+                assert json.loads(ws.receive_text())["resumed"]
+                ws.send_text(json.dumps([1000, button, "click", {}]))
+                deadline = time.monotonic() + 5
+                while to_vdom(root)["children"][0]["children"][0] == label and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert to_vdom(root)["children"][0]["children"][0] == f"n={int(label[2:]) + 1}"
+    finally:
+        vdom.Root.attach = attach
+        vdom.Root.dispatch = dispatch

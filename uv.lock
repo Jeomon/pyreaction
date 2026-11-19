@@ -1013,6 +1013,9 @@ browser = [
 fast = [
     { name = "orjson" },
 ]
+jinja = [
+    { name = "jinja2" },
+]
 redis = [
     { name = "redis" },
 ]
@@ -1039,6 +1042,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "a2wsgi", marker = "extra == 'wsgi'", specifier = ">=1.10" },
+    { name = "jinja2", marker = "extra == 'jinja'", specifier = ">=3.1" },
     { name = "orjson", marker = "extra == 'fast'", specifier = ">=3.9" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.50" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=5" },
@@ -1046,7 +1050,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "websockets", specifier = ">=12" },
 ]
-provides-extras = ["fast", "browser", "redis", "wsgi"]
+provides-extras = ["fast", "browser", "redis", "wsgi", "jinja"]
 
 [package.metadata.requires-dev]
 dev = [

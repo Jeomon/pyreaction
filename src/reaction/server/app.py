@@ -10,6 +10,9 @@ requests and any worker process can serve either one.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -47,7 +50,7 @@ except ImportError:  # pragma: no cover - depends on the optional extra
     def _dumps(data: Any) -> str:
         return _encoder.encode(data)
 
-__all__ = ["create_app", "embed", "mount", "page", "prerender", "run", "wrap"]
+__all__ = ["create_app", "embed", "jinja_components", "mount", "page", "prerender", "run", "wrap"]
 
 logger = logging.getLogger("reaction")
 
@@ -351,6 +354,7 @@ def create_app(
     stylesheets: Sequence[str] = (),
     allowed_origins: Sequence[str] = (),
     max_pending_ops: int = 100_000,
+    max_pending_events: int = 1000,
     max_upload_size: int = DEFAULT_MAX_UPLOAD,
     prefix: str = "/_pyreaction",
     data_timeout: float = 5.0,
@@ -372,6 +376,9 @@ def create_app(
     WebSockets are only accepted from the page's own origin plus
     ``allowed_origins`` (needed behind a proxy that rewrites the Host header;
     ``"*"`` allows any). ``max_upload_size`` (bytes) caps each uploaded file.
+    A page that sends more than ``max_pending_events`` events its handlers have not
+    started yet is disconnected (it reconnects and resumes), so a page cannot
+    queue work on the server without limit.
 
     The first HTML waits up to ``data_timeout`` seconds for data that
     ``use_async``/``use_data`` load, so it arrives with the data in it. With
@@ -546,6 +553,13 @@ def create_app(
                 if event is None:
                     logger.warning("Ignored a malformed message on a WebSocket")
                     continue
+                if root.pending_events >= max_pending_events:
+                    # Handlers are not keeping up with this page: stop reading
+                    # rather than queue without limit. The page reconnects and
+                    # resumes once the queued events have run.
+                    logger.warning("Closing a WebSocket with %d events waiting", root.pending_events)
+                    await ws.close(code=TRY_AGAIN_LATER)
+                    break
                 root.dispatch(*event)
         finally:
             writing.cancel()
@@ -747,7 +761,7 @@ async def _empty_request(receive: Any) -> Any:
 
 def wrap(
     app: Any,
-    component: Component | Element | Callable[[], Element],
+    component: Component | Element | Callable[[], Element] | Starlette,
     path: str = "/",
     **options: Any,
 ) -> Any:
@@ -773,7 +787,8 @@ def wrap(
     wrap it under a path and add :func:`embed` to the template.
     """
     inner = _as_asgi(app)
-    ours = create_app(component, **options)
+    # A pyreaction app already built (create_app, jinja_components) is used as is.
+    ours = component if isinstance(component, Starlette) else create_app(component, **options)
     base = "/" + path.strip("/") if path.strip("/") else ""
     prefix = options.get("prefix", "/_pyreaction")
     own_paths = [prefix]
@@ -860,6 +875,17 @@ def embed(
     page connects. ``location`` is the URL the app sees, normally the host page's
     path. Use a different ``element_id`` for each app on a page.
     """
+    return _embed_html(app, mount_path, location, element_id, prefix, "")
+
+
+def _embed_html(
+    app: Component | Element | Callable[[], Element] | None,
+    mount_path: str,
+    location: str,
+    element_id: str,
+    prefix: str,
+    ws_query: str,
+) -> str:
     body = ""
     if app is not None:
         root = Root(_as_factory(app)(), location=location)
@@ -870,8 +896,106 @@ def embed(
     base = escape(mount_path.rstrip("/") + prefix)
     return (
         f'<div id="{escape(element_id)}">{body}</div>'
-        f'<script src="{base}/client.js" data-ws="{base}/ws" data-mount="{escape(element_id)}"></script>'
+        f'<script src="{base}/client.js" data-ws="{base}/ws{escape(ws_query)}" data-mount="{escape(element_id)}"></script>'
     )
+
+
+def _dotted(component: Any) -> str:
+    return f"{component.__module__}.{getattr(component, '__qualname__', component.__name__)}"
+
+
+def jinja_components(
+    env: Any,
+    components: Sequence[Component | Callable[..., Element]],
+    *,
+    mount_path: str = "/components",
+    secret: str | bytes | None = None,
+    **options: Any,
+) -> Any:
+    """Add a ``{% component %}`` tag to a Jinja ``Environment`` and return the ASGI
+    app that runs those components, to mount at ``mount_path``::
+
+        templates = Jinja2Templates("templates")
+        api.mount("/components", jinja_components(templates.env, [Counter, Chart]))
+
+        {# in a template #}
+        {% component "myapp.widgets.Counter" %}
+        {% component "myapp.widgets.Chart", values=[1, 2, 3], title=page_title %}
+
+    Only the listed components can be named, by import path
+    (``module.qualname``). The tag writes the server-rendered HTML and the script;
+    the component and its props (JSON values) travel in the WebSocket URL, signed
+    with ``secret``, so a visitor cannot choose another component or change the
+    props. Give the same ``secret`` to every worker process; the default is a
+    random one, which works for a single process only. The location the component
+    sees is the ``request`` in the template's context (Starlette, Flask or Django),
+    else ``/``. For Flask or Django, put the returned app in front with
+    :func:`wrap`. ``options`` go to :func:`create_app`.
+    """
+    try:
+        from jinja2 import nodes
+        from jinja2.ext import Extension
+        from markupsafe import Markup
+    except ImportError:
+        raise ImportError('jinja_components() needs Jinja: pip install "pyreaction[jinja]"') from None
+    from ..core.element import component as as_component
+    from ..core.hooks import use_request
+
+    registry = {_dotted(c): c for c in components}
+    key = secret.encode() if isinstance(secret, str) else secret or secrets.token_bytes(32)
+    prefix = options.get("prefix", "/_pyreaction")
+
+    def sign(name: str, props: dict[str, Any]) -> str:
+        payload = base64.urlsafe_b64encode(json.dumps([name, props], separators=(",", ":")).encode()).decode()
+        mac = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:32]
+        return f"{payload}.{mac}"
+
+    def unsign(token: str) -> tuple[str, dict[str, Any]] | None:
+        payload, _, mac = token.rpartition(".")
+        good = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:32]
+        if not payload or not hmac.compare_digest(mac, good):
+            return None
+        name, props = json.loads(base64.urlsafe_b64decode(payload))
+        return (name, props) if name in registry else None
+
+    @as_component
+    def Chosen() -> Any:
+        conn = use_request()
+        found = unsign(conn.query_params.get("c", "")) if conn is not None else None
+        if found is None:
+            return None  # an unsigned or altered request: show nothing
+        name, props = found
+        return registry[name](**props)
+
+    def render_tag(context: Any, name: str, /, **props: Any) -> Markup:
+        if name not in registry:
+            raise KeyError(f"{name!r} is not one of the components given to jinja_components()")
+        json.dumps(props)  # props travel as JSON; fail here, in the template, if they cannot
+        request = context.get("request")
+        path = getattr(request, "path", None) or getattr(getattr(request, "url", None), "path", None) or "/"
+        query = "?c=" + sign(name, props)
+        element_id = "pyreaction-" + secrets.token_hex(4)
+        return Markup(_embed_html(registry[name](**props), mount_path, path, element_id, prefix, query))
+
+    class ComponentTag(Extension):
+        tags = {"component"}
+
+        def parse(self, parser: Any) -> Any:
+            lineno = next(parser.stream).lineno
+            name = parser.parse_expression()
+            kwargs = []
+            while parser.stream.skip_if("comma"):
+                target = parser.stream.expect("name")
+                parser.stream.expect("assign")
+                kwargs.append(nodes.Keyword(target.value, parser.parse_expression()))
+            call = self.call_method("_render", [nodes.ContextReference(), name], kwargs)
+            return nodes.Output([call], lineno=lineno)
+
+        def _render(self, context: Any, name: str, /, **props: Any) -> Markup:
+            return render_tag(context, name, **props)
+
+    env.add_extension(ComponentTag)
+    return create_app(Chosen, **options)
 
 
 async def _get(asgi: Any, path: str) -> tuple[int, dict[str, str], str]:

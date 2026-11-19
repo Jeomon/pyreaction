@@ -152,6 +152,10 @@ Values come back as JSON (a file as its name, type and size; a list as its items
 The browser has finished with the event by then, so `preventDefault` and the like
 are set with `event(...)` options, not called afterwards.
 
+`image("png", data, alt=...)` shows image bytes you have in memory, such as a
+matplotlib chart, as an `<img>` with a `data:` URL (`"svg"` takes SVG text). Keep
+such images small; serve large ones as files.
+
 ### File uploads
 
 ```python
@@ -191,6 +195,7 @@ browser and arrives with `.error` set and no data.
 | `use_status(code)` | the HTTP status of the first response, e.g. 404 or 410 |
 | `use_request()` | the Starlette `Request`, then `WebSocket`, serving the page: `.headers`, `.cookies`, `.client` |
 | `use_id()` | an id that is the same in the server's HTML and the live page, for `label`/`aria-*` pairs |
+| `use_linked_inputs(attrs_list, on_change, cast)` | inputs that show one value: typing in one updates the others (a slider and a number box) |
 | `use_store(store)` / `use_sync_external_store(subscribe, get)` | state shared between pages; see [Shared state](#shared-state) |
 | `use_effect_event(fn)` | a stable function that always calls the latest `fn` |
 | `use_imperative_handle(ref, create, deps)` | expose an API to a parent holding `ref` |
@@ -470,6 +475,22 @@ React components wrap the same way: `examples/static/react_slider.js` renders a
 React component with `createRoot` inside `mount`, passes props through in
 `update`, and calls `root.unmount()` in `unmount`. See `examples/widgets.py`.
 
+A small module can be written inline instead of in a file:
+
+```python
+Clock = js_component_from_string("""
+  export default function mount(element, props) {
+    const tick = () => (element.textContent = new Date().toLocaleTimeString());
+    tick();
+    const timer = setInterval(tick, 1000);
+    return { unmount() { clearInterval(timer); } };
+  }
+""")
+```
+
+The browser imports it from a `data:` URL, so it can import other modules by full
+URL only, and a Content-Security-Policy must allow `data:` scripts.
+
 ## Testing
 
 ```python
@@ -648,8 +669,37 @@ its own server or gunicorn's sync workers. To put a component inside a Django or
 Flask template, wrap it under a path and add `embed(Widget, mount_path="/widget")`
 to the template (`|safe` / `mark_safe`). Checked with Django 6.1 and Flask 3.1.
 
+### A `{% component %}` tag for Jinja templates
+
+```python
+from reaction import jinja_components
+
+# FastAPI with Jinja2Templates
+api.mount("/components", jinja_components(templates.env, [Counter, Chart], secret=SECRET))
+
+# Flask
+components = jinja_components(flask_app.jinja_env, [Counter, Chart], secret=SECRET)
+app = wrap(flask_app, components, "/components")
+```
+
+```jinja
+{% component "myapp.widgets.Counter" %}
+{% component "myapp.widgets.Chart", values=[1, 2, 3], title=page_title %}
+```
+
+The tag writes the component's server-rendered HTML and its script; it goes live
+when the page connects. Only the listed components can be named, by import path
+(`module.Name`), and props must be JSON values. The component and its props
+travel in the WebSocket URL, signed with `secret`, so a visitor cannot pick
+another component or change the props. Give every worker process the same
+`secret`; the default is random, which works for one process only. The location
+the component sees is the template context's `request` path. Needs Jinja:
+`pip install "pyreaction[jinja]"`.
+
 Options: `title`, `head`, `lang`, `static_dir`, `static_path`, `stylesheets`,
 `routes` (extra Starlette routes), `data_timeout`, `stream`, `max_upload_size`,
+`max_pending_events` (1000 by default: a page sending more events than its handlers
+have started is disconnected, then reconnects and resumes),
 `allowed_origins`, `on_error`, `threaded`, `reconnect_max` (ms),
 `resume_timeout` (s) and `debug`.
 

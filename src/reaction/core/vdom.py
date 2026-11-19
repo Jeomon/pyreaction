@@ -616,6 +616,7 @@ class Root:
         self._suspense_tasks: set[asyncio.Task[Any]] = set()
         # Events and effect batches, run in order by one worker once attached.
         self._queue: asyncio.Queue[tuple[str, Any]] | None = None
+        self.pending_events = 0  # browser events queued and not yet started
         self._busy = False
         with _gc_paused():
             self.container.children = self._reconcile(self.container, [], (element,))
@@ -1054,6 +1055,8 @@ class Root:
         ACTIVE_ROOT.set(self)  # this task's context: its handlers, effects and threads
         while True:
             kind, job = await self._queue.get()
+            if kind == "event":
+                self.pending_events -= 1
             self._busy = True
             try:
                 if kind == "event":
@@ -1270,6 +1273,7 @@ class Root:
             self._answer(data)
             return
         if self._queue is not None:
+            self.pending_events += 1
             self._queue.put_nowait(("event", (seq, node_id, name, data)))
             return
         call = self._resolve(seq, node_id, name, data)

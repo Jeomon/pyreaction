@@ -23,7 +23,7 @@ from reaction import (
     use_status,
 )
 
-from .test_reconciler import Harness
+from .test_vdom import Harness
 
 
 def test_slow_sync_handler_does_not_block_other_sessions():

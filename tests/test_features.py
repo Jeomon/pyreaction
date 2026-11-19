@@ -15,7 +15,7 @@ from reaction import (
     use_title,
 )
 
-from .test_reconciler import Harness
+from .test_vdom import Harness
 
 
 def test_ref_commands_reach_the_browser_and_release_on_unmount():

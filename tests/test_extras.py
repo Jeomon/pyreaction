@@ -16,7 +16,7 @@ from reaction import (
     use_state,
 )
 
-from .test_reconciler import Harness
+from .test_vdom import Harness
 
 Chart = js_component("/static/chart.js", "mount")
 
