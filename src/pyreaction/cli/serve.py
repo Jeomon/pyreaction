@@ -45,7 +45,7 @@ def load_app(root: Path, config: dict[str, Any], debug: bool = False) -> Any:
 
     ``debug`` shows errors in the browser; ``pyreaction dev`` turns it on.
     """
-    from ..server import create_app
+    from ..server.app import DEFAULT_MAX_UPLOAD, create_app
 
     target = config.get("app", "app:App")
     module_name, _, attr = target.partition(":")
@@ -69,6 +69,7 @@ def load_app(root: Path, config: dict[str, Any], debug: bool = False) -> Any:
         static_dir=static_dir,
         stylesheets=config.get("stylesheets", []) if static_dir is not None else [],
         allowed_origins=config.get("allowed_origins", []),
+        max_upload_size=config.get("max_upload_size", DEFAULT_MAX_UPLOAD),
         debug=debug,
     )
 
@@ -84,9 +85,12 @@ def app_factory() -> Any:
 def _serve(args: argparse.Namespace, reload: bool) -> int:
     import uvicorn
 
+    from ..server.app import DEFAULT_MAX_UPLOAD, ws_max_size
+
     root, config = find_project(Path.cwd())
     os.environ[PROJECT_ENV] = str(root)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    frame_limit = ws_max_size(config.get("max_upload_size", DEFAULT_MAX_UPLOAD))
     if reload:
         print(f"pyreaction dev: serving {root.name} at http://{args.host}:{args.port} (reloads on save)")
         uvicorn.run(
@@ -97,9 +101,16 @@ def _serve(args: argparse.Namespace, reload: bool) -> int:
             reload=True,
             reload_dirs=[str(root)],
             log_level="warning",
+            ws_max_size=frame_limit,
         )
     else:
-        uvicorn.run(load_app(root, config), host=args.host, port=args.port, log_level=args.log_level)
+        uvicorn.run(
+            load_app(root, config),
+            host=args.host,
+            port=args.port,
+            log_level=args.log_level,
+            ws_max_size=frame_limit,
+        )
     return 0
 
 

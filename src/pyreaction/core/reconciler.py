@@ -12,6 +12,8 @@ of operations on those ids, so an update costs what changed, not what exists:
     ["x", id, text]                 change a text node
     ["e", id, name, spec]           listen to an event (null stops listening)
     ["m", id, method, args]         call a method on an element, e.g. focus
+    ["j", id, tag, module, export, props]   create an element a JavaScript module draws into
+    ["J", id, props]               pass new props to that module
 
 A message carries ``ops`` and ``ack``, and when they change ``title``, ``nav``
 (a URL to push into the browser's history) and, in debug mode, ``errors``.
@@ -34,12 +36,12 @@ from collections.abc import Callable, Iterable
 from typing import Any
 from urllib.parse import parse_qs
 
-from .element import FRAGMENT, Component, Element
+from .element import FRAGMENT, Component, Element, JsComponent
 from .hooks import CURRENT, Context, EffectSlot, same
 
 logger = logging.getLogger("pyreaction")
 
-__all__ = ["ElementHandle", "Event", "Location", "Root"]
+__all__ = ["ElementHandle", "Event", "Location", "Root", "UploadedFile"]
 
 _SKIP = object()
 
@@ -113,6 +115,28 @@ class Event(dict):
     def __getattr__(self, name: str) -> Any:
         value = self.get(name)
         return Event(value) if isinstance(value, dict) and not isinstance(value, Event) else value
+
+
+class UploadedFile:
+    """A file the person picked, in ``e.files`` of a file input's event.
+
+    ``error`` is set, and ``data`` empty, when the file was refused (too large).
+    """
+
+    __slots__ = ("name", "type", "size", "data", "error")
+
+    def __init__(self, name: str, type: str, data: bytes, error: str | None = None, size: int | None = None) -> None:
+        self.name = name
+        self.type = type
+        self.data = data
+        self.size = len(data) if size is None else size
+        self.error = error
+
+    def text(self, encoding: str = "utf-8") -> str:
+        return self.data.decode(encoding)
+
+    def __repr__(self) -> str:
+        return f"<UploadedFile {self.name!r} {self.size} bytes{' ' + self.error if self.error else ''}>"
 
 
 class Location:
@@ -261,6 +285,8 @@ class Root:
         self._nav: dict[str, Any] | None = None
         self._errors: list[str] = []
         self._location_subs: set[ComponentNode] = set()
+        # Files received ahead of the event that refers to them, by upload id.
+        self.uploads: dict[str, UploadedFile] = {}
         self._ids = itertools.count(1)
         self._dirty: list[tuple[int, int, ComponentNode]] = []
         self._seq = itertools.count()
@@ -317,6 +343,9 @@ class Root:
             for node in self._dom_nodes(host.children):
                 if isinstance(node, TextNode):
                     ops.append(["t", node.id, node.text])
+                    continue
+                if isinstance(node.type, JsComponent):
+                    ops.append(self._js_create(node.id, node.type, node.attrs))
                     continue
                 ops.append(["c", node.id, node.type, node.attrs, {n: h.spec() for n, h in node.events.items()}])
                 walk(node)
@@ -488,6 +517,10 @@ class Root:
                 self.set_location(to)
             self._ack(seq)
             return
+        files = data.get("files")
+        if isinstance(files, list):
+            # Taken out of storage now, whether or not a handler wants them.
+            data["files"] = [self._take_upload(f) for f in files if isinstance(f, dict)]
         node = self.hosts.get(node_id)
         handler = node.events.get(name) if node is not None else None
         if handler is None:
@@ -509,6 +542,17 @@ class Root:
     def _ack(self, seq: int) -> None:
         if seq > self.ack:
             self.ack = seq
+
+    def _take_upload(self, meta: dict[str, Any]) -> UploadedFile:
+        name = str(meta.get("name", ""))
+        type_ = str(meta.get("type", ""))
+        size = meta.get("size") if isinstance(meta.get("size"), int) else 0
+        upload_id = meta.get("id")
+        stored = self.uploads.pop(upload_id, None) if isinstance(upload_id, str) else None
+        if stored is not None:
+            return stored
+        error = meta.get("error") if isinstance(meta.get("error"), str) else "not received"
+        return UploadedFile(name, type_, b"", error=error, size=size)
 
     # ---- reconciliation --------------------------------------------------------
 
@@ -542,6 +586,13 @@ class Root:
             node_id = next(self._ids)
             self.ops.append(["t", node_id, item])
             return TextNode(node_id, item, key, parent)
+        if isinstance(item.type, JsComponent):
+            host = HostNode(next(self._ids), item, key, parent)
+            self.hosts[host.id] = host
+            self.ops.append(self._js_create(host.id, item.type, item.attrs))
+            if item.ref is not None:
+                item.ref.current = ElementHandle(self, host.id)
+            return host
         if isinstance(item.type, str) and item.type != FRAGMENT:
             host = HostNode(next(self._ids), item, key, parent)
             self.hosts[host.id] = host
@@ -586,6 +637,15 @@ class Root:
     def _diff_host(self, node: HostNode, item: Element) -> None:
         ops = self.ops
         old_attrs, new_attrs = node.attrs, item.attrs
+        if isinstance(node.type, JsComponent):
+            # The module gets all its props at once; callbacks are looked up on dispatch.
+            if old_attrs != new_attrs:
+                ops.append(["J", node.id, new_attrs])
+            self._swap_ref(node, item)
+            node.element = item
+            node.attrs = new_attrs
+            node.events = item.events
+            return
         if old_attrs != new_attrs:
             for name, value in new_attrs.items():
                 if old_attrs.get(name, _SKIP) != value:
@@ -600,11 +660,7 @@ class Root:
                     ops.append(["e", node.id, name, handler.spec()])
             for name in old_events.keys() - new_events.keys():
                 ops.append(["e", node.id, name, None])
-        old_ref, new_ref = node.element.ref, item.ref
-        if old_ref is not new_ref:
-            self._release_ref(node)
-            if new_ref is not None:
-                new_ref.current = ElementHandle(self, node.id)
+        self._swap_ref(node, item)
         node.element = item
         node.attrs = new_attrs
         node.events = new_events
@@ -678,6 +734,16 @@ class Root:
         ref = node.element.ref
         if ref is not None and isinstance(ref.current, ElementHandle) and ref.current.id == node.id:
             ref.current = None
+
+    def _swap_ref(self, node: HostNode, item: Element) -> None:
+        if node.element.ref is not item.ref:
+            self._release_ref(node)
+            if item.ref is not None:
+                item.ref.current = ElementHandle(self, node.id)
+
+    @staticmethod
+    def _js_create(node_id: int, js: JsComponent, props: dict[str, Any]) -> list[Any]:
+        return ["j", node_id, js.tag, js.module, js.export, props]
 
     def _unmount(self, node: Any, emit: bool) -> None:
         if isinstance(node, TextNode):

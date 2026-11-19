@@ -43,6 +43,7 @@ title = "my-app"
 static = "public"
 stylesheets = ["style.css"]  # files in the static folder to link
 head = ""                    # extra raw HTML for <head>
+max_upload_size = 10485760   # bytes per uploaded file (default 10 MiB)
 ```
 
 `init` takes `--no-install` and `--no-git`.
@@ -85,7 +86,57 @@ Submit events call `preventDefault` by default. For other options:
 from pyreaction import event
 html.input(on_input=event(search, debounce=300))          # skipped events never reach the server
 html.a("Open", href="#", on_click=event(open_, prevent_default=True))
+html.textarea(on_key_down=event(send, keys=["Enter"], prevent_default=True))
 ```
+
+`keys` limits a keyboard event to those `KeyboardEvent.key` values. Other keys
+stay in the browser: they are not sent, and their default is not prevented, so
+the example above blocks only Enter and the textarea still takes other typing.
+
+### File uploads
+
+```python
+def save(e):
+    for f in e.files:          # UploadedFile: .name, .type, .size, .data (bytes), .text(), .error
+        if not f.error:
+            Path("uploads", f.name).write_bytes(f.data)
+
+html.input(type="file", multiple=True, on_change=save)
+```
+
+Files travel over the page's WebSocket ahead of the event, so no extra endpoint
+or dependency is needed. A file over `max_upload_size` (10 MiB by default) is
+refused in the browser and arrives with `.error` set and no data. Files are held
+in memory until the handler runs; keep the limit modest, or write large files
+elsewhere.
+
+## JavaScript components
+
+For what Python cannot draw in the browser (charts, maps, editors), wrap a
+JavaScript module:
+
+```python
+from pyreaction import js_component
+
+Chart = js_component("/static/chart.js", "mount")
+
+Chart(values=values, color="teal", on_pick=lambda e: set_picked(e.index))
+```
+
+```js
+// public/chart.js
+export function mount(element, props, emit) {
+  // draw into element; emit("pick", {index: 2}) calls on_pick in Python
+  return { update(props) { /* redraw */ }, unmount() { /* clean up */ } };
+}
+```
+
+Props must be JSON values and are passed whole to `update` when any changes;
+`on_<name>` props are Python callbacks that `emit("<name>", data)` calls. The
+module URL can be a file in your static folder or a CDN address. The element
+is an empty `<div>` (or `tag=`) in the server's HTML, filled in once the page
+is live. `ref=` works too, for `ref.current.call("method")`. See
+`examples/widgets.py`.
 
 ## Hooks
 
@@ -161,8 +212,8 @@ boundary also shows in the browser with its traceback.
 
 `run(App, host=, port=, ...)` starts uvicorn; other options go to `create_app`.
 `create_app(App, ...)` returns the Starlette app, to mount in FastAPI or any ASGI
-server. It takes `title`, `head`, `lang`, `debug`, and `static_dir`, `static_path`
-and `stylesheets` for static files:
+server. It takes `title`, `head`, `lang`, `debug`, `max_upload_size`, and
+`static_dir`, `static_path` and `stylesheets` for static files:
 
 ```python
 api.mount("/ui", create_app(App, static_dir="public", stylesheets=["app.css"]))
@@ -179,6 +230,10 @@ header, list the public origin: `create_app(App, allowed_origins=["https://app.e
 
 Any number of worker processes can serve the app: the page load and its
 WebSocket need not reach the same one.
+
+`run()` and `pyreaction dev/run` raise uvicorn's WebSocket frame limit to fit
+`max_upload_size`. With another server, allow frames of at least that size plus
+64 KiB (uvicorn: `--ws-max-size`).
 
 ## How it works
 

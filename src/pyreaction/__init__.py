@@ -12,7 +12,7 @@ patched into the browser over a WebSocket.
 """
 
 from .core.boundary import ErrorBoundary
-from .core.element import Component, Element, component, event, fragment, h, html, memo
+from .core.element import Component, Element, JsComponent, component, event, fragment, h, html, js_component, memo
 from .core.hooks import (
     Context,
     Ref,
@@ -29,7 +29,7 @@ from .core.hooks import (
     use_state,
     use_title,
 )
-from .core.reconciler import ElementHandle, Event, Location, Root
+from .core.reconciler import ElementHandle, Event, Location, Root, UploadedFile
 from .core.router import Link, Router
 from .core.ssr import render_to_string
 
@@ -42,11 +42,13 @@ __all__ = [
     "ElementHandle",
     "ErrorBoundary",
     "Event",
+    "JsComponent",
     "Link",
     "Location",
     "Ref",
     "Root",
     "Router",
+    "UploadedFile",
     "component",
     "create_app",
     "create_context",
@@ -54,6 +56,7 @@ __all__ = [
     "fragment",
     "h",
     "html",
+    "js_component",
     "memo",
     "render_to_string",
     "run",

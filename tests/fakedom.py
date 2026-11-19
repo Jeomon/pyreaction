@@ -16,6 +16,7 @@ class Node:
         self.events: dict[str, Any] = {}
         self.children: list[Node] = []
         self.parent: Node | None = None
+        self.js: dict[str, Any] | None = None
 
     def remove(self) -> None:
         if self.parent is not None:
@@ -50,6 +51,12 @@ class FakeDom:
                 self.nodes[op[1]] = node
             elif kind == "t":
                 self.nodes[op[1]] = Node(None, op[2])
+            elif kind == "j":
+                node = Node(op[2])
+                node.js = {"module": op[3], "export": op[4], "props": op[5]}
+                self.nodes[op[1]] = node
+            elif kind == "J":
+                self.nodes[op[1]].js["props"] = op[2]
             elif kind == "A":
                 parent = self.nodes[op[1]]
                 for i in op[2]:
@@ -102,6 +109,7 @@ class FakeDom:
 
 def tree_html(root: Any) -> str:
     """The mounted tree in FakeDom's format, built straight from the reconciler's nodes."""
+    from pyreaction.core.element import JsComponent
     from pyreaction.core.reconciler import ComponentNode, TextNode
 
     def nodes(children: list[Any]) -> str:
@@ -111,6 +119,8 @@ def tree_html(root: Any) -> str:
                 out.append(nodes(child.children))
             elif isinstance(child, TextNode):
                 out.append(escape(child.text, quote=False))
+            elif isinstance(child.type, JsComponent):
+                out.append(f"<{child.type.tag}></{child.type.tag}>")
             else:
                 node = Node(child.type)
                 node.attrs = dict(child.attrs)

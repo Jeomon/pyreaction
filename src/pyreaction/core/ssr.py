@@ -12,7 +12,7 @@ from __future__ import annotations
 from html import escape
 from typing import Any
 
-from .element import Element
+from .element import Element, JsComponent
 from .reconciler import ComponentNode, HostNode, Root, TextNode
 
 __all__ = ["render_to_string"]
@@ -57,6 +57,10 @@ def _children(children: list[Any], out: list[str], raw: bool) -> None:
 
 
 def _host(node: HostNode, out: list[str]) -> None:
+    if isinstance(node.type, JsComponent):
+        # An empty box; the module draws into it once the page is live.
+        out.append(f"<{node.type.tag}></{node.type.tag}>")
+        return
     tag = node.type
     out.append("<" + tag)
     for name, value in node.attrs.items():

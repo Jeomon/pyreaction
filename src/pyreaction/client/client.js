@@ -20,6 +20,8 @@
   let ack = 0;
   let retry = 0;
   const outbox = [];
+  let uploads = 0;
+  let maxUpload = 0; // set by the server's first message
   // The last event seq each input sent. A server value older than that is stale:
   // the person has typed since, and a newer render is on its way.
   let lastSent = new WeakMap();
@@ -56,8 +58,31 @@
   }
 
   function send(msg) {
-    if (socket && socket.readyState === 1) socket.send(JSON.stringify(msg));
+    if (socket && socket.readyState === 1) socket.send(msg instanceof Uint8Array ? msg : JSON.stringify(msg));
     else outbox.push(msg);
+  }
+
+  // A file goes to the server as one binary frame (4-byte header length, JSON
+  // header, bytes) ahead of the event that refers to it by id.
+  async function upload(fileList) {
+    const out = [];
+    for (const file of fileList) {
+      const meta = { name: file.name, type: file.type, size: file.size };
+      if (file.size > maxUpload) {
+        out.push({ ...meta, error: `larger than the ${maxUpload} byte limit` });
+        continue;
+      }
+      const id = String(++uploads);
+      const header = new TextEncoder().encode(JSON.stringify({ u: id, ...meta }));
+      const body = new Uint8Array(await file.arrayBuffer());
+      const frame = new Uint8Array(4 + header.length + body.length);
+      new DataView(frame.buffer).setUint32(0, header.length);
+      frame.set(header, 4);
+      frame.set(body, 4 + header.length);
+      send(frame);
+      out.push({ ...meta, id });
+    }
+    return out;
   }
 
   function listen(el, name, spec) {
@@ -68,7 +93,7 @@
       delete events[name];
       return;
     }
-    const [preventDefault, stopPropagation, debounce, throttle] = spec;
+    const [preventDefault, stopPropagation, debounce, throttle, keys] = spec;
     let timer = null;
     let last = 0;
     const fire = (data) => {
@@ -77,11 +102,16 @@
       send([s, el.__id, name, data]);
     };
     const handler = (e) => {
+      // Other keys stay entirely in the browser: not sent, default not prevented.
+      if (keys && !keys.includes(e.key)) return;
       if (preventDefault) e.preventDefault();
       if (stopPropagation) e.stopPropagation();
       if (e.target && e.target !== el) lastSent.set(e.target, seq + 1);
       const data = serialize(e);
-      if (debounce) {
+      const t = e.target;
+      if (t && t.localName === "input" && t.type === "file" && t.files && t.files.length) {
+        upload(t.files).then((files) => fire({ ...data, files }));
+      } else if (debounce) {
         clearTimeout(timer);
         timer = setTimeout(() => fire(data), debounce);
       } else if (throttle) {
@@ -96,6 +126,31 @@
     el.addEventListener(name, handler);
   }
 
+  // ---- JavaScript components -------------------------------------------------------
+
+  function mountJs(el, module, exportName, props) {
+    const state = { module, props, handle: null, gone: false };
+    el.__js = state;
+    const emit = (name, data) => {
+      const payload = data !== null && typeof data === "object" && !Array.isArray(data) ? data : { value: data };
+      send([++seq, el.__id, name, payload]);
+    };
+    import(new URL(module, location.href).href)
+      .then((mod) => {
+        if (state.gone) return;
+        const mount = mod[exportName];
+        if (typeof mount !== "function") throw new Error(`${module} has no function export "${exportName}"`);
+        state.handle = mount(el, state.props, emit) || {};
+      })
+      .catch((err) => console.error(`pyreaction: could not mount ${module}`, err));
+  }
+
+  function updateJs(el, props) {
+    const state = el.__js;
+    state.props = props;
+    if (state.handle && state.handle.update) state.handle.update(props);
+  }
+
   function register(id, node) {
     node.__id = id;
     nodes.set(id, node);
@@ -103,6 +158,18 @@
 
   function forget(node) {
     if (node.__id !== undefined) nodes.delete(node.__id);
+    if (node.__js) {
+      node.__js.gone = true;
+      const handle = node.__js.handle;
+      if (handle && handle.unmount) {
+        try {
+          handle.unmount();
+        } catch (err) {
+          console.error("pyreaction: unmount failed", err);
+        }
+      }
+      return; // what the module drew is its own
+    }
     for (let c = node.firstChild; c; c = c.nextSibling) forget(c);
   }
 
@@ -118,6 +185,15 @@
         }
         case "t":
           register(op[1], document.createTextNode(op[2]));
+          break;
+        case "j": {
+          const el = document.createElement(op[2]);
+          register(op[1], el);
+          mountJs(el, op[3], op[4], op[5]);
+          break;
+        }
+        case "J":
+          updateJs(nodes.get(op[1]), op[2]);
           break;
         case "A": {
           const parent = nodes.get(op[1]);
@@ -181,7 +257,8 @@
         } else if (c.nodeType === 3) out.push(c);
         else if (c.nodeType === 1) {
           out.push(c);
-          if (c.localName !== "textarea") walk(c);
+          // A JavaScript component's contents are its own, not part of the tree.
+          if (c.localName !== "textarea" && !c.__js) walk(c);
         }
       }
     };
@@ -192,12 +269,12 @@
   // Adopt the nodes already on the page; on any difference build the tree afresh.
   function hydrate(ops) {
     const found = domOrder();
-    const created = ops.filter((op) => op[0] === "c" || op[0] === "t");
+    const created = ops.filter((op) => op[0] === "c" || op[0] === "t" || op[0] === "j");
     const ok =
       created.length === found.length &&
       created.every((op, i) => {
         const n = found[i];
-        return op[0] === "c" ? n.nodeType === 1 && n.localName === op[2] : n.nodeType === 3 && n.data === op[2];
+        return op[0] === "t" ? n.nodeType === 3 && n.data === op[2] : n.nodeType === 1 && n.localName === op[2];
       });
     if (!ok) {
       console.warn("pyreaction: the page's markup differs from this render (clock, randomness?); rebuilding it");
@@ -209,6 +286,12 @@
     created.forEach((op, i) => {
       const n = found[i];
       register(op[1], n);
+      if (op[0] === "j") {
+        // Still mounted from the last session: keep it and pass the new props.
+        if (n.__js && n.__js.module === op[3]) updateJs(n, op[5]);
+        else mountJs(n, op[3], op[4], op[5]);
+        return;
+      }
       if (op[0] !== "c") return;
       const attrs = op[3];
       for (const a of Array.from(n.attributes)) if (!(a.name in attrs)) n.removeAttribute(a.name);
@@ -304,6 +387,7 @@
         outbox.length = 0;
         seq = 0;
         lastSent = new WeakMap();
+        maxUpload = data.maxUpload || 0;
       }
       ack = data.ack;
       if (data.init === "hydrate") hydrate(data.ops);

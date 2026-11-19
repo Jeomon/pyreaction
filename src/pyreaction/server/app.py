@@ -27,7 +27,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket
 
 from ..core.element import Component, Element
-from ..core.reconciler import Root
+from ..core.reconciler import Root, UploadedFile
 from ..core.ssr import render_to_string
 
 try:
@@ -92,6 +92,39 @@ def _parse_event(text: str) -> tuple[int, int, str, dict[str, Any]] | None:
     return seq, node_id, name, data
 
 
+DEFAULT_MAX_UPLOAD = 10 * 1024 * 1024
+_MAX_HEADER = 64 * 1024
+
+
+def ws_max_size(max_upload_size: int) -> int:
+    """The WebSocket frame limit uvicorn needs so a file of the largest allowed size fits."""
+    return max(16 * 1024 * 1024, max_upload_size + _MAX_HEADER + 4)
+
+
+def _parse_upload(frame: bytes, max_size: int) -> tuple[str, UploadedFile] | None:
+    """A binary frame from the browser: 4-byte header length, JSON header, file bytes."""
+    if len(frame) < 4:
+        return None
+    n = int.from_bytes(frame[:4], "big")
+    if n > _MAX_HEADER or len(frame) < 4 + n:
+        return None
+    try:
+        header = json.loads(frame[4 : 4 + n])
+    except ValueError:
+        return None
+    if not isinstance(header, dict) or not isinstance(header.get("u"), str):
+        return None
+    data = frame[4 + n :]
+    if len(data) > max_size:
+        return None
+    name = header.get("name")
+    type_ = header.get("type")
+    return header["u"], UploadedFile(
+        name if isinstance(name, str) else "",
+        type_ if isinstance(type_, str) else "",
+        bytes(data),
+    )
+
 class _Outbox:
     """Messages waiting for a slow socket are merged into one, up to a limit of
     operations; past it the connection is closed and the browser starts over."""
@@ -154,6 +187,7 @@ def create_app(
     stylesheets: Sequence[str] = (),
     allowed_origins: Sequence[str] = (),
     max_pending_ops: int = 100_000,
+    max_upload_size: int = DEFAULT_MAX_UPLOAD,
     prefix: str = "/_pyreaction",
     debug: bool = False,
 ) -> Starlette:
@@ -166,7 +200,9 @@ def create_app(
 
     WebSockets are only accepted from the page's own origin plus
     ``allowed_origins`` (needed behind a proxy that rewrites the Host header;
-    ``"*"`` allows any). ``debug`` shows errors in the browser. Mount the result
+    ``"*"`` allows any). ``max_upload_size`` (bytes) caps each file a file input
+    sends; serve with :func:`run` or ``pyreaction run`` so uvicorn's frame limit
+    is raised to match. ``debug`` shows errors in the browser. Mount the result
     inside another ASGI app, or serve it with :func:`run`.
     """
     make = _as_factory(app)
@@ -219,11 +255,28 @@ def create_app(
         writing = asyncio.create_task(writer())
         try:
             root = Root(make(), location=url, connection=ws, debug=debug)
-            root.attach(outbox.push, hydrate=ws.query_params.get("h") == "1")
+
+            def send(message: dict[str, Any]) -> None:
+                if "init" in message:
+                    message["maxUpload"] = max_upload_size  # the browser checks sizes first
+                outbox.push(message)
+
+            root.attach(send, hydrate=ws.query_params.get("h") == "1")
+            # Files waiting for their event may hold at most a few uploads' worth of memory.
+            budget = 4 * max_upload_size
             while True:
                 message = await ws.receive()
                 if message["type"] == "websocket.disconnect":
                     break
+                frame = message.get("bytes")
+                if frame is not None:
+                    upload = _parse_upload(frame, max_upload_size)
+                    held = sum(f.size for f in root.uploads.values())
+                    if upload is None or held + upload[1].size > budget:
+                        logger.warning("Refused a file upload on a WebSocket")
+                        continue
+                    root.uploads[upload[0]] = upload[1]
+                    continue
                 text = message.get("text")
                 event = _parse_event(text) if text is not None else None
                 if event is None:
@@ -257,4 +310,11 @@ def run(
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    uvicorn.run(create_app(app, **options), host=host, port=port, log_level=log_level)
+    max_upload = options.get("max_upload_size", DEFAULT_MAX_UPLOAD)
+    uvicorn.run(
+        create_app(app, **options),
+        host=host,
+        port=port,
+        log_level=log_level,
+        ws_max_size=ws_max_size(max_upload),
+    )

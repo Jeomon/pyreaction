@@ -7,7 +7,7 @@ event handlers, so the reconciler only ever compares ready-to-send values.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 __all__ = [
@@ -15,11 +15,13 @@ __all__ = [
     "Element",
     "EventHandler",
     "FRAGMENT",
+    "JsComponent",
     "component",
     "event",
     "fragment",
     "h",
     "html",
+    "js_component",
     "memo",
 ]
 
@@ -45,7 +47,7 @@ _EVENT_ALIASES = {"change": "input", "doubleclick": "dblclick"}
 class EventHandler:
     """A callback plus how the browser should treat the event before sending it."""
 
-    __slots__ = ("fn", "prevent_default", "stop_propagation", "debounce", "throttle")
+    __slots__ = ("fn", "prevent_default", "stop_propagation", "debounce", "throttle", "keys")
 
     def __init__(
         self,
@@ -54,15 +56,17 @@ class EventHandler:
         stop_propagation: bool = False,
         debounce: int | None = None,
         throttle: int | None = None,
+        keys: Sequence[str] | None = None,
     ) -> None:
         self.fn = fn
         self.prevent_default = prevent_default
         self.stop_propagation = stop_propagation
         self.debounce = debounce
         self.throttle = throttle
+        self.keys = list(keys) if keys is not None else None
 
     def spec(self) -> list[Any]:
-        return [self.prevent_default, self.stop_propagation, self.debounce, self.throttle]
+        return [self.prevent_default, self.stop_propagation, self.debounce, self.throttle, self.keys]
 
 
 def event(
@@ -72,16 +76,20 @@ def event(
     stop_propagation: bool = False,
     debounce: int | None = None,
     throttle: int | None = None,
+    keys: Sequence[str] | None = None,
 ) -> Any:
     """Wrap an event callback with browser-side options.
 
     ``debounce`` and ``throttle`` are in milliseconds and are applied in the
-    browser, so skipped events never cross the network. Usable as
-    ``event(fn, debounce=200)`` or as a decorator ``@event(prevent_default=True)``.
+    browser, so skipped events never cross the network. ``keys`` limits a
+    keyboard event to those ``KeyboardEvent.key`` values, e.g. ``["Enter",
+    "Escape"]``: other keys are neither sent nor have their default prevented,
+    so ``event(save, keys=["Enter"], prevent_default=True)`` blocks only Enter.
+    Usable as ``event(fn, debounce=200)`` or as a decorator ``@event(prevent_default=True)``.
     """
 
     def wrap(f: Callable[..., Any]) -> EventHandler:
-        return EventHandler(f, prevent_default, stop_propagation, debounce, throttle)
+        return EventHandler(f, prevent_default, stop_propagation, debounce, throttle, keys)
 
     return wrap if fn is None else wrap(fn)
 
@@ -279,3 +287,45 @@ def component(fn: Callable[..., Any]) -> Component:
 def memo(fn: Callable[..., Any] | Component) -> Component:
     """A component that skips re-rendering while its arguments are unchanged."""
     return Component(fn.fn if isinstance(fn, Component) else fn, memo=True)
+
+
+class JsComponent:
+    """A JavaScript module drawn inside an element; made by :func:`js_component`."""
+
+    def __init__(self, module: str, export: str = "default", tag: str = "div") -> None:
+        self.module = module
+        self.export = export
+        self.tag = tag
+        self.__name__ = f"{module}:{export}"
+
+    def __call__(self, *, key: Any = None, ref: Any = None, **props: Any) -> Element:
+        attrs: dict[str, Any] = {}
+        events: dict[str, EventHandler] = {}
+        for name, value in props.items():
+            if name.startswith("on_") and (callable(value) or isinstance(value, EventHandler)):
+                events[name[3:]] = value if isinstance(value, EventHandler) else EventHandler(value)
+            else:
+                attrs[name] = value
+        return Element(self, key, attrs, events, ref=ref)
+
+    def __repr__(self) -> str:
+        return f"<js_component {self.__name__}>"
+
+
+def js_component(module: str, export: str = "default", tag: str = "div") -> JsComponent:
+    """Use a JavaScript module as a component, for a chart, map or editor.
+
+    ``module`` is a URL the browser can import, e.g. ``"/static/chart.js"`` or a
+    CDN address. Its ``export`` is a function the browser calls as
+    ``mount(element, props, emit)`` once a ``<tag>`` for it is on the page::
+
+        export default function mount(element, props, emit) {
+          // draw into element; emit("select", {id: 3}) calls on_select in Python
+          return { update(props) { ... }, unmount() { ... } };
+        }
+
+    Props must be JSON values; ``on_<name>`` props are Python callbacks that
+    ``emit("<name>", data)`` calls with ``data`` as the event. ``update`` runs
+    when props change, ``unmount`` when the element is removed.
+    """
+    return JsComponent(module, export, tag)
