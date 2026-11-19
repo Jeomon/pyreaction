@@ -73,7 +73,7 @@ html.div(
 - `class_name` becomes `class`, `html_for` becomes `for`, and underscores become dashes (`aria_label`, `data_id`).
 - `style` takes a dict with snake_case or camelCase keys.
 - `True` sets an attribute, while `False` or `None` leaves it out.
-- `value` and `checked` are set as live DOM properties, so inputs can be controlled.
+- `value` and `checked` are set as live DOM properties, so inputs can be controlled. `default_value` and `default_checked` make an uncontrolled input instead: they set only the starting value, and the browser keeps what is typed (read it on submit from `e.form`, or through a `ref`).
 - `fragment(*children)` groups children without a wrapper, and a component may also return a list.
 - `h("div", {"class_name": "x"}, child)` is the call form, for tags chosen at runtime.
 - SVG and MathML work like any other tag (`html.svg(html.circle(r=5))`); the standard tags are typed, so editors autocomplete them. Any other name makes a custom element: `html.my_widget` is `<my-widget>`.
@@ -93,7 +93,10 @@ could run code (`<script>`, `<iframe>`, `on*` attributes, `javascript:` links).
 ## Events
 
 `on_click`, `on_change` (fires on every edit, as in React), `on_submit`,
-`on_key_down` and so on. A handler takes no argument, or one `Event`:
+`on_key_down` and so on. Pass the function itself (`on_click=vote`), not its
+result (`on_click=vote()`, which runs while rendering). A handler takes no
+argument, or one `Event`; parameters with defaults are left alone, so
+`on_click=lambda r=r: vote(r.id)` in a loop works. The event has
 `e.value`, `e.checked`, `e.key`, `e.target.name`, `e.target.dataset`,
 `e.target.selectionStart`. On a submit, `e.form` holds the fields:
 `e.form["email"]`, and `e.form.getlist("tags")` for checkbox groups and
@@ -120,6 +123,9 @@ the example above blocks only Enter and the textarea still takes other typing.
 `stop_immediate_propagation`. `js()` code sees `event` and `element`; it is sent
 to the page as written, so never build it from user input.
 
+A `_capture` suffix (`on_click_capture`) listens on the way down, before the
+target's own handlers, as React's `onClickCapture`.
+
 ### File uploads
 
 ```python
@@ -143,12 +149,16 @@ browser and arrives with `.error` set and no data.
 | --- | --- |
 | `use_state(initial)` | `value, set_value`; the setter takes a value or `lambda prev: ...` |
 | `use_reducer(reducer, initial)` | `state, dispatch` |
-| `use_effect(fn, deps)` | runs after the update reaches the browser; return a cleanup, or make it `async` (cancelled on cleanup). Plain effects run in a worker thread |
+| `use_effect(fn, deps)` | runs after the update reaches the browser; return a cleanup, or make it `async` (cancelled on cleanup). Plain effects run in a worker thread. `deps=None` runs after every render, `[]` once, a list when a value in it changes |
+| `use_layout_effect(fn, deps)` | the same as `use_effect`, for code written for React (nothing paints on the server; measure elements with `ref.current.call("getBoundingClientRect")`) |
 | `use_memo(fn, deps)` / `use_callback(fn, deps)` | cached until `deps` change |
-| `use_ref(initial)` | `ref.current` survives re-renders; pass it as `ref=` to an element to act on it |
-| `create_context(default)` / `use_context(ctx)` | provide with `ctx(*children, value=...)` |
+| `use_ref(initial)` | `ref.current` survives re-renders; pass it as `ref=` to an element to act on it. `ref=` also takes a function, called with the element (it may return a cleanup) and with `None` when removed. `create_ref()` makes one outside a component |
+| `create_context(default)` / `use_context(ctx)` | provide with `ctx(*children, value=...)`, or `ctx.Provider(...)` as in older React |
 | `use_async(fn, deps)` / `use_data(fn, deps)` | load data without blocking; see [Data](#data) |
-| `use_transition()` / `use_action_state(action, initial)` | pending state for slow work; see [Pending state](#pending-state-and-forms) |
+| `use(ctx_or_task)` | a context (allowed inside `if`), or the result of an `asyncio` task, suspending until it is done |
+| `use_deferred_value(value)` | `value` one render behind, so a slow part of the page updates after the fast part |
+| `use_transition()` / `start_transition(fn)` / `use_action_state(action, initial)` | pending state for slow work; see [Pending state](#pending-state-and-forms) |
+| `use_optimistic(state, update)` | show a change at once, until the action behind it is done |
 | `use_location()` | the page URL: `.path`, `.search`, `.query` (a dict); re-renders when it changes |
 | `use_navigate()` | `navigate("/users/7")`, `navigate(url, replace=True)`, or `navigate(url, reload=True)` for a full load |
 | `use_title(text)` | sets the page title, in the first HTML too |
@@ -161,6 +171,32 @@ browser and arrives with `.error` set and no data.
 | `use_debug_value(value)` | logs the value when it changes, in debug mode |
 
 `@memo` instead of `@component` skips re-rendering while the arguments are unchanged.
+A function of your own whose name starts with `use_` and calls hooks is a custom
+hook: it shares logic, and each component calling it gets its own state
+(`examples/lunch_roulette.py` has `use_countdown`).
+
+The rules of hooks are checked as in React. Hooks are matched to their slots by
+call order, so each render must call the same hooks: one inside an `if` raises
+"Rendered fewer (or more) hooks than during the previous render". A hook called
+outside rendering (in a handler or effect) raises "Invalid hook call". A
+component that sets state every time it renders stops after 50 renders with "Too
+many re-renders" instead of looping forever; the error goes to the nearest
+`ErrorBoundary`.
+
+`StrictMode(*children)` helps find impure components and effects missing a
+cleanup: in debug mode (`pyreaction dev`) its children render twice and each
+effect is set up, cleaned up and set up again when it first runs, as in React's
+development builds. Outside debug mode it does nothing.
+
+`Profiler(*children, id=..., on_render=fn)` calls `fn(id, phase, actual_ms,
+start, commit)` after each render pass that rendered its subtree.
+`ViewTransition(*children, name=None)` applies updates that change its children
+inside the browser's `document.startViewTransition`, so they animate (cross-fade
+by default, styled with `::view-transition-old(name)`).
+
+For components that work on their children, as in React: `Children.map`,
+`Children.for_each`, `Children.count`, `Children.to_array` and `Children.only`,
+`clone_element(el, *children, **props)` and `is_valid_element(x)`.
 
 Updates made in the same event-loop tick are batched into one render and one
 message. Setters are safe to call from other threads.
@@ -193,6 +229,10 @@ at once with the fallback, and the boundary's content follows in the same
 response when its data arrives, swapped in by a small inline script before the
 page goes live. `create_app(stream=False)` waits for all of it instead.
 
+`@cache` memoises a function for one page, as React's `cache` does for one
+request: several components asking for `get_user(7)` load it once. An `async`
+function returns a task to read with `use(get_user(7))`.
+
 ## Pending state and forms
 
 Every event is a round trip, so slow actions should say they are working:
@@ -213,10 +253,26 @@ def Contact():
 components inside it `use_form_status()` (`.pending`, `.data`), and clears the
 fields on success (`reset=False` keeps them).
 
+`html.form(..., action=fn)` is the same as `Form`, as React 19 writes it, and
+`html.button("Save draft", form_action=fn)` submits its form to `fn` instead (with
+the button's own `name`/`value`, after the browser checks required fields).
+
 `use_transition()` returns `pending, start`: `start(fn, *args)` runs `fn` in the
-background with `pending` True meanwhile. `use_action_state(action, initial)`
-returns `state, run, pending`, where `run(payload)` sets the state to
+background with `pending` True meanwhile; `start_transition(fn)` does the same
+from any handler, without the flag. `use_action_state(action, initial)` returns
+`state, run, pending`, where `run(payload)` sets the state to
 `action(state, payload)`; pass `run` to `on_submit` to get the form's fields.
+
+```python
+shown, add = use_optimistic(messages, lambda cur, text: cur + [text + " (sending)"])
+
+def send(fields):
+    add(fields["text"])            # shown at once
+    set_messages(api.post(fields["text"]))   # the real list replaces it when done
+```
+
+`use_optimistic` changes what is shown until the action that called `add` (the
+handler, transition or form action) finishes; if it fails, the change goes away.
 
 ## Routing
 
@@ -244,11 +300,20 @@ server when loaded directly.
 ## The page's head
 
 ```python
-Head(html.meta(name="description", content=post.summary), html.link(rel="canonical", href=url))
+html.title(post.title)                                   # anywhere in the tree
+html.meta(name="description", content=post.summary)
+html.link(rel="canonical", href=url)
+preload("/fonts/inter.woff2", as_="font", cross_origin="anonymous")
+preconnect("https://api.example.com")
 ```
 
-`Head` puts tags into `<head>` from anywhere in the tree, in the first HTML too,
-and removes them when it unmounts. `use_title` sets the title.
+As in React 19, `<title>`, `<meta>` and `<link>` written anywhere go into
+`<head>`, in the first HTML too, and leave it when they unmount (a `<title>`
+inside `<svg>` and tags with `itemprop` stay where they are). `Head(...)` and
+`use_title` do the same. The resource hints `prefetch_dns`, `preconnect`,
+`preload`, `preload_module`, `preinit` (a stylesheet or script, applied now) and
+`preinit_module` add each resource once, from a render or a handler; the page
+keeps tags it already has, so a script is not run twice.
 
 ## Acting on elements
 
@@ -430,6 +495,12 @@ To put an app inside a page your own server renders (Jinja, Django), mount it
 as above and add `embed(App, mount_path="/ui", location=request.url.path)` to
 the page, unescaped (`| safe` in Jinja).
 
+`prerender(App, ["/", "/about"], "dist")` renders pages ahead of time for a
+static host, as React's `prerender`: each waits for all its data, gets its
+title and head tags, and is written as `dist/index.html`, `dist/about/index.html`.
+The pages are plain HTML without the client script; `live=True` keeps it, for
+pages served in front of the running app. Options go to `create_app`.
+
 Each page view is a live session on the server. If the connection drops, the
 page dims and reconnects (with growing, randomised delays). The server keeps the
 dropped session for `resume_timeout` seconds (30 by default; 0 turns this off),
@@ -503,7 +574,7 @@ contents of `style.css` are inlined into the page so they cost no extra request.
 uv sync
 uv run pytest          # browser tests use the installed Chrome, or: uv run playwright install chromium
 uv run mypy
-uv run python examples/todo.py       # also: pages.py, widgets.py, login.py
+uv run python examples/todo.py       # also: pages.py, widgets.py, login.py, lunch_roulette.py
 uv run python benchmarks/bench.py
 ```
 

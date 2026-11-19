@@ -36,6 +36,7 @@ import itertools
 import logging
 import shutil
 import threading
+import time
 import traceback
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Iterator
@@ -44,9 +45,13 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from .element import FRAGMENT, PORTAL, Component, Element, JsComponent
-from .hooks import CURRENT, Context, EffectSlot, Suspended, same
+from .hooks import ACTIVE_ROOT, CURRENT, CURRENT_ACTION, Context, EffectSlot, Suspended, same
 
 logger = logging.getLogger("pyreaction")
+
+# Renders of one component within one pass before it counts as an endless loop
+# (a component that sets state every time it renders), as React does.
+MAX_RENDERS = 50
 
 __all__ = ["ElementHandle", "Event", "FormFields", "Location", "Reply", "Root", "UploadedFile"]
 
@@ -95,6 +100,7 @@ class TextNode:
 class HostNode:
     __slots__ = (
         "id", "type", "key", "parent", "element", "attrs", "events", "children", "dom", "depth", "ns",
+        "ref_cleanup",
     )
 
     def __init__(self, id: int, element: Element, key: Any, parent: Any) -> None:
@@ -105,6 +111,7 @@ class HostNode:
         self.element = element
         self.attrs = element.attrs
         self.events = element.events
+        self.ref_cleanup: Callable[[], Any] | None = None
         self.children: list[Any] = []
         self.dom: list[int] = []
         self.depth = parent.depth + 1 if parent is not None else 0
@@ -134,7 +141,7 @@ class ComponentNode:
     __slots__ = (
         "type", "key", "parent", "root", "element", "depth", "children", "hooks",
         "hook_index", "pending_effects", "dirty", "mounted", "value", "subscribers",
-        "subscriptions", "catch", "suspend", "waiting",
+        "subscriptions", "catch", "suspend", "waiting", "hook_count", "strict", "profile", "view_transition",
     )
 
     def __init__(self, root: Root, element: Element, key: Any, parent: Any) -> None:
@@ -159,6 +166,14 @@ class ComponentNode:
         # whether it is showing its fallback right now.
         self.suspend: Callable[[Any], None] | None = None
         self.waiting = False
+        # Hooks the last complete render called: every render must call as many.
+        self.hook_count: int | None = None
+        # Set by StrictMode: its descendants render twice and set up effects twice.
+        self.strict = False
+        # Set by Profiler: (id, on_render).
+        self.profile: tuple[Any, Callable[..., Any]] | None = None
+        # Set by ViewTransition: updates under it are animated by the browser.
+        self.view_transition = False
 
     @property
     def name(self) -> str:
@@ -335,16 +350,24 @@ class ElementHandle:
 
 
 def _wants_event(fn: Callable[..., Any]) -> bool:
+    """Whether a handler takes the event: it has a parameter without a default.
+
+    Parameters with defaults are left alone, so the usual way to capture a loop
+    variable, ``on_click=lambda r=r: vote(r.id)``, keeps its ``r``."""
     code = getattr(fn, "__code__", None)
     if code is not None:
-        n = code.co_argcount + code.co_kwonlyargcount
+        n = code.co_argcount - len(getattr(fn, "__defaults__", None) or ())
         if inspect.ismethod(fn):
             n -= 1
         return n > 0 or bool(code.co_flags & inspect.CO_VARARGS)
     try:
-        return len(inspect.signature(fn).parameters) > 0
+        params = inspect.signature(fn).parameters.values()
     except (TypeError, ValueError):
         return True
+    return any(
+        p.default is p.empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL)
+        for p in params
+    )
 
 
 def _stable_positions(seq: list[int]) -> set[int]:
@@ -424,6 +447,7 @@ class Root:
         connection: Any = None,
         debug: bool = False,
         threaded: bool = True,
+        on_error: Callable[[BaseException, str], None] | None = None,
     ) -> None:
         self.container = HostNode(0, Element("#root"), None, None)
         self.hosts: dict[int, HostNode] = {}
@@ -433,7 +457,8 @@ class Root:
         self.debug = debug
         self.threaded = threaded
         # Called with (exc, where) for every error not caught by an ErrorBoundary.
-        self.on_error: Callable[[BaseException, str], None] | None = None
+        # Given here so errors in the first render reach it too.
+        self.on_error = on_error
         self.title: str | None = None
         # For the server's first response: the HTTP status, or a URL to redirect to.
         self.status = 200
@@ -443,6 +468,15 @@ class Root:
         # Tags each Head component puts into <head>, in the order they rendered.
         self._head: dict[ComponentNode, tuple[Element, ...]] = {}
         self._head_dirty = False
+        # Resource hints (preload, preinit, ...): added once each, kept for the page.
+        self._resources: dict[tuple[str, str], Element] = {}
+        # What cache() functions returned for this page, by (function, arguments).
+        self.cache: dict[Any, Any] = {}
+        # Profiler timings of the render pass under way: node -> [phase, ms, start].
+        self._profiling = False
+        # Whether this pass changed something under a ViewTransition.
+        self._animate = False
+        self._profiles: dict[ComponentNode, list[Any]] = {}
         # Where a list without keys was already reported (debug mode), once each.
         self._warned_unkeyed: set[Any] = set()
         self._nav: dict[str, Any] | None = None
@@ -478,6 +512,7 @@ class Root:
         # An error boundary that caught during the first render re-renders now,
         # so the first paint already shows its fallback.
         self._render_dirty()
+        self._report_profiles()
 
     # ---- lifecycle -------------------------------------------------------------
 
@@ -501,7 +536,7 @@ class Root:
         self.ops = []
         if self.title is not None:
             self._title_dirty = True
-        if self._head:
+        if self._head or self._resources:
             self._head_dirty = True
         message = self._message(self.snapshot() + commands)
         message["init"] = "hydrate" if hydrate else "replace"
@@ -623,16 +658,49 @@ class Root:
                 self._render_all_dirty()
         finally:
             self._flushing = False
+        self._report_profiles()
 
     def _render_all_dirty(self) -> None:
+        renders: dict[ComponentNode, int] = {}
         while self._dirty:
             _, _, node = heapq.heappop(self._dirty)
             if not node.dirty or not node.mounted:
                 continue
+            count = renders.get(node, 0) + 1
+            renders[node] = count
+            if count > MAX_RENDERS:
+                # A component that sets state on every render would loop forever.
+                node.dirty = False
+                self._render_failed(node, RuntimeError(
+                    f"Too many re-renders in {node.name}: it sets state every time it renders. "
+                    "Set state in an event handler or effect; pass the handler itself "
+                    "(on_click=vote), not its result (on_click=vote())."
+                ))
+                continue
             before = self._dom_ids(node.children)
+            if not self._animate:
+                self._animate = self._under_view_transition(node)
+            start = time.perf_counter() if self._profiling else 0.0
             self._render(node, node.element)
+            if self._profiling:
+                # The Profilers above it did not render, but their subtree did.
+                elapsed = time.perf_counter() - start
+                above = node.parent
+                while above is not None:
+                    if isinstance(above, ComponentNode) and above.profile is not None:
+                        self._add_profile(above, "update", elapsed, start)
+                    above = above.parent
             if self._dom_ids(node.children) != before:
                 self._sync_dom(self._host_of(node))
+
+    def _render_failed(self, node: ComponentNode, exc: BaseException) -> None:
+        """An error while rendering ``node``: to the nearest error boundary, else logged."""
+        boundary = self._boundary_for(node, "catch")
+        if boundary is None:
+            self.report(exc, f"rendering {node.name}")
+        else:
+            logger.error("Error rendering %s, caught by an error boundary", node.name, exc_info=exc)
+            boundary.catch(exc)  # type: ignore[misc]
 
     def _message(self, ops: list[list[Any]]) -> dict[str, Any]:
         message: dict[str, Any] = {"ops": ops, "ack": self.ack}
@@ -648,13 +716,50 @@ class Root:
         if self._head_dirty:
             message["head"] = self.head_html()
             self._head_dirty = False
+        if self._animate:
+            if ops:
+                message["vt"] = True  # apply inside document.startViewTransition
+            self._animate = False
         return message
 
+    @staticmethod
+    def _under_view_transition(node: Any) -> bool:
+        while node is not None:
+            if isinstance(node, ComponentNode) and node.view_transition:
+                return True
+            node = node.parent
+        return False
+
     def head_html(self) -> str:
-        """The tags Head components asked for, as HTML for the page's <head>."""
+        """Resource hints, then the tags Head components asked for, as HTML for the
+        page's <head>."""
         from .ssr import render_head
 
-        return render_head([el for elements in self._head.values() for el in elements])
+        tags = list(self._resources.values())
+        return render_head(tags + [el for elements in self._head.values() for el in elements])
+
+    def defer(self, fn: Callable[[], None]) -> bool:
+        """Run ``fn`` on the loop once what is being rendered now has been sent.
+        False (and nothing scheduled) when the page is not live, as for its first HTML."""
+        if self._loop is None:
+            return False
+        self._loop.call_soon(fn)
+        return True
+
+    def track(self, future: asyncio.Future[Any]) -> None:
+        """Count ``future`` as work the page is waiting for (see :meth:`settle`)."""
+        if not future.done():
+            self._pending.add(future)  # type: ignore[arg-type]
+            future.add_done_callback(self._pending.discard)
+
+    def add_resource(self, key: tuple[str, str], element: Element) -> None:
+        def apply() -> None:
+            if key not in self._resources:
+                self._resources[key] = element
+                self._head_dirty = True
+                self.request_flush()
+
+        self.call(apply)
 
     def _run_effects(self) -> None:
         # Each effect runs the function from the render that queued it, even when
@@ -666,16 +771,46 @@ class Root:
         if self._queue is not None:
             self._queue.put_nowait(("effects", effects))
             return
+        token = ACTIVE_ROOT.set(self)
+        try:
+            self._run_effects_now(effects)
+        finally:
+            ACTIVE_ROOT.reset(token)
+
+    def _run_effects_now(self, effects: list[tuple[EffectSlot, Any]]) -> None:
         for slot, fn in effects:
             if not slot.node.mounted:
                 continue
             self._cleanup(slot)
             try:
-                result = fn()  # type: ignore[misc]
+                result = fn()
+                if self._strict_rerun(slot, result):
+                    result = fn()
             except Exception as exc:
                 self.report(exc, f"an effect in {slot.node.name}")
                 continue
             self._keep_effect_result(slot, result)
+
+    def _strict_rerun(self, slot: EffectSlot, result: Any) -> bool:
+        """Under StrictMode in debug mode, an effect's first run is set up, cleaned
+        up and set up again, so an effect without the cleanup it needs shows it.
+        Cleans up the first setup and says whether to run it again."""
+        if slot.ran:
+            return False
+        slot.ran = True
+        if not (self.debug and slot.node.mounted and self._is_strict(slot.node)):
+            return False
+        self._keep_effect_result(slot, result)
+        self._cleanup(slot)
+        return True
+
+    @staticmethod
+    def _is_strict(node: Any) -> bool:
+        while node is not None:
+            if isinstance(node, ComponentNode) and node.strict:
+                return True
+            node = node.parent
+        return False
 
     def _keep_effect_result(self, slot: EffectSlot, result: Any) -> None:
         if not slot.node.mounted:
@@ -698,10 +833,10 @@ class Root:
                 continue
             self._cleanup(slot)
             try:
-                if self.threaded and not inspect.iscoroutinefunction(fn):
-                    result = await self._in_thread(fn)
-                else:
-                    result = fn()
+                in_thread = self.threaded and not inspect.iscoroutinefunction(fn)
+                result = await self._in_thread(fn) if in_thread else fn()
+                if self._strict_rerun(slot, result):
+                    result = await self._in_thread(fn) if in_thread else fn()
             except Exception as exc:
                 self.report(exc, f"an effect in {slot.node.name}")
                 continue
@@ -739,6 +874,7 @@ class Root:
         counter count two, even when they arrive in the same network packet.
         """
         assert self._queue is not None
+        ACTIVE_ROOT.set(self)  # this task's context: its handlers, effects and threads
         while True:
             kind, job = await self._queue.get()
             self._busy = True
@@ -806,6 +942,7 @@ class Root:
             return None
 
         async def job() -> Any:
+            CURRENT_ACTION.set(asyncio.current_task())  # use_optimistic ties to this work
             if after is not None and not after.done():
                 await asyncio.wait([after])
             try:
@@ -961,18 +1098,40 @@ class Root:
         call = self._resolve(seq, node_id, name, data)
         if call is None:
             return
+        token = ACTIVE_ROOT.set(self)
         try:
             result = call()
         except Exception as exc:
             self.report(exc, f"the {name!r} handler")
             self._ack(seq)
             return
+        finally:
+            ACTIVE_ROOT.reset(token)
         self._after_handler(seq, result)
 
     async def _dispatch_async(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> None:
         call = self._resolve(seq, node_id, name, data)
         if call is None:
             return
+        # Optimistic values a handler sets last until it (and any async work it
+        # returned) is done.
+        assert self._loop is not None
+        action: asyncio.Future[None] = self._loop.create_future()
+        token = CURRENT_ACTION.set(action)
+        try:
+            task = await self._dispatch_call(seq, name, call)
+        finally:
+            CURRENT_ACTION.reset(token)
+        def finish(_: Any = None) -> None:
+            if not action.done():
+                action.set_result(None)
+
+        if task is None:
+            finish()
+        else:
+            task.add_done_callback(finish)
+
+    async def _dispatch_call(self, seq: int, name: str, call: Callable[[], Any]) -> asyncio.Task[Any] | None:
         try:
             if self.threaded and not inspect.iscoroutinefunction(call.fn):  # type: ignore[attr-defined]
                 loop = self._loop
@@ -994,8 +1153,8 @@ class Root:
         except Exception as exc:
             self.report(exc, f"the {name!r} handler")
             self._ack(seq)
-            return
-        self._after_handler(seq, result)
+            return None
+        return self._after_handler(seq, result)
 
     def _resolve(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> Callable[[], Any] | None:
         """The handler call for an event, or None when there is nothing to run."""
@@ -1041,14 +1200,15 @@ class Root:
                 self.request_flush()
         # "#ping" keeps proxies from closing an idle connection; nothing to do.
 
-    def _after_handler(self, seq: int, result: Any) -> None:
+    def _after_handler(self, seq: int, result: Any) -> asyncio.Task[Any] | None:
         if inspect.iscoroutine(result):
             task = self.spawn(result)
             self._pending.add(task)
             task.add_done_callback(self._pending.discard)
             task.add_done_callback(lambda _: self._ack(seq))
-        else:
-            self._ack(seq)
+            return task
+        self._ack(seq)
+        return None
 
     def _ack(self, seq: int) -> None:
         if seq > self.ack:
@@ -1112,8 +1272,7 @@ class Root:
             host.dom = self._dom_ids(host.children)
             if host.dom:
                 self.ops.append(["A", host.id, host.dom])
-            if item.ref is not None:
-                item.ref.current = ElementHandle(self, host.id)
+            self._attach_ref(host, item.ref)
             return host
         if isinstance(item.type, str) and item.type != FRAGMENT:
             host = HostNode(next(self._ids), item, key, parent)
@@ -1123,8 +1282,7 @@ class Root:
             host.dom = self._dom_ids(host.children)
             if host.dom:
                 self.ops.append(["A", host.id, host.dom])
-            if item.ref is not None:
-                item.ref.current = ElementHandle(self, host.id)
+            self._attach_ref(host, item.ref)
             return host
         node = ComponentNode(self, item, key, parent)
         self._render(node, item)
@@ -1191,7 +1349,15 @@ class Root:
         node.children = self._reconcile(node, node.children, item.children)
         self._sync_dom(node)
 
-    def _render(self, node: ComponentNode, item: Element) -> None:
+    def _render(self, node: ComponentNode, item: Element, timed: bool = False) -> None:
+        kind = node.type
+        if not timed and type(kind) is Component and kind.profiler:
+            phase = "mount" if node.profile is None else "update"
+            start = time.perf_counter()
+            self._render(node, item, True)
+            if node.profile is not None:
+                self._add_profile(node, phase, time.perf_counter() - start, start)
+            return
         node.dirty = False
         node.element = item
         kind = node.type
@@ -1199,7 +1365,20 @@ class Root:
             node.hook_index = 0
             token = CURRENT.set(node)
             try:
+                if self.debug and self._is_strict(node):
+                    # StrictMode: a render whose result is thrown away, so a component
+                    # that is not pure (changes something while rendering) shows it.
+                    hooks = len(node.hooks)
+                    effects = [(h, h.fn, h.deps) for h in node.hooks if isinstance(h, EffectSlot)]
+                    kind.fn(*item.args, **item.kwargs)
+                    # Undo what that render did to the hooks, so the real one decides.
+                    del node.hooks[hooks:]
+                    for slot, fn, deps in effects:
+                        slot.fn, slot.deps = fn, deps
+                    node.hook_index = 0
+                    node.pending_effects.clear()
                 out = kind.fn(*item.args, **item.kwargs)
+                self._check_hook_count(node)
             except Suspended as waiting:
                 # Waiting for data: show the nearest Suspense fallback meanwhile. The
                 # hook re-renders this component when the data arrives.
@@ -1215,12 +1394,7 @@ class Root:
                 out = None
             except Exception as exc:
                 node.pending_effects.clear()
-                boundary = self._boundary_for(node, "catch")
-                if boundary is None:
-                    self.report(exc, f"rendering {node.name}")
-                else:
-                    logger.error("Error rendering %s, caught by an error boundary", node.name, exc_info=exc)
-                    boundary.catch(exc)  # type: ignore[misc]
+                self._render_failed(node, exc)
                 if node.children:
                     return  # keep showing the last good output
                 out = None
@@ -1235,11 +1409,54 @@ class Root:
                     for sub in list(node.subscribers):
                         self.schedule(sub)
             children = item.children
+        ops_before = len(self.ops)
         node.children = self._reconcile(node, node.children, children)
+        if node.view_transition and len(self.ops) > ops_before and self._sink is not None:
+            self._animate = True  # a parent re-rendered and changed what is inside
         if node.pending_effects:
             # Queued after the children's, so children's effects run first, as in React.
             self._effects.extend(node.pending_effects)
             node.pending_effects.clear()
+
+    def _add_profile(self, node: ComponentNode, phase: str, seconds: float, start: float) -> None:
+        entry = self._profiles.get(node)
+        if entry is None:
+            self._profiles[node] = [phase, seconds * 1000, start * 1000]
+        else:
+            entry[1] += seconds * 1000
+            if phase == "mount":
+                entry[0] = "mount"
+
+    def _report_profiles(self) -> None:
+        """Tell each Profiler how long its subtree took to render in this pass."""
+        if not self._profiles:
+            return
+        profiles, self._profiles = self._profiles, {}
+        commit = time.perf_counter() * 1000
+        for node, (phase, ms, start) in profiles.items():
+            if node.profile is None or not node.mounted:
+                continue
+            profile_id, on_render = node.profile
+            try:
+                on_render(profile_id, phase, ms, start, commit)
+            except Exception as exc:
+                self.report(exc, f"the on_render of Profiler {profile_id!r}")
+
+    @staticmethod
+    def _check_hook_count(node: ComponentNode) -> None:
+        """Hooks are matched to their slots by call order, so every render of a
+        component must call the same hooks: never inside an if, a loop, or after an
+        early return."""
+        used = node.hook_index
+        if node.hook_count is None:
+            node.hook_count = used
+        elif used != node.hook_count:
+            expected = node.hook_count
+            raise RuntimeError(
+                f"Rendered {'fewer' if used < expected else 'more'} hooks than during the previous render "
+                f"of {node.name} ({used} instead of {expected}). Call hooks at the top level of the "
+                "component, the same ones on every render: not inside an if, a loop, or after an early return."
+            )
 
     @staticmethod
     def _boundary_for(node: ComponentNode, kind: str) -> ComponentNode | None:
@@ -1282,16 +1499,41 @@ class Root:
                 ops.append(["a", host.id, node_id, before])
             before = node_id
 
+    def _attach_ref(self, node: HostNode, ref: Any) -> None:
+        """Give ``ref`` the element: a ref object gets it in ``.current``; a function
+        is called with it, and may return a cleanup for when it is detached."""
+        if ref is None:
+            return
+        handle = ElementHandle(self, node.id)
+        if hasattr(ref, "current"):
+            ref.current = handle
+            return
+        try:
+            result = ref(handle)
+        except Exception as exc:
+            self.report(exc, "a callback ref")
+            return
+        node.ref_cleanup = result if callable(result) else None
+
     def _release_ref(self, node: HostNode) -> None:
         ref = node.element.ref
-        if ref is not None and isinstance(ref.current, ElementHandle) and ref.current.id == node.id:
-            ref.current = None
+        if ref is None:
+            return
+        if hasattr(ref, "current"):
+            if isinstance(ref.current, ElementHandle) and ref.current.id == node.id:
+                ref.current = None
+            return
+        # A callback ref: its cleanup if it returned one, else it is called with None.
+        cleanup, node.ref_cleanup = node.ref_cleanup, None
+        try:
+            cleanup() if cleanup is not None else ref(None)
+        except Exception as exc:
+            self.report(exc, "a callback ref")
 
     def _swap_ref(self, node: HostNode, item: Element) -> None:
         if node.element.ref is not item.ref:
             self._release_ref(node)
-            if item.ref is not None:
-                item.ref.current = ElementHandle(self, node.id)
+            self._attach_ref(node, item.ref)
 
     @staticmethod
     def _js_create(host: HostNode) -> list[Any]:

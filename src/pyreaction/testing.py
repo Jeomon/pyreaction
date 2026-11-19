@@ -56,7 +56,7 @@ class TestNode:
 
     @property
     def value(self) -> Any:
-        return self.attrs.get("value")
+        return self.attrs.get("value", self.attrs.get("defaultValue"))
 
     def html(self) -> str:
         if self.tag is None:
@@ -238,8 +238,10 @@ class Page:
     # ---- lifecycle -------------------------------------------------------------
 
     async def _start(self, element: Element, location: str, connection: Any) -> Root:
-        root = Root(element, location=location, connection=connection, debug=False)
-        root.on_error = lambda exc, where: self.errors.append(exc)
+        root = Root(
+            element, location=location, connection=connection, debug=False,
+            on_error=lambda exc, where: self.errors.append(exc),
+        )
         root.attach(self._receive)
         await root.settle(self.timeout)
         return root
@@ -332,19 +334,38 @@ class Page:
         return self.find(target) if isinstance(target, str) else target
 
     def dispatch(self, target: str | TestNode, event: str, data: dict[str, Any] | None = None) -> None:
-        """Fire ``event`` (a DOM event name, e.g. ``"keydown"``) at an element, and settle."""
+        """Fire ``event`` (a DOM event name, e.g. ``"keydown"``) at an element, and settle.
+
+        It propagates as in a browser: capture handlers (``on_click_capture``) from
+        the outside in, then handlers from the target outwards, until one stops it."""
         node = self._node(target)
-        while node is not None and event not in node.events and node.id != 0:
-            node = node.parent  # type: ignore[assignment]
-        if node is None or node.id == 0:
+        path: list[TestNode] = []
+        at: TestNode | None = node
+        while at is not None and at.id != 0:
+            path.append(at)
+            at = at.parent
+        capture = f"{event}:capture"
+        listeners = [(n, capture) for n in reversed(path) if capture in n.events]
+        listeners += [(n, event) for n in path if event in n.events]
+        if not listeners:
             raise LookupError(f"nothing at or above {target!r} listens to {event!r}")
-        spec = node.events[event]
         payload = {"type": event, **(data or {})}
-        keys = spec[4] if len(spec) > 4 else None
-        if keys and payload.get("key") not in keys:
-            return  # filtered out in the browser
-        self._seq += 1
-        self.root.dispatch(self._seq, node.id, event, payload)
+        for owner, name in listeners:
+            spec = owner.events[name]
+            if len(spec) > 7 and spec[7] and "form" not in payload:
+                form = owner
+                while form is not None and form.tag != "form":
+                    form = form.parent  # type: ignore[assignment]
+                if form is not None:
+                    payload["form"] = self._fields(form, submitter=owner)
+            keys = spec[4] if len(spec) > 4 else None
+            if keys and payload.get("key") not in keys:
+                continue  # filtered out in the browser: not sent, not stopped
+            if not (len(spec) > 5 and spec[5]):  # a js() handler runs in the browser only
+                self._seq += 1
+                self.root.dispatch(self._seq, owner.id, name, payload)
+            if spec[1] or (len(spec) > 6 and spec[6]):
+                break
         self.settle()
 
     def click(self, target: str | TestNode) -> None:
@@ -369,13 +390,28 @@ class Page:
         a list value gives a field several values."""
         node = self._node(target)
         if fields is None:
-            fields = {}
-            for el in node.walk():
-                name = el.attrs.get("name") if el.tag in ("input", "select", "textarea") else None
-                if name:
-                    fields[name] = str(el.attrs.get("value", ""))
-        pairs = [[k, str(x)] for k, v in fields.items() for x in (v if isinstance(v, list) else [v])]
+            pairs = self._fields(node)
+        else:
+            pairs = [[k, str(x)] for k, v in fields.items() for x in (v if isinstance(v, list) else [v])]
         self.dispatch(node, "submit", {"form": pairs})
+
+    @staticmethod
+    def _fields(form: TestNode, submitter: TestNode | None = None) -> list[list[str]]:
+        """A form's fields as the browser's FormData gives them."""
+        pairs = []
+        for el in form.walk():
+            name = el.attrs.get("name") if el.tag in ("input", "select", "textarea") else None
+            if not name:
+                continue
+            if el.attrs.get("type") in ("checkbox", "radio"):
+                if el.attrs.get("checked", el.attrs.get("defaultChecked")) in (None, False):
+                    continue
+                pairs.append([name, str(el.attrs.get("value", "on"))])
+            else:
+                pairs.append([name, str(el.value or "")])
+        if submitter is not None and submitter.attrs.get("name"):
+            pairs.append([submitter.attrs["name"], str(submitter.attrs.get("value", ""))])
+        return pairs
 
     def navigate(self, url: str) -> None:
         """Follow a link or the back button to ``url``."""

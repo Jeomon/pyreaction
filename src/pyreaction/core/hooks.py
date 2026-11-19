@@ -40,11 +40,34 @@ __all__ = [
     "use_sync_external_store",
     "use_title",
     "use_transition",
+    "start_transition",
+    "use_optimistic",
+    "create_ref",
+    "use",
+    "use_deferred_value",
+    "cache",
 ]
 
 T = TypeVar("T")
 
 CURRENT: ContextVar[ComponentNode | None] = ContextVar("pyreaction_current", default=None)
+# The page whose event handler, effect or background work is running (worker threads
+# get it too: they run in a copy of the context that started them).
+ACTIVE_ROOT: ContextVar[Any] = ContextVar("pyreaction_root", default=None)
+# The action running now (a transition's task, or an event handler's completion
+# future): optimistic values set during it last until it is done.
+CURRENT_ACTION: ContextVar[Any] = ContextVar("pyreaction_action", default=None)
+
+
+def active_root() -> Any:
+    """The page being rendered, or whose handler, effect or background work runs."""
+    node = CURRENT.get()
+    if node is not None:
+        return node.root
+    root = ACTIVE_ROOT.get()
+    if root is None:
+        raise RuntimeError("only callable while a page renders, or from its event handlers and effects")
+    return root
 
 _PRIMITIVES = (int, float, str, bytes, bool, type(None), tuple, frozenset)
 
@@ -74,7 +97,10 @@ def _slot(kind: Callable[..., T], *args: Any) -> tuple[T, bool]:
     """The current component's next hook slot, created on first render."""
     node = CURRENT.get()
     if node is None:
-        raise RuntimeError("Hooks can only be called while a component is rendering.")
+        raise RuntimeError(
+            "Invalid hook call: hooks can only be called while a component renders, at its top "
+            "level, or from your own use_ functions called there; not from event handlers or effects."
+        )
     i = node.hook_index
     node.hook_index = i + 1
     hooks = node.hooks
@@ -151,6 +177,12 @@ class Ref(Generic[T]):
         return f"Ref({self.current!r})"
 
 
+def create_ref(initial: T = None) -> Ref[T]:  # type: ignore[assignment]
+    """A new ref object, for code outside components (in a component, ``use_ref``
+    keeps the same one across renders)."""
+    return Ref(initial)
+
+
 class _RefSlot:
     __slots__ = ("ref",)
 
@@ -187,13 +219,14 @@ def use_callback(fn: T, deps: Sequence[Any] | None = None) -> T:
 
 
 class EffectSlot:
-    __slots__ = ("node", "fn", "deps", "cleanup")
+    __slots__ = ("node", "fn", "deps", "cleanup", "ran")
 
     def __init__(self, node: ComponentNode) -> None:
         self.node = node
         self.fn: Callable[[], Any] | None = None
         self.deps: Sequence[Any] | None = None
         self.cleanup: Callable[[], Any] | None = None
+        self.ran = False  # StrictMode sets up, cleans up and sets up again the first time
 
 
 def use_effect(fn: Callable[[], Any], deps: Sequence[Any] | None = None) -> None:
@@ -210,6 +243,14 @@ def use_effect(fn: Callable[[], Any], deps: Sequence[Any] | None = None) -> None
         slot.node.pending_effects.append(slot)
 
 
+def use_layout_effect(fn: Callable[[], Any], deps: Sequence[Any] | None = None) -> None:
+    """The same as :func:`use_effect`, for code written for React. In React it runs
+    before the browser paints, to measure the page; here components run on the
+    server, so it runs once the update has reached the browser. To measure an
+    element, ask the browser: ``await ref.current.call("getBoundingClientRect")``."""
+    use_effect(fn, deps)
+
+
 class Context(Generic[T]):
     """Created by :func:`create_context`. ``ctx(value, *children)`` provides a value."""
 
@@ -221,6 +262,11 @@ class Context(Generic[T]):
         from .element import Element
 
         return Element(self, key, children=children, kwargs={"value": value})
+
+    @property
+    def Provider(self) -> Context[T]:
+        """``ctx.Provider(*children, value=...)``, React's older spelling of ``ctx(...)``."""
+        return self
 
     def __repr__(self) -> str:
         return f"<context {self.__name__}>"
@@ -252,7 +298,10 @@ def use_context(ctx: Context[T]) -> T:
 def _current() -> ComponentNode:
     node = CURRENT.get()
     if node is None:
-        raise RuntimeError("Hooks can only be called while a component is rendering.")
+        raise RuntimeError(
+            "Invalid hook call: hooks can only be called while a component renders, at its top "
+            "level, or from your own use_ functions called there; not from event handlers or effects."
+        )
     return node
 
 
@@ -332,6 +381,202 @@ def use_transition() -> tuple[bool, Callable[..., None]]:
     return pending, slot.start
 
 
+def start_transition(fn: Callable[..., Any], *args: Any) -> None:
+    """Run ``fn(*args)`` in the background, from a handler or effect, without holding
+    up the page: like ``start`` from :func:`use_transition`, without a pending flag.
+    ``async`` functions run on the loop, others in a worker thread; errors are reported."""
+    root = active_root()
+
+    def done(result: Any, error: BaseException | None) -> None:
+        if error is not None:
+            root.report(error, "a transition")
+
+    root.call(lambda: root.background(fn, args, done))
+
+
+class _OptimisticSlot:
+    __slots__ = ("updates", "state", "add")
+
+    def __init__(self, node: ComponentNode) -> None:
+        # (the action it belongs to or None, its argument, the state when added)
+        self.updates: list[tuple[Any, Any, Any]] = []
+        self.state: Any = None
+        root = node.root
+
+        def add(arg: Any) -> None:
+            owner = CURRENT_ACTION.get()
+
+            def apply() -> None:
+                entry = (owner, arg, self.state)
+                self.updates.append(entry)
+                root.schedule(node)
+                if owner is not None:
+
+                    def drop() -> None:
+                        self.updates = [u for u in self.updates if u is not entry]
+                        if node.mounted:
+                            root.schedule(node)
+
+                    owner.add_done_callback(lambda _: root.call(drop))
+
+            root.call(apply)
+
+        self.add = add
+
+
+def use_optimistic(
+    state: T, update: Callable[[T, Any], T] | None = None
+) -> tuple[T, Callable[[Any], None]]:
+    """``shown, add = use_optimistic(state, update)``: show a change before the server
+    work behind it finishes. ``add(x)`` makes ``shown`` ``update(shown, x)`` (or just
+    ``x``) at once; when the action that called it (a transition, a form action or
+    the event handler) is done, ``shown`` is ``state`` again, by then the real result.
+    Outside an action, the change lasts until ``state`` itself changes."""
+    slot, _ = _slot(_OptimisticSlot)
+    slot.state = state
+    slot.updates = [u for u in slot.updates if u[0] is not None or same(u[2], state)]
+    shown = state
+    for _, arg, _ in slot.updates:
+        shown = update(shown, arg) if update is not None else arg
+    return shown, slot.add
+
+
+_MISSING: Any = object()
+
+
+class _DeferredSlot:
+    __slots__ = ("shown", "target", "waiting")
+
+    def __init__(self, node: ComponentNode) -> None:
+        self.shown: Any = None
+        self.target: Any = None
+        self.waiting = False
+
+
+def use_deferred_value(value: T, initial_value: Any = _MISSING) -> T:
+    """``value``, a step behind: when it changes, this render still gets the previous
+    one, and a second render follows with the new one once the first update has
+    reached the browser. Use it for the slow part of a page (search results) so the
+    fast part (the search box) updates first. ``initial_value`` is shown on the
+    first live render. The page's first HTML always has the latest value."""
+    node = _current()
+    slot, new = _slot(_DeferredSlot)
+    if new:
+        slot.shown = value if initial_value is _MISSING else initial_value
+    slot.target = value
+    if same(slot.shown, value):
+        return value
+    root = node.root
+
+    def catch_up() -> None:
+        slot.waiting = False
+        if node.mounted and not same(slot.shown, slot.target):
+            slot.shown = slot.target
+            root.schedule(node)
+
+    if not slot.waiting:
+        if not root.defer(catch_up):
+            slot.shown = value
+            return value
+        slot.waiting = True
+    return slot.shown
+
+
+def use(resource: Any) -> Any:
+    """Read a context or wait for a future, as React's ``use``.
+
+    ``use(SomeContext)`` is :func:`use_context`, but may be called inside an ``if``
+    or a loop. ``use(task)``, with an ``asyncio`` task or future created outside this
+    render (by :func:`cache` or ``asyncio.create_task`` in a handler), returns its
+    result: until it is done the nearest :class:`Suspense` shows its fallback, and an
+    error goes to the nearest :class:`ErrorBoundary`. A coroutine cannot be read
+    twice, so it is refused: wrap the function with :func:`cache`, or use
+    :func:`use_data`."""
+    import asyncio
+
+    node = _current()
+    if isinstance(resource, Context):
+        provider = node.parent
+        while provider is not None and provider.type is not resource:
+            provider = provider.parent
+        if provider is None:
+            return resource.default
+        if node not in provider.subscribers:
+            provider.subscribers.add(node)
+            node.subscriptions.append(provider)
+        return provider.value
+    if isinstance(resource, asyncio.Future):
+        if resource.done():
+            return resource.result()
+        root = node.root
+        root.track(resource)
+
+        def rerender() -> None:
+            if node.mounted:
+                root.schedule(node)
+
+        def ready(_: Any) -> None:
+            root.call(rerender)
+
+        resource.add_done_callback(ready)
+        raise Suspended(resource)
+    if inspect.iscoroutine(resource):
+        resource.close()
+        raise TypeError("use() needs a task, not a coroutine: wrap the async function with cache(), or use use_data()")
+    raise TypeError(f"use() takes a context or an asyncio task or future, not {type(resource).__name__}")
+
+
+def _cache_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    def one(value: Any) -> Any:
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return ("#id", id(value))  # unhashable: the same object, as React compares
+
+    return tuple(one(a) for a in args), tuple(sorted((k, one(v)) for k, v in kwargs.items()))
+
+
+def cache(fn: Callable[..., T]) -> Callable[..., T]:
+    """Memoise ``fn`` for one page, as React's ``cache`` does for one server request:
+    called with the same arguments while the same page renders or handles events,
+    it runs once, so several components can ask for the same data without loading
+    it twice. Errors are remembered too. An ``async`` function returns a task, to
+    read with :func:`use` (``use(get_user(7))``) or to ``await``. Outside a page it
+    just calls ``fn``. Each page starts empty; use a database or ``functools.lru_cache``
+    for data shared between pages."""
+    import asyncio
+    import functools
+
+    is_async = inspect.iscoroutinefunction(fn)
+
+    @functools.wraps(fn)
+    def cached(*args: Any, **kwargs: Any) -> Any:
+        node = CURRENT.get()
+        root = node.root if node is not None else ACTIVE_ROOT.get()
+        if root is None:
+            return fn(*args, **kwargs)
+        key = (cached, _cache_key(args, kwargs))
+        store = root.cache
+        if key not in store:
+            if is_async:
+                coro: Any = fn(*args, **kwargs)
+                task: asyncio.Task[Any] = asyncio.get_running_loop().create_task(coro)
+                root.track(task)
+                store[key] = (True, task)
+            else:
+                try:
+                    store[key] = (True, fn(*args, **kwargs))
+                except Exception as exc:
+                    store[key] = (False, exc)
+        ok, value = store[key]
+        if not ok:
+            raise value
+        return value
+
+    return cached
+
+
 def use_action_state(
     action: Callable[[Any, Any], Any], initial: T
 ) -> tuple[T, Callable[..., None], bool]:
@@ -354,7 +599,9 @@ def use_action_state(
 def _action_runner(holder: Ref[Any], fn: Ref[Any], set_state: Any, start: Any) -> Callable[..., None]:
     from .reconciler import Event
 
-    def run(payload: Any = None) -> None:
+    # *args, not a default: as an event handler it must receive the event.
+    def run(*args: Any) -> None:
+        payload = args[0] if args else None
         if isinstance(payload, Event) and payload.get("form") is not None:
             payload = payload["form"]
         action = fn.current

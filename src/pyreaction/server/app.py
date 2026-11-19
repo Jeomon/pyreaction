@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import tempfile
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -44,7 +45,7 @@ except ImportError:  # pragma: no cover - depends on the optional extra
     def _dumps(data: Any) -> str:
         return _encoder.encode(data)
 
-__all__ = ["create_app", "embed", "run"]
+__all__ = ["create_app", "embed", "prerender", "run"]
 
 logger = logging.getLogger("pyreaction")
 
@@ -334,9 +335,11 @@ def create_app(
     make = _as_factory(app)
 
     def new_root(url: str, connection: Any) -> Root:
-        root = Root(make(), location=url, connection=connection, debug=debug, threaded=threaded)
-        if on_error is not None:
-            root.on_error = lambda exc, where: on_error(exc, where, root.connection)
+        def report(exc: BaseException, where: str) -> None:
+            if on_error is not None:
+                on_error(exc, where, root.connection)
+
+        root = Root(make(), location=url, connection=connection, debug=debug, threaded=threaded, on_error=report)
         return root
 
     # Pages whose connection dropped, kept for a reconnect: id -> (root, expiry timer).
@@ -530,3 +533,85 @@ def embed(
         f'<div id="{escape(element_id)}">{body}</div>'
         f'<script src="{base}/client.js" data-ws="{base}/ws" data-mount="{escape(element_id)}"></script>'
     )
+
+
+async def _get(asgi: Any, path: str) -> tuple[int, dict[str, str], str]:
+    """One GET through an ASGI app, without a network: (status, headers, body)."""
+    raw_path, _, query = path.partition("?")
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+        "scheme": "http", "path": raw_path, "raw_path": raw_path.encode(), "query_string": query.encode(),
+        "root_path": "", "headers": [(b"host", b"localhost")], "client": ("127.0.0.1", 0),
+        "server": ("localhost", 80),
+    }
+    status = 500
+    headers: dict[str, str] = {}
+    chunks: list[bytes] = []
+    sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await asyncio.Event().wait()  # no disconnect until the response is done
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        nonlocal status
+        if message["type"] == "http.response.start":
+            status = message["status"]
+            headers.update({k.decode(): v.decode() for k, v in message.get("headers", [])})
+        elif message["type"] == "http.response.body":
+            chunks.append(message.get("body", b""))
+
+    await asyncio.wait_for(asgi(scope, receive, send), timeout=None)
+    return status, headers, b"".join(chunks).decode()
+
+
+def prerender(
+    app: Component | Element | Callable[[], Element],
+    paths: Sequence[str] = ("/",),
+    out_dir: str | Path | None = None,
+    *,
+    live: bool = False,
+    **options: Any,
+) -> dict[str, str]:
+    """Render ``paths`` to complete HTML pages ahead of time, for a static host.
+
+    Each page waits for all its data (``use_data``, ``use_async``, Suspense), as
+    React's ``prerender`` does, and gets its status, title and head tags like a
+    served page. Returns ``{path: html}``; with ``out_dir`` also writes them, ``/``
+    as ``index.html`` and ``/about`` as ``about/index.html`` (copy your static
+    folder next to them yourself). Without ``live`` the pages have no client
+    script: plain HTML, no WebSocket. With ``live=True`` they keep it, to be served
+    in front of the running app. Redirecting paths are skipped. ``options`` go to
+    :func:`create_app` (``title``, ``head``, ``stylesheets``, ``data_timeout``...).
+    Call it outside an event loop (in async code, run it in a thread).
+    """
+    asgi = create_app(app, stream=False, **options)
+    script = re.compile(r'<script src="[^"]*/client\.js"[^>]*></script>\n?')
+
+    async def render_all() -> dict[str, str]:
+        pages: dict[str, str] = {}
+        for path in paths:
+            if not path.startswith("/"):
+                raise ValueError(f"paths start with '/': {path!r}")
+            status, headers, body = await _get(asgi, path)
+            if 300 <= status < 400:
+                logger.warning("Not prerendering %s: it redirects to %s", path, headers.get("location"))
+                continue
+            if status >= 400:
+                logger.warning("Prerendered %s with status %d", path, status)
+            pages[path] = body if live else script.sub("", body)
+        return pages
+
+    pages = asyncio.run(render_all())
+    if out_dir is not None:
+        root = Path(out_dir)
+        for path, html in pages.items():
+            clean = path.partition("?")[0].strip("/")
+            target = root / clean / "index.html" if clean else root / "index.html"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(html, encoding="utf-8")
+    return pages

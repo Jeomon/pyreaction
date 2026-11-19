@@ -165,6 +165,12 @@ def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = No
             value = ""
         elif name in ("indeterminate", "muted"):
             continue
+        elif name == "defaultValue":
+            if tag != "input":
+                continue  # a textarea's is its text; a select's is set once live
+            name = "value"
+        elif name == "defaultChecked":
+            name = "checked"
         out.append(f' {name}="{escape(str(value))}"')
     out.append(">")
     if tag in VOID:
@@ -172,7 +178,8 @@ def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = No
     if RAW_HTML in node.attrs:
         out.append(str(node.attrs[RAW_HTML]))
     elif tag == "textarea" and not node.children:
-        out.append(escape(str(node.attrs.get("value", "")), quote=False))
+        text = node.attrs.get("value", node.attrs.get("defaultValue", ""))
+        out.append(escape(str(text), quote=False))
     else:
         _children(node.children, out, raw=tag in RAW_TEXT, boundaries=boundaries)
     out.append(f"</{tag}>")

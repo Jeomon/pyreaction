@@ -135,8 +135,8 @@ def test_event_specs_and_submit_prevents_default():
 
     root = Root(App())
     creates = {op[2]: op[4] for op in root.ops if op[0] == "c"}
-    assert creates["form"] == {"submit": [True, False, None, None, None, None, False]}
-    assert creates["input"] == {"input": [False, False, 200, None, None, None, False]}
+    assert creates["form"] == {"submit": [True, False, None, None, None, None, False, False]}
+    assert creates["input"] == {"input": [False, False, 200, None, None, None, False, False]}
 
 
 def test_conditional_child_keeps_sibling_identity():

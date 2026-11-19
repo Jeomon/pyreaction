@@ -9,7 +9,10 @@ from typing import Any
 from .element import Element, component, html
 from .hooks import CURRENT, Ref, create_context, use_context, use_ref, use_state, use_transition
 
-__all__ = ["Activity", "Form", "FormStatus", "Head", "Suspense", "use_form_status"]
+__all__ = [
+    "Activity", "Form", "FormStatus", "Head", "Profiler", "StrictMode", "Suspense", "ViewTransition",
+    "use_form_status",
+]
 
 
 class FormStatus:
@@ -76,6 +79,56 @@ def Form(*children: Any, action: Callable[[Any], Any], reset: bool = True, **pro
 
 
 @component
+def Profiler(*children: Any, id: Any, on_render: Callable[..., Any]) -> Any:
+    """Measure how long the components inside take to render, as React's Profiler.
+
+    After each render pass that rendered any of them, ``on_render(id, phase,
+    actual_duration, start_time, commit_time)`` is called: ``phase`` is "mount" or
+    "update", durations and times are milliseconds (``time.perf_counter`` based).
+    Profilers may be nested; an outer one's time includes the inner one's."""
+    node = CURRENT.get()
+    assert node is not None
+    node.profile = (id, on_render)
+    node.root._profiling = True
+    return list(children)
+
+
+Profiler.profiler = True
+
+
+@component
+def ViewTransition(*children: Any, name: str | None = None) -> Any:
+    """Animate changes to ``children`` with the browser's View Transitions API, as
+    React's ``<ViewTransition>``: when an update changes anything inside, the page
+    applies it in ``document.startViewTransition``, which cross-fades by default and
+    can be styled with CSS (``::view-transition-old(name)``). Browsers without the
+    API just update. Unlike React, every update inside animates, not only those
+    from transitions.
+
+    With ``name`` the children sit in a ``<div>`` with that ``view-transition-name``,
+    so the browser can animate it on its own (a card moving to a new place: give
+    it the same name on both pages). Names must be unique on the page."""
+    node = CURRENT.get()
+    assert node is not None
+    node.view_transition = True
+    if name is None:
+        return list(children)
+    return html.div(*children, style={"view_transition_name": name})
+
+
+@component
+def StrictMode(*children: Any) -> Any:
+    """Finds impure components and effects without cleanup, in debug mode (as
+    ``pyreaction dev`` runs) only, like React's development builds: components
+    inside render twice, and each effect is set up, cleaned up and set up again
+    when it first runs. Outside debug mode it does nothing."""
+    node = CURRENT.get()
+    assert node is not None
+    node.strict = True
+    return list(children)
+
+
+@component
 def Suspense(*children: Any, fallback: Any = None) -> Any:
     """Show ``fallback`` while a component inside waits for :func:`use_data`.
 
@@ -114,8 +167,42 @@ def Activity(*children: Any, mode: str = "visible") -> Element:
 def Head(*children: Any) -> None:
     """Put ``<meta>``, ``<link>`` and other tags into the page's ``<head>``, from
     anywhere in the tree, in the first HTML too. They are removed when the
-    component unmounts. Use :func:`use_title` for the title."""
+    component unmounts. A ``<title>`` among them sets the page title."""
     node = CURRENT.get()
     assert node is not None
-    node.root.set_head(node, tuple(c for c in children if isinstance(c, Element)))
+    tags = []
+    for child in children:
+        if isinstance(child, Element) and child.type is Hoisted:
+            child = child.args[0]
+        if not isinstance(child, Element):
+            continue
+        if child.type == "title":
+            node.root.set_title(_text(child))
+        else:
+            tags.append(child)
+    node.root.set_head(node, tuple(tags))
+    return None
+
+
+def _text(el: Element) -> str:
+    return "".join(str(c) for c in el.children if c is not None and c is not False and c is not True)
+
+
+@component
+def Hoisted(element: Element) -> Any:
+    """What ``html.title``, ``html.meta`` and ``html.link`` make: written anywhere in
+    the tree, the tag goes into the page's ``<head>`` (the title sets the page
+    title), in the first HTML too, as React 19 does. A ``<title>`` inside ``<svg>``
+    (a tooltip) and tags with ``itemprop`` (page metadata) stay where they are."""
+    node = CURRENT.get()
+    assert node is not None
+    host = node.parent
+    while host is not None and not hasattr(host, "ns"):
+        host = host.parent
+    if "itemprop" in element.attrs or (host is not None and host.ns == "svg"):
+        return element
+    if element.type == "title":
+        node.root.set_title(_text(element))
+    else:
+        node.root.set_head(node, (element,))
     return None

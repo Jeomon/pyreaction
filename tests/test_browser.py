@@ -242,3 +242,124 @@ def test_state_survives_a_dropped_connection(page):
         page.wait_for_selector(server.READY, state="attached", timeout=15000)
         page.wait_for_function("document.querySelector('#inc').textContent === 'n=3'", timeout=5000)
         assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+
+
+def test_uncontrolled_inputs_keep_what_is_typed_across_re_renders(page):
+    sent = []
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+
+        def submit(e):
+            sent.append(dict(e.form.items()))
+            set_n(n + 1)
+
+        return html.form(
+            html.input(name="q", id="q", default_value="hello"),
+            html.input(type="checkbox", name="c", id="c", default_checked=True),
+            html.textarea(name="t", id="t", default_value="notes"),
+            html.select(html.option("a", value="a"), html.option("b", value="b"), name="s", id="s", default_value="b"),
+            html.button(f"sent {n}", id="go"),
+            on_submit=submit,
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        assert page.input_value("#q") == "hello" and page.is_checked("#c")
+        assert page.input_value("#t") == "notes"
+        assert page.input_value("#s") == "b", "the select starts on its default"
+        page.fill("#q", "typed by hand")
+        page.uncheck("#c")
+        page.select_option("#s", "a")
+        page.click("#go")
+        page.wait_for_function("document.querySelector('#go').textContent === 'sent 1'")
+        assert sent == [{"q": "typed by hand", "t": "notes", "s": "a"}]
+        # The re-render did not put the defaults back.
+        assert page.input_value("#q") == "typed by hand"
+        assert not page.is_checked("#c")
+        assert page.input_value("#s") == "a"
+
+
+def test_capture_events_and_button_form_action_in_chrome(page):
+    order, drafts, posts = [], [], []
+
+    @component
+    def App():
+        return html.div(
+            html.form(
+                html.input(name="title", id="title", required=True),
+                html.button("Publish", id="publish"),
+                html.button("Draft", id="draft", name="kind", value="draft",
+                            form_action=lambda f: drafts.append(dict(f))),
+                on_submit=lambda e: posts.append(dict(e.form)),
+            ),
+            html.button("inner", id="inner", on_click=lambda: order.append("inner")),
+            on_click_capture=lambda: order.append("capture"),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.click("#inner")
+        page.wait_for_timeout(300)
+        assert order[-2:] == ["capture", "inner"]
+        page.click("#draft")  # the title is required: the browser refuses first
+        page.wait_for_timeout(300)
+        assert drafts == []
+        page.fill("#title", "hello")
+        page.click("#draft")
+        page.wait_for_timeout(300)
+        assert drafts == [{"title": "hello", "kind": "draft"}] and posts == []
+
+
+def test_head_tags_resources_and_callback_refs_in_chrome(page):
+    from pyreaction import preinit
+
+    refs = []
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+
+        def go():
+            preinit("data:text/javascript,window.__ran=(window.__ran||0)+1", as_="script")
+            set_n(n + 1)
+
+        return html.div(
+            html.title(f"Page {n}"),
+            html.meta(name="description", content=f"n={n}"),
+            html.p("ref me", id="p", ref=lambda el: refs.append(el is not None)),
+            html.button("go", id="go", on_click=go),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        assert page.title() == "Page 0"
+        page.click("#go")
+        page.wait_for_function("document.title === 'Page 1'")
+        page.click("#go")
+        page.wait_for_function("document.title === 'Page 2'")
+        assert page.evaluate("document.querySelector('meta[name=description]').content") == "n=2"
+        assert page.evaluate("document.querySelectorAll('meta[name=description]').length") == 1
+        assert page.evaluate("window.__ran") == 1, "a preinit script runs once, not on every head update"
+        assert True in refs
+
+
+def test_view_transition_updates_in_chrome(page):
+    from pyreaction import ViewTransition
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        return html.div(ViewTransition(html.p(f"n={n}", id="n"), name="count"),
+                        html.button("+", id="inc", on_click=lambda: set_n(n + 1)))
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.evaluate("""window.__vt = 0; const o = document.startViewTransition.bind(document);
+            document.startViewTransition = (cb) => { window.__vt++; return o(cb); }""")
+        for _ in range(3):
+            page.click("#inc")
+        page.wait_for_function("document.querySelector('#n').textContent === 'n=3'")
+        assert page.evaluate("window.__vt") >= 1
+        assert page.evaluate("getComputedStyle(document.querySelector('#n').parentElement).viewTransitionName") == "count"

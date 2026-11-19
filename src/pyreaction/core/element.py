@@ -6,6 +6,8 @@ event handlers, so the reconciler only ever compares ready-to-send values.
 
 from __future__ import annotations
 
+import inspect
+
 import functools
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
@@ -86,6 +88,11 @@ _ATTR_ALIASES = {
     "html_for": "for",
     "htmlFor": "for",
     "for_": "for",
+    # Uncontrolled inputs: only the starting value, the browser keeps what is typed.
+    "default_value": "defaultValue",
+    "defaultValue": "defaultValue",
+    "default_checked": "defaultChecked",
+    "defaultChecked": "defaultChecked",
 }
 
 # React's onChange fires on every edit, which is the DOM "input" event.
@@ -101,7 +108,7 @@ class EventHandler:
 
     __slots__ = (
         "fn", "prevent_default", "stop_propagation", "debounce", "throttle", "keys", "code",
-        "stop_immediate_propagation",
+        "stop_immediate_propagation", "form",
     )
 
     def __init__(
@@ -114,6 +121,7 @@ class EventHandler:
         keys: Sequence[str] | None = None,
         code: str | None = None,
         stop_immediate_propagation: bool = False,
+        form: bool = False,
     ) -> None:
         if fn is None and code is None:
             raise TypeError("an event handler needs a function or js() code")
@@ -128,11 +136,13 @@ class EventHandler:
         self.keys = list(keys) if keys is not None else None
         self.code = code
         self.stop_immediate_propagation = stop_immediate_propagation
+        # Send the fields of the element's form, checked first (a button's form_action).
+        self.form = form
 
     def spec(self) -> list[Any]:
         return [
             self.prevent_default, self.stop_propagation, self.debounce, self.throttle, self.keys,
-            self.code, self.stop_immediate_propagation,
+            self.code, self.stop_immediate_propagation, self.form,
         ]
 
 
@@ -243,13 +253,22 @@ def _style_to_str(style: dict[str, Any]) -> str:
 
 
 def _event_name(prop: str) -> str | None:
+    """The DOM event a prop listens to; ``on_click_capture`` gives ``click:capture``,
+    a listener that runs on the way down, before the target's own handlers."""
     if prop.startswith("on_"):
         name = prop[3:].replace("_", "")
     elif len(prop) > 2 and prop.startswith("on") and prop[2].isupper():
         name = prop[2:].lower()
     else:
         return None
+    if name.endswith("capture") and name not in _CAPTURE_NAMED:
+        base = name[: -len("capture")]
+        return _EVENT_ALIASES.get(base, base) + ":capture"
     return _EVENT_ALIASES.get(name, name)
+
+
+# Events whose own name ends in "capture" (onGotPointerCaptureCapture captures them).
+_CAPTURE_NAMED = frozenset({"gotpointercapture", "lostpointercapture"})
 
 
 def _split_props(props: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], dict[str, EventHandler]]:
@@ -268,6 +287,9 @@ def _split_props(props: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], dict[
             if value is not None:
                 attrs[RAW_HTML] = str(value)
                 attrs[RAW_MARK] = ""
+            continue
+        if name in ("form_action", "formAction") and callable(value):
+            events["click"] = _form_action(value)
             continue
         ev = _event_name(name)
         if ev is not None:
@@ -297,6 +319,32 @@ def _split_props(props: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], dict[
     return key, ref, attrs, events
 
 
+def _form_action(fn: Callable[..., Any]) -> EventHandler:
+    """``html.button(form_action=fn)``: this button submits its form to ``fn(fields)``
+    instead of the form's own action, after the browser checks required fields."""
+    if inspect.iscoroutinefunction(fn):
+
+        async def run_async(e: Any) -> Any:
+            return await fn(e.form)
+
+        return EventHandler(run_async, prevent_default=True, form=True)
+
+    def run(e: Any) -> Any:
+        return fn(e.form)
+
+    return EventHandler(run, prevent_default=True, form=True)
+
+
+# Written anywhere, these go into the page's <head>, as in React 19.
+HOISTED = frozenset({"title", "meta", "link"})
+
+
+def _hoist(el: Element) -> Element:
+    from .components import Hoisted
+
+    return Hoisted(el, key=el.key)
+
+
 def h(tag: Any, props: dict[str, Any] | None = None, *children: Any) -> Element:
     """Create an element, ``h("div", {"class_name": "box"}, "hello")``.
 
@@ -310,12 +358,109 @@ def h(tag: Any, props: dict[str, Any] | None = None, *children: Any) -> Element:
         return Element(tag, key, kwargs=props)
     key, ref, attrs, events = _split_props(props or {})
     _check_raw(attrs, children)
-    return Element(tag, key, attrs, events, children, ref=ref)
+    el = Element(tag, key, attrs, events, children, ref=ref)
+    return _hoist(el) if tag in HOISTED else el
 
 
 def _check_raw(attrs: dict[str, Any], children: tuple[Any, ...]) -> None:
     if RAW_HTML in attrs and any(c is not None and c is not False for c in children):
         raise TypeError("an element with dangerously_set_inner_html cannot also have children")
+
+
+def is_valid_element(value: Any) -> bool:
+    """Whether ``value`` is an element (what ``html.div(...)`` or a component call makes)."""
+    return isinstance(value, Element)
+
+
+def clone_element(element: Element, *children: Any, **props: Any) -> Element:
+    """A copy of ``element`` with ``props`` merged over its own, and ``children``
+    replacing its children when given. ``key`` and ``ref`` are kept unless passed."""
+    if not isinstance(element, Element):
+        raise TypeError(f"clone_element takes an element, got {type(element).__name__}")
+    key = props.pop("key", element.key)
+    if isinstance(element.type, str) and element.type not in (FRAGMENT, PORTAL):
+        ref = props.pop("ref", element.ref)
+        _, _, attrs, events = _split_props(props)
+        new_children = children if children else element.children
+        merged = {**element.attrs, **attrs}
+        _check_raw(merged, new_children)
+        return Element(element.type, key, merged, {**element.events, **events}, new_children, ref=ref)
+    if element.type in (FRAGMENT, PORTAL):
+        return Element(element.type, key, dict(element.attrs), children=children or element.children)
+    kwargs = {**element.kwargs, **props}
+    args = element.args
+    if children:
+        if "children" in element.kwargs:
+            kwargs["children"] = children
+        else:
+            args = children
+    return Element(element.type, key, args=args, kwargs=kwargs)
+
+
+def _child_list(children: Any) -> list[Any]:
+    """Children flattened out of nested lists and tuples (not out of fragments)."""
+    if children is None:
+        return []
+    if not isinstance(children, (list, tuple)):
+        return [children]
+    out: list[Any] = []
+    for child in children:
+        if isinstance(child, (list, tuple)):
+            out.extend(_child_list(child))
+        else:
+            out.append(child)
+    return out
+
+
+def _empty(child: Any) -> bool:
+    return child is None or isinstance(child, bool)
+
+
+class Children:
+    """React's ``Children`` helpers, for components that work on the children they
+    are given (``*children``, a list, or one child). Nested lists are flattened;
+    fragments count as one child, as in React."""
+
+    @staticmethod
+    def map(children: Any, fn: Callable[..., Any]) -> list[Any]:
+        """``fn(child, index)`` for each child (``fn(child)`` works too); empty
+        results are dropped."""
+        two = _wants_two(fn)
+        out = [fn(c, i) if two else fn(c) for i, c in enumerate(_child_list(children))]
+        return [c for c in _child_list(out) if not _empty(c)]
+
+    @staticmethod
+    def for_each(children: Any, fn: Callable[..., Any]) -> None:
+        two = _wants_two(fn)
+        for i, child in enumerate(_child_list(children)):
+            fn(child, i) if two else fn(child)
+
+    @staticmethod
+    def count(children: Any) -> int:
+        """How many children there are, empty ones (None, True, False) included."""
+        return len(_child_list(children))
+
+    @staticmethod
+    def to_array(children: Any) -> list[Any]:
+        """The children as a flat list, without empty ones."""
+        return [c for c in _child_list(children) if not _empty(c)]
+
+    @staticmethod
+    def only(children: Any) -> Element:
+        """The one child, which must be an element."""
+        items = Children.to_array(children)
+        if len(items) != 1 or not isinstance(items[0], Element):
+            raise ValueError(f"expected exactly one element child, got {len(items)} child(ren)")
+        return items[0]
+
+
+def _wants_two(fn: Callable[..., Any]) -> bool:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    return len(positional) >= 2 or any(p.kind is p.VAR_POSITIONAL for p in params)
 
 
 def fragment(*children: Any, key: Any = None) -> Element:
@@ -347,10 +492,17 @@ class _TagFactory:
             props = {**children[0], **props}
             children = children[1:]
         if not props:
-            return Element(self.tag, None, {}, {}, children)
-        key, ref, attrs, events = _split_props(props)
-        _check_raw(attrs, children)
-        return Element(self.tag, key, attrs, events, children, ref=ref)
+            el = Element(self.tag, None, {}, {}, children)
+        else:
+            if self.tag == "form" and callable(props.get("action")):
+                # React 19's <form action={fn}>: the Form component, with pending state.
+                from .components import Form
+
+                return Form(*children, **props)
+            key, ref, attrs, events = _split_props(props)
+            _check_raw(attrs, children)
+            el = Element(self.tag, key, attrs, events, children, ref=ref)
+        return _hoist(el) if self.tag in HOISTED else el
 
     def __repr__(self) -> str:
         return f"html.{self.tag}"
@@ -542,6 +694,7 @@ class Component:
     def __init__(self, fn: Callable[..., Any], memo: bool = False) -> None:
         self.fn = fn
         self.memo = memo
+        self.profiler = False  # set on Profiler: the reconciler times its renders
         functools.update_wrapper(self, fn)
 
     def __call__(self, *args: Any, key: Any = None, **kwargs: Any) -> Element:

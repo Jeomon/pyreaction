@@ -23,6 +23,9 @@
   let ack = 0;
   let retry = 0;
   let sid = null; // this session's id on the server, for resuming after a drop
+  // While a view transition runs, later messages wait so they apply in order.
+  let animating = null;
+  const waiting = [];
   const outbox = [];
   let uploads = 0;
   let maxUpload = 0; // set by the server's first message
@@ -30,10 +33,32 @@
   // the person has typed since, and a newer render is on its way.
   let lastSent = new WeakMap();
 
+  // A <select> can only take its value once its options exist.
+  function selectValue(el) {
+    if (el.__value === undefined) return;
+    el.value = el.__value;
+    if (el.__once) {
+      el.__once = false;
+      el.__value = undefined;
+    }
+  }
+
   function setProp(el, name, value) {
     if (name === "#html") {
       // dangerously_set_inner_html: the server's string, as markup.
       el.innerHTML = value === null ? "" : value;
+      return;
+    }
+    if (name === "defaultValue" || name === "defaultChecked") {
+      // Uncontrolled: only the starting value; the browser keeps what is typed.
+      if (el.localName === "select") {
+        if (el.__defaulted) return;
+        el.__defaulted = true;
+        el.__value = value == null ? "" : String(value);
+        el.__once = true; // applied when its options arrive, then left to the person
+        el.value = el.__value;
+      } else if (name === "defaultChecked") el.defaultChecked = value !== null;
+      else el.defaultValue = value == null ? "" : String(value);
       return;
     }
     if (PROPS.has(name)) {
@@ -110,13 +135,16 @@
 
   function listen(el, name, spec) {
     const events = el.__ev || (el.__ev = {});
+    // "click:capture" listens to click on the way down, before the target's handlers.
+    const [type, phase] = name.split(":");
+    const capture = phase === "capture";
     const prev = events[name];
-    if (prev) el.removeEventListener(name, prev);
+    if (prev) el.removeEventListener(type, prev, capture);
     if (spec === null) {
       delete events[name];
       return;
     }
-    const [preventDefault, stopPropagation, debounce, throttle, keys, code, stopImmediate] = spec;
+    const [preventDefault, stopPropagation, debounce, throttle, keys, code, stopImmediate, withForm] = spec;
     let timer = null;
     let last = 0;
     const fire = (data) => {
@@ -142,6 +170,15 @@
       }
       if (e.target && e.target !== el) lastSent.set(e.target, seq + 1);
       const data = serialize(e);
+      if (withForm) {
+        // A button's form_action: the form's fields (with this button's), once valid.
+        const form = el.form || el.closest("form");
+        if (form && !form.checkValidity()) {
+          form.reportValidity();
+          return;
+        }
+        if (form) data.form = Array.from(new FormData(form, el), ([k, v]) => [k, typeof v === "string" ? v : v.name]);
+      }
       const t = e.target;
       if (t && t.localName === "input" && t.type === "file" && t.files && t.files.length) {
         upload(t.files).then((files) => fire({ ...data, files }));
@@ -157,7 +194,7 @@
       } else fire(data);
     };
     events[name] = handler;
-    el.addEventListener(name, handler);
+    el.addEventListener(type, handler, capture);
   }
 
   // ---- JavaScript components -------------------------------------------------------
@@ -302,13 +339,13 @@
           for (const id of op[2]) frag.appendChild(nodes.get(id));
           inside(parent).appendChild(frag);
           // A <select> can only take its value once its options exist.
-          if (parent.__value !== undefined) parent.value = parent.__value;
+          selectValue(parent);
           break;
         }
         case "a": {
           const parent = nodes.get(op[1]);
           inside(parent).insertBefore(nodes.get(op[2]), op[3] === null ? null : nodes.get(op[3]));
-          if (parent.__value !== undefined) parent.value = parent.__value;
+          selectValue(parent);
           break;
         }
         case "r": {
@@ -489,11 +526,33 @@
 
   // ---- <head> tags from Head components ----------------------------------------------
 
+  // Tags already in <head> stay as they are (a stylesheet is not reloaded, a script
+  // not run again); new ones are added, and those no longer asked for removed.
   function setHead(markup) {
-    for (const el of document.head.querySelectorAll("[data-pyreaction-head]")) el.remove();
     const t = document.createElement("template");
     t.innerHTML = markup;
-    document.head.appendChild(t.content);
+    const old = new Map();
+    for (const el of document.head.querySelectorAll("[data-pyreaction-head]")) {
+      const same = old.get(el.outerHTML) || [];
+      same.push(el);
+      old.set(el.outerHTML, same);
+    }
+    for (const el of Array.from(t.content.children)) {
+      const kept = old.get(el.outerHTML);
+      if (kept && kept.length) {
+        kept.shift();
+        continue;
+      }
+      let node = el;
+      if (el.localName === "script") {
+        // A script parsed from markup never runs: make a fresh one so it does.
+        node = document.createElement("script");
+        for (const a of el.attributes) node.setAttribute(a.name, a.value);
+        node.text = el.text;
+      }
+      document.head.appendChild(node);
+    }
+    for (const same of old.values()) for (const el of same) el.remove();
   }
 
   // ---- errors (debug mode) ---------------------------------------------------------
@@ -541,8 +600,23 @@
       clearInterval(heartbeat);
       heartbeat = setInterval(() => send([0, 0, "#ping", {}]), HEARTBEAT);
     };
+    const receive = (data) => {
+      if (data.vt && !data.init && document.startViewTransition) {
+        animating = document
+          .startViewTransition(() => handle(data))
+          .updateCallbackDone.catch(() => {})
+          .finally(() => {
+            animating = null;
+            while (waiting.length && !animating) receive(waiting.shift());
+          });
+      } else handle(data);
+    };
     socket.onmessage = (msg) => {
       const data = JSON.parse(msg.data);
+      if (animating) waiting.push(data);
+      else receive(data);
+    };
+    const handle = (data) => {
       if (data.init) {
         sid = data.sid || null;
         maxUpload = data.maxUpload || 0;
