@@ -192,7 +192,14 @@ development builds. Outside debug mode it does nothing.
 start, commit)` after each render pass that rendered its subtree.
 `ViewTransition(*children, name=None)` applies updates that change its children
 inside the browser's `document.startViewTransition`, so they animate (cross-fade
-by default, styled with `::view-transition-old(name)`).
+by default, styled with `::view-transition-old(name)`). `add_transition_type("back")`
+in the handler names the change, for CSS such as
+`html:active-view-transition-type(back)`.
+
+`lazy(load)` makes a component that calls `load()` on its first render to get
+the real one (an `async` loader suspends meanwhile). `forward_ref(fn)` is the same
+as `component(fn)`, for code ported from React: any component can already take
+`ref=` and pass it on.
 
 For components that work on their children, as in React: `Children.map`,
 `Children.for_each`, `Children.count`, `Children.to_array` and `Children.only`,
@@ -231,7 +238,14 @@ page goes live. `create_app(stream=False)` waits for all of it instead.
 
 `@cache` memoises a function for one page, as React's `cache` does for one
 request: several components asking for `get_user(7)` load it once. An `async`
-function returns a task to read with `use(get_user(7))`.
+function returns a task to read with `use(get_user(7))`; it is cancelled when the
+page closes, and `cache_signal()` gives the work a signal that says so
+(`.aborted`, `.on_abort(fn)`, `await .wait()`).
+
+`browser()` at the top of a component leaves it to the browser: the page's
+first HTML (and `prerender`, `embed`) shows the nearest `Suspense` fallback, and
+the component renders once the page is live. Use it for parts that depend on the
+browser or are too costly to render for every request.
 
 ## Pending state and forms
 
@@ -273,6 +287,11 @@ def send(fields):
 
 `use_optimistic` changes what is shown until the action that called `add` (the
 handler, transition or form action) finishes; if it fails, the change goes away.
+
+`flush_sync(lambda: set_status("saving"))` renders and sends an update right away,
+so the page shows it while the rest of a slow handler runs.
+`request_form_reset(form_ref)` resets a form with uncontrolled inputs, once the
+current action is done.
 
 ## Routing
 
@@ -500,6 +519,8 @@ static host, as React's `prerender`: each waits for all its data, gets its
 title and head tags, and is written as `dist/index.html`, `dist/about/index.html`.
 The pages are plain HTML without the client script; `live=True` keeps it, for
 pages served in front of the running app. Options go to `create_app`.
+`render_to_static_markup(element)` renders HTML that never goes live (an email,
+a snippet), without the markers the live page uses to adopt it.
 
 Each page view is a live session on the server. If the connection drops, the
 page dims and reconnects (with growing, randomised delays). The server keeps the

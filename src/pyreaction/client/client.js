@@ -602,8 +602,11 @@
     };
     const receive = (data) => {
       if (data.vt && !data.init && document.startViewTransition) {
+        // Types (add_transition_type) need the object form, where the browser has it.
+        const types = Array.isArray(data.vt) ? data.vt : [];
+        const withTypes = types.length && typeof ViewTransition !== "undefined" && "types" in ViewTransition.prototype;
         animating = document
-          .startViewTransition(() => handle(data))
+          .startViewTransition(withTypes ? { update: () => handle(data), types } : () => handle(data))
           .updateCallbackDone.catch(() => {})
           .finally(() => {
             animating = null;

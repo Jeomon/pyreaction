@@ -22,6 +22,7 @@ from .core.element import (
     clone_element,
     component,
     event,
+    forward_ref,
     fragment,
     h,
     html,
@@ -32,6 +33,12 @@ from .core.element import (
     portal,
 )
 from .core.hooks import (
+    add_transition_type,
+    browser,
+    cache_signal,
+    flush_sync,
+    lazy,
+    request_form_reset,
     cache,
     use,
     use_deferred_value,
@@ -68,13 +75,20 @@ from .core.hooks import (
 from .core.parse import parse_html
 from .core.reconciler import ElementHandle, Event, FormFields, Location, Reply, Root, UploadedFile
 from .core.router import Link, Navigate, Router
-from .core.ssr import render_to_string
+from .core.ssr import render_to_static_markup, render_to_string
 from .core.resources import preconnect, prefetch_dns, preinit, preinit_module, preload, preload_module
 from .core.store import RedisBackend, Store, StoreBackend, use_store
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "forward_ref",
+    "request_form_reset",
+    "lazy",
+    "flush_sync",
+    "cache_signal",
+    "browser",
+    "add_transition_type",
     "ViewTransition",
     "cache",
     "Profiler",
@@ -131,6 +145,7 @@ __all__ = [
     "prefetch_dns",
     "preconnect",
     "portal",
+    "render_to_static_markup",
     "render_to_string",
     "run",
     "use_action_state",

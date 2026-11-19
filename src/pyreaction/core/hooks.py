@@ -46,6 +46,12 @@ __all__ = [
     "use",
     "use_deferred_value",
     "cache",
+    "browser",
+    "flush_sync",
+    "request_form_reset",
+    "add_transition_type",
+    "cache_signal",
+    "lazy",
 ]
 
 T = TypeVar("T")
@@ -563,6 +569,7 @@ def cache(fn: Callable[..., T]) -> Callable[..., T]:
                 coro: Any = fn(*args, **kwargs)
                 task: asyncio.Task[Any] = asyncio.get_running_loop().create_task(coro)
                 root.track(task)
+                root.signal.on_abort(task.cancel)  # the page closed: stop loading
                 store[key] = (True, task)
             else:
                 try:
@@ -575,6 +582,87 @@ def cache(fn: Callable[..., T]) -> Callable[..., T]:
         return value
 
     return cached
+
+
+def flush_sync(fn: Callable[[], T] | None = None) -> T | None:
+    """Call ``fn`` (if given), then render and send the resulting updates right away
+    instead of at the end of the handler, as React's ``flushSync``: the page shows
+    them before the handler goes on (a "Saving..." before a slow call). Returns what
+    ``fn`` returned. Not callable while rendering."""
+    if CURRENT.get() is not None:
+        raise RuntimeError("flush_sync cannot be called while rendering; call it from a handler or effect")
+    root = active_root()
+    result = fn() if fn is not None else None
+    root.flush_now()
+    return result
+
+
+def request_form_reset(form: Any) -> None:
+    """Reset a ``<form>`` (a ref attached to it, or its element handle) to its
+    initial values, as react-dom's ``requestFormReset``: inside an action (a
+    handler, transition or form action) once that action is done, else now. Use it
+    with forms whose inputs are uncontrolled (``default_value``)."""
+    handle = getattr(form, "current", form)
+    if handle is None or not hasattr(handle, "call"):
+        raise ValueError("request_form_reset needs a ref attached to a <form>")
+    root = active_root()
+    action = CURRENT_ACTION.get()
+    if action is None or action.done():
+        handle.call("reset")
+        return
+    action.add_done_callback(lambda _: root.call(lambda: handle.call("reset")))
+
+
+def add_transition_type(name: str) -> None:
+    """Name the kind of change being made (``"forward"``, ``"back"``), as React's
+    ``addTransitionType``: when the update animates through a :class:`ViewTransition`,
+    the browser gets the types, and CSS can tell them apart with
+    ``html:active-view-transition-type(forward)``. Call it in the handler or
+    transition that makes the change."""
+    active_root().add_transition_type(name)
+
+
+def cache_signal() -> Any:
+    """A signal that tells work done for this page that the page has closed, as
+    React's ``cacheSignal``: ``.aborted``, ``.on_abort(fn)`` and ``await .wait()``.
+    For work started by a :func:`cache` function that should stop early (a long
+    query, a stream). None outside a page."""
+    node = CURRENT.get()
+    root = node.root if node is not None else ACTIVE_ROOT.get()
+    return None if root is None else root.signal
+
+
+def lazy(load: Callable[[], Any]) -> Any:
+    """A component loaded on first use, as React's ``lazy``: ``load()`` returns the
+    real component; it is called once, when the component first renders, and its
+    result is kept. ``load`` may be ``async``: until it finishes the nearest
+    :class:`Suspense` shows its fallback, and an error goes to the nearest
+    ``ErrorBoundary`` (the next render tries again)::
+
+        Settings = lazy(lambda: importlib.import_module("app.settings").Settings)
+    """
+    import asyncio
+
+    from .element import Component
+
+    state: dict[str, Any] = {}
+
+    def render(*args: Any, **kwargs: Any) -> Any:
+        target = state.get("component")
+        if target is None:
+            if inspect.iscoroutinefunction(load):
+                task = state.get("task")
+                if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+                    task = asyncio.ensure_future(load())
+                    state["task"] = task
+                target = use(task)
+            else:
+                target = load()
+            state["component"] = target
+        return target(*args, **kwargs)
+
+    render.__name__ = f"lazy({getattr(load, '__name__', 'load')})"
+    return Component(render)
 
 
 def use_action_state(
@@ -631,6 +719,32 @@ class Suspended(Exception):
     def __init__(self, task: Any) -> None:
         super().__init__("waiting for data")
         self.task = task
+
+
+class BrowserOnly(Suspended):
+    """Raised by :func:`browser` while rendering HTML for a response."""
+
+    def __init__(self, reason: str | None) -> None:
+        super().__init__(None)
+        self.reason = reason
+
+
+# What a Suspense boundary is told when a component inside is left to the browser.
+BROWSER_ONLY: Any = object()
+
+
+def browser(reason: str | None = None) -> None:
+    """Render this component only in the browser, as React's ``browser()``.
+
+    Called at the top of a component, it stops the render while HTML is made for a
+    response (the first page load, :func:`prerender`, ``embed``): the nearest
+    :class:`Suspense` shows its fallback there, and once the page is live the
+    component renders normally. For parts that depend on the browser (the window
+    size, local settings) or are too costly to render for every request. Without a
+    Suspense boundary the component renders nothing until the page is live.
+    ``reason`` documents why. Once the page is live it does nothing."""
+    if not _current().root.live:
+        raise BrowserOnly(reason)
 
 
 class AsyncState(Generic[T]):

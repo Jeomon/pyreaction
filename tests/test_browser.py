@@ -357,9 +357,67 @@ def test_view_transition_updates_in_chrome(page):
     with serve(App) as server:
         open_page(page, server)
         page.evaluate("""window.__vt = 0; const o = document.startViewTransition.bind(document);
-            document.startViewTransition = (cb) => { window.__vt++; return o(cb); }""")
+            document.startViewTransition = (cb) => { window.__vt++; return o(cb); }; true""")
         for _ in range(3):
             page.click("#inc")
         page.wait_for_function("document.querySelector('#n').textContent === 'n=3'")
         assert page.evaluate("window.__vt") >= 1
         assert page.evaluate("getComputedStyle(document.querySelector('#n').parentElement).viewTransitionName") == "count"
+
+
+def test_browser_only_part_is_adopted_then_rendered_in_chrome(page):
+    from pyreaction import Suspense, browser
+
+    @component
+    def Width():
+        browser("reads the window")
+        return html.p("live part", id="live")
+
+    @component
+    def App():
+        return html.main(html.h1("Page"), Suspense(Width(), fallback=html.p("server part", id="fb")))
+
+    with serve(App) as server:
+        first_html = page.request.get(server.url).text()
+        assert "server part" in first_html and "live part" not in first_html
+        page.goto(server.url)
+        page.wait_for_selector(server.READY, state="attached")
+        page.wait_for_selector("#live")
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted", "no mismatch rebuild"
+        assert not page.is_visible("#fb")
+
+
+def test_flush_sync_form_reset_and_transition_types_in_chrome(page):
+    import time
+
+    from pyreaction import ViewTransition, add_transition_type, flush_sync, request_form_reset, use_ref
+
+    @component
+    def App():
+        status, set_status = use_state("idle")
+        form = use_ref()
+
+        def save():
+            flush_sync(lambda: set_status("saving"))
+            time.sleep(0.6)
+            request_form_reset(form)
+            add_transition_type("done")
+            set_status("saved")
+
+        return html.div(
+            ViewTransition(html.p(status, id="status")),
+            html.form(html.input(id="q", name="q", default_value="start"), ref=form),
+            html.button("save", id="save", on_click=save),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.evaluate("""window.__types = []; const o = document.startViewTransition.bind(document);
+            document.startViewTransition = (a) => { window.__types.push(a && typeof a === 'object' ? a.types : null); return o(a); }; true""")
+        page.fill("#q", "edited")
+        page.click("#save")
+        page.wait_for_function("document.querySelector('#status').textContent === 'saving'", timeout=500)
+        assert page.input_value("#q") == "edited", "not reset until the action is done"
+        page.wait_for_function("document.querySelector('#status').textContent === 'saved'")
+        page.wait_for_function("document.querySelector('#q').value === 'start'")
+        assert ["done"] in page.evaluate("window.__types")

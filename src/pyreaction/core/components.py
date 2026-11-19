@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .element import Element, component, html
-from .hooks import CURRENT, Ref, create_context, use_context, use_ref, use_state, use_transition
+from .hooks import BROWSER_ONLY, CURRENT, Ref, create_context, use_context, use_ref, use_state, use_transition
 
 __all__ = [
     "Activity", "Form", "FormStatus", "Head", "Profiler", "StrictMode", "Suspense", "ViewTransition",
@@ -136,10 +136,23 @@ def Suspense(*children: Any, fallback: Any = None) -> Any:
     have their data keep their state.
     """
     waiting, set_waiting = use_state(0)
+    browser_only = use_ref(False)
     node = CURRENT.get()
     assert node is not None
 
     def suspend(task: Any) -> None:
+        if task is BROWSER_ONLY:
+            # Content left to the browser: the fallback stays until the page is live.
+            if not browser_only.current:
+                browser_only.current = True
+                set_waiting(lambda n: n + 1)
+
+                def release() -> None:
+                    browser_only.current = False
+                    set_waiting(lambda n: n - 1)
+
+                node.root.on_live(node, release)
+            return
         set_waiting(lambda n: n + 1)
         if task is None or task.done():
             set_waiting(lambda n: n - 1)

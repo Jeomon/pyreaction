@@ -709,6 +709,13 @@ def component(fn: Callable[..., Any]) -> Component:
     return Component(fn)
 
 
+def forward_ref(fn: Callable[..., Any] | Component) -> Component:
+    """For code ported from React: a component that receives ``ref``. In pyreaction
+    (as in React 19) any component can take ``ref=`` as an ordinary argument and
+    pass it to an element, so this is the same as :func:`component`."""
+    return fn if isinstance(fn, Component) else Component(fn)
+
+
 def memo(fn: Callable[..., Any] | Component) -> Component:
     """A component that skips re-rendering while its arguments are unchanged."""
     return Component(fn.fn if isinstance(fn, Component) else fn, memo=True)

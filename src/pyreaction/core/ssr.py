@@ -15,7 +15,7 @@ from typing import Any
 from .element import PORTAL, RAW_HTML, Element, JsComponent
 from .reconciler import ComponentNode, HostNode, Root, TextNode
 
-__all__ = ["render_children", "render_head", "render_portals", "render_to_string"]
+__all__ = ["render_children", "render_head", "render_portals", "render_to_static_markup", "render_to_string"]
 
 VOID = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
@@ -38,6 +38,19 @@ def render_to_string(target: Root | Element, boundaries: dict[Any, int] | None =
     return "".join(out)
 
 
+def render_to_static_markup(target: Root | Element) -> str:
+    """Render to plain HTML that will never go live, as React's
+    ``renderToStaticMarkup``: for emails, static snippets and other pages. Leaves out
+    what the live page needs to adopt the HTML (comment markers between texts,
+    ``data-pyreaction-*`` attributes), and data still loading is not waited for."""
+    root = target if isinstance(target, Root) else Root(target)
+    out: list[str] = []
+    _children(root.container.children, out, raw=False, static=True)
+    if root is not target:
+        root.close()
+    return "".join(out)
+
+
 def render_children(children: list[Any], boundaries: dict[Any, int]) -> str:
     """HTML for a list of mounted nodes, marking Suspense boundaries as above."""
     out: list[str] = []
@@ -52,7 +65,9 @@ class _End:
         self.n = n
 
 
-def _children(children: list[Any], out: list[str], raw: bool, boundaries: dict[Any, int] | None = None) -> None:
+def _children(
+    children: list[Any], out: list[str], raw: bool, boundaries: dict[Any, int] | None = None, static: bool = False
+) -> None:
     prev_text = False
     stack: list[Any] = list(reversed(children))
     while stack:
@@ -70,6 +85,10 @@ def _children(children: list[Any], out: list[str], raw: bool, boundaries: dict[A
             stack.extend(reversed(node.children))
             continue
         if isinstance(node, TextNode):
+            if static:
+                text = node.text.replace("</", "<\\/") if raw else escape(node.text, quote=False)
+                out.append(text)
+                continue
             if prev_text:
                 out.append("<!---->")
             if not node.text:
@@ -80,7 +99,7 @@ def _children(children: list[Any], out: list[str], raw: bool, boundaries: dict[A
                 out.append(escape(node.text, quote=False))
             prev_text = True
         else:
-            _host(node, out, boundaries)
+            _host(node, out, boundaries, static)
             prev_text = False
 
 
@@ -133,7 +152,7 @@ def render_portals(root: Root, boundaries: dict[Any, int] | None = None) -> str:
     return "".join(out)
 
 
-def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = None) -> None:
+def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = None, static: bool = False) -> None:
     if node.type == PORTAL:
         return  # rendered by render_portals, at the end of the page
     if isinstance(node.type, JsComponent):
@@ -142,18 +161,22 @@ def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = No
         tag = node.type.tag
         out.append(f"<{tag}>")
         fallback = node.element.kwargs.get("fallback")
-        if fallback:
-            out.append(f'<div data-pyreaction-fallback style="display:contents">{fallback}</div>')
-        if node.children:
-            out.append('<div data-pyreaction-slot style="display:contents">')
-            _children(node.children, out, raw=False, boundaries=boundaries)
-            out.append("</div>")
+        if static:
+            out.append(str(fallback or ""))
+            _children(node.children, out, raw=False, static=True)
+        else:
+            if fallback:
+                out.append(f'<div data-pyreaction-fallback style="display:contents">{fallback}</div>')
+            if node.children:
+                out.append('<div data-pyreaction-slot style="display:contents">')
+                _children(node.children, out, raw=False, boundaries=boundaries)
+                out.append("</div>")
         out.append(f"</{tag}>")
         return
     tag = node.type
     out.append("<" + tag)
     for name, value in node.attrs.items():
-        if name == RAW_HTML:
+        if name == RAW_HTML or (static and name.startswith("data-pyreaction-")):
             continue
         if name == "value":
             if tag == "textarea" or tag == "select":
@@ -181,5 +204,5 @@ def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = No
         text = node.attrs.get("value", node.attrs.get("defaultValue", ""))
         out.append(escape(str(text), quote=False))
     else:
-        _children(node.children, out, raw=tag in RAW_TEXT, boundaries=boundaries)
+        _children(node.children, out, raw=tag in RAW_TEXT, boundaries=boundaries, static=static)
     out.append(f"</{tag}>")

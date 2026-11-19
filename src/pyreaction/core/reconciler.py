@@ -45,7 +45,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from .element import FRAGMENT, PORTAL, Component, Element, JsComponent
-from .hooks import ACTIVE_ROOT, CURRENT, CURRENT_ACTION, Context, EffectSlot, Suspended, same
+from .hooks import ACTIVE_ROOT, BROWSER_ONLY, CURRENT, CURRENT_ACTION, BrowserOnly, Context, EffectSlot, Suspended, same
 
 logger = logging.getLogger("pyreaction")
 
@@ -306,6 +306,56 @@ class Reply:
         return self._future.done()
 
 
+class PageSignal:
+    """What :func:`cache_signal` returns: tells work started for a page that the page
+    has closed, as React's ``AbortSignal``. ``.aborted``, ``on_abort(fn)`` (``fn``
+    is called at once if already aborted), and ``await signal.wait()``."""
+
+    __slots__ = ("aborted", "_callbacks", "_lock")
+
+    def __init__(self) -> None:
+        self.aborted = False
+        self._callbacks: list[Callable[[], Any]] = []
+        self._lock = threading.Lock()
+
+    def on_abort(self, fn: Callable[[], Any]) -> None:
+        with self._lock:
+            if not self.aborted:
+                self._callbacks.append(fn)
+                return
+        fn()
+
+    def abort(self) -> None:
+        with self._lock:
+            if self.aborted:
+                return
+            self.aborted = True
+            callbacks, self._callbacks = self._callbacks, []
+        for fn in callbacks:
+            try:
+                fn()
+            except Exception:
+                logger.exception("A cache_signal listener failed")
+
+    async def wait(self) -> None:
+        """Return once the page has closed."""
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        def finish() -> None:
+            if not done.done():
+                done.set_result(None)
+
+        def wake() -> None:
+            loop.call_soon_threadsafe(finish)
+
+        self.on_abort(wake)
+        await done
+
+    def __repr__(self) -> str:
+        return f"PageSignal(aborted={self.aborted})"
+
+
 class ElementHandle:
     """What a ``ref`` attached to an element holds: acts on the element in the browser
     and reads values back from it."""
@@ -474,8 +524,16 @@ class Root:
         self.cache: dict[Any, Any] = {}
         # Profiler timings of the render pass under way: node -> [phase, ms, start].
         self._profiling = False
-        # Whether this pass changed something under a ViewTransition.
+        # Whether this pass changed something under a ViewTransition, and the types
+        # add_transition_type gave it.
         self._animate = False
+        self._transition_types: list[str] = []
+        # Components that called browser() before the page was live, and how to make
+        # the Suspense boundaries showing their fallbacks show them once it is.
+        self._browser_only: set[ComponentNode] = set()
+        self._browser_release: dict[ComponentNode, Callable[[], None]] = {}
+        # Aborted when the page closes; what cache_signal() returns.
+        self.signal = PageSignal()
         self._profiles: dict[ComponentNode, list[Any]] = {}
         # Where a list without keys was already reported (debug mode), once each.
         self._warned_unkeyed: set[Any] = set()
@@ -543,6 +601,7 @@ class Root:
         self._sink = sink
         sink(message)
         self._run_effects()
+        self._render_browser_only()
         if self._dirty or self.ops or self._nav or self._errors or self._title_dirty or self._head_dirty:
             self.flush()
 
@@ -559,6 +618,7 @@ class Root:
     def close(self) -> None:
         """Unmount everything, running effect cleanups and cancelling tasks."""
         self._sink = None
+        self.signal.abort()
         for child in self.container.children:
             self._unmount(child, emit=False)
         self.container.children = []
@@ -718,9 +778,57 @@ class Root:
             self._head_dirty = False
         if self._animate:
             if ops:
-                message["vt"] = True  # apply inside document.startViewTransition
+                # Apply inside document.startViewTransition, with the types if any.
+                message["vt"] = self._transition_types or True
             self._animate = False
+        if ops:
+            self._transition_types = []
         return message
+
+    def add_transition_type(self, name: str) -> None:
+        def apply() -> None:
+            if name not in self._transition_types:
+                self._transition_types.append(name)
+
+        self.call(apply)
+
+    def flush_now(self) -> None:
+        """Render and send pending updates at once (flush_sync). From a worker
+        thread, waits until the loop has done it; the thread's own updates, posted
+        to the loop before, are included."""
+        if self._loop is None or threading.get_ident() == self._thread:
+            self.flush()
+            return
+        done: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+        def run() -> None:
+            try:
+                self.flush()
+            finally:
+                done.set_result(None)
+
+        self._loop.call_soon_threadsafe(run)
+        done.result(timeout=10)
+
+    @property
+    def live(self) -> bool:
+        """Whether the page has been live in a browser (and is not just rendering
+        HTML for a response). Stays True while a dropped connection may resume."""
+        return self._queue is not None
+
+    def on_live(self, boundary: ComponentNode, release: Callable[[], None]) -> None:
+        """A Suspense ``boundary`` showing its fallback for browser() content:
+        ``release`` shows the content once the page is live."""
+        self._browser_release[boundary] = release
+
+    def _render_browser_only(self) -> None:
+        """Now the page is live, render what was left to the browser."""
+        nodes, self._browser_only = self._browser_only, set()
+        releases, self._browser_release = self._browser_release, {}
+        for release in releases.values():
+            release()
+        for node in nodes:
+            self.schedule(node)
 
     @staticmethod
     def _under_view_transition(node: Any) -> bool:
@@ -1384,7 +1492,12 @@ class Root:
                 # hook re-renders this component when the data arrives.
                 node.pending_effects.clear()
                 boundary = self._boundary_for(node, "suspend")
-                if boundary is not None:
+                if isinstance(waiting, BrowserOnly):
+                    # Left to the browser: rendered (empty) here, again once live.
+                    self._browser_only.add(node)
+                    if boundary is not None:
+                        boundary.suspend(BROWSER_ONLY)  # type: ignore[misc]
+                elif boundary is not None:
                     if waiting.task is not None:
                         self._suspense_tasks.add(waiting.task)
                         waiting.task.add_done_callback(self._suspense_tasks.discard)
