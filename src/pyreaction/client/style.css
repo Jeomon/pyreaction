@@ -1,0 +1,32 @@
+/* While the connection to the server is down, the page cannot respond: dim it and block input. */
+html[data-pyreaction-offline] body {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* Errors shown in debug mode (pyreaction dev). */
+#pyreaction-errors {
+  position: fixed;
+  inset: auto 1rem 1rem 1rem;
+  max-height: 60vh;
+  overflow: auto;
+  z-index: 2147483647;
+  padding: 1rem;
+  border-radius: 8px;
+  background: #2b0d0d;
+  color: #ffd9d9;
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  box-shadow: 0 8px 30px rgb(0 0 0 / 0.4);
+  pointer-events: auto;
+}
+
+#pyreaction-errors pre {
+  margin: 0 0 1rem;
+  white-space: pre-wrap;
+}
+
+#pyreaction-errors button {
+  float: right;
+  font: inherit;
+  cursor: pointer;
+}

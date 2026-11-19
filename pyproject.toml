@@ -1,0 +1,43 @@
+[project]
+name = "pyreaction"
+version = "0.1.0"
+description = "React-style UI components in pure Python, rendered on the server and patched into the browser over a WebSocket."
+readme = "README.md"
+authors = [
+    { name = "jeomon", email = "jeogeoalukka@gmail.com" }
+]
+requires-python = ">=3.11"
+keywords = ["react", "ui", "components", "hooks", "asgi", "websocket"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Framework :: AsyncIO",
+    # PyPI rejects any upload with this classifier: the project is private.
+    "Private :: Do Not Upload",
+]
+dependencies = [
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "websockets>=12",
+]
+
+[project.scripts]
+pyreaction = "pyreaction.cli:main"
+[project.optional-dependencies]
+fast = ["orjson>=3.9"]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.16.2",
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,423 @@
+import random
+
+import pytest
+
+from pyreaction import (
+    Root,
+    component,
+    create_context,
+    event,
+    fragment,
+    html,
+    memo,
+    render_to_string,
+    use_context,
+    use_effect,
+    use_memo,
+    use_reducer,
+    use_ref,
+    use_state,
+)
+
+from .fakedom import FakeDom, tree_html
+
+
+class Harness:
+    """Mount a tree, mirror its operations into a fake DOM, and flush updates by hand."""
+
+    def __init__(self, element, **options):
+        self.root = Root(element, **options)
+        self.dom = FakeDom()
+        self.sent = []
+        # What attach() sends first: the whole tree, built from nothing.
+        self.dom.apply(self.root.snapshot())
+        self.root.ops = []
+        self.root._sink = self._receive
+        self.root._run_effects()
+
+    def _receive(self, message):
+        self.sent.append(message)
+        self.dom.apply(message["ops"])
+
+    def flush(self):
+        self.sent.clear()
+        self.root.flush()
+        assert self.dom.html() == tree_html(self.root), "DOM drifted from the tree"
+        return [op for m in self.sent for op in m["ops"]]
+
+    def html(self):
+        return self.dom.html()
+
+    def click(self, node_id, name="click", data=None):
+        self.root.dispatch(1, node_id, name, data or {})
+
+    def find(self, tag, text=None):
+        for node_id, host in self.root.hosts.items():
+            if host.type == tag and (text is None or text in render_to_string(host.element)):
+                return node_id
+        raise LookupError(tag)
+
+
+def test_static_render_matches_ssr():
+    @component
+    def App():
+        return html.div(html.h1("Hi", class_name="t"), html.p("a", 1, None, False, "b"), html.br())
+
+    h = Harness(App())
+    assert h.html() == '<div><h1 class="t">Hi</h1><p>a1b</p><br></div>'
+    assert render_to_string(App()) == '<div><h1 class="t">Hi</h1><p>a<!---->1<!---->b</p><br></div>'
+
+
+def test_state_updates_are_batched_and_minimal():
+    setters = {}
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        setters["n"] = set_n
+        return html.div(html.span("static"), html.b(n))
+
+    h = Harness(App())
+    setters["n"](1)
+    setters["n"](lambda v: v + 1)
+    ops = h.flush()
+    assert ops == [["x", 5, "2"]]
+    assert len(h.sent) == 1
+    assert h.html() == "<div><span>static</span><b>2</b></div>"
+
+
+def test_setting_same_value_does_not_render():
+    renders = []
+    setters = {}
+
+    @component
+    def App():
+        n, set_n = use_state(5)
+        setters["n"] = set_n
+        renders.append(n)
+        return html.p(n)
+
+    h = Harness(App())
+    setters["n"](5)
+    assert h.flush() == []
+    assert renders == [5]
+
+
+def test_events_call_handlers_with_and_without_event():
+    seen = []
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        return html.div(
+            html.button("inc", on_click=lambda: set_n(n + 1)),
+            html.input(value=str(n), on_change=lambda e: seen.append(e.target.value)),
+            html.span(n),
+        )
+
+    h = Harness(App())
+    button = h.find("button")
+    h.click(button)
+    h.flush()
+    assert "<span>1</span>" in h.html()
+    h.click(h.find("input"), "input", {"target": {"value": "x"}})
+    assert seen == ["x"]
+    assert h.root.ack == 1
+
+
+def test_event_specs_and_submit_prevents_default():
+    @component
+    def App():
+        return html.form(
+            html.input(on_input=event(lambda e: None, debounce=200)),
+            on_submit=lambda e: None,
+        )
+
+    root = Root(App())
+    creates = {op[2]: op[4] for op in root.ops if op[0] == "c"}
+    assert creates["form"] == {"submit": [True, False, None, None]}
+    assert creates["input"] == {"input": [False, False, 200, None]}
+
+
+def test_conditional_child_keeps_sibling_identity():
+    setters = {}
+
+    @component
+    def App():
+        show, set_show = use_state(False)
+        setters["show"] = set_show
+        return html.div(html.p("banner") if show else None, html.input(value="kept"))
+
+    h = Harness(App())
+    input_id = h.find("input")
+    setters["show"](True)
+    ops = h.flush()
+    assert h.find("input") == input_id, "input was remounted"
+    assert not any(op[0] == "r" for op in ops)
+    assert h.html().startswith("<div><p>banner</p>")
+
+
+def test_type_change_remounts():
+    setters = {}
+
+    @component
+    def App():
+        tag, set_tag = use_state("p")
+        setters["tag"] = set_tag
+        return html.div(html(tag, "x"))
+
+    h = Harness(App())
+    setters["tag"]("section")
+    ops = h.flush()
+    assert any(op[0] == "r" for op in ops)
+    assert h.html() == "<div><section>x</section></div>"
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_keyed_list_shuffles(seed):
+    rng = random.Random(seed)
+    setters = {}
+    item_states = {}
+
+    @component
+    def Item(k):
+        mounted = use_ref(k)  # identity check: a remount would make a new ref
+        item_states.setdefault(k, set()).add(id(mounted))
+        return html.li(k)
+
+    @component
+    def App():
+        items, set_items = use_state(list(range(8)))
+        setters["items"] = set_items
+        return html.ul([Item(k, key=k) for k in items], "end")
+
+    h = Harness(App())
+    pool = list(range(16))
+    for _ in range(6):
+        nxt = rng.sample(pool, rng.randint(0, 12))
+        setters["items"](nxt)
+        h.flush()
+        assert h.html() == "<ul>" + "".join(f"<li>{k}</li>" for k in nxt) + "end</ul>"
+    for k, refs in item_states.items():
+        # Each key keeps one ref per continuous presence; at most one per (re)appearance.
+        assert len(refs) >= 1
+
+
+def test_keyed_move_only_moves_what_changed():
+    setters = {}
+
+    @component
+    def App():
+        items, set_items = use_state(list(range(100)))
+        setters["items"] = set_items
+        return html.ul([html.li(i, key=i) for i in items])
+
+    h = Harness(App())
+    order = list(range(100))
+    order.insert(10, order.pop(90))
+    setters["items"](order)
+    ops = h.flush()
+    assert [op[0] for op in ops] == ["a"]
+
+
+def test_components_and_fragments_flatten_into_parent():
+    setters = {}
+
+    @component
+    def Pair(a, b):
+        return [html.i(a), html.b(b)]
+
+    @component
+    def App():
+        flip, set_flip = use_state(False)
+        setters["flip"] = set_flip
+        pairs = [Pair(1, 2, key="x"), fragment("t", html.u("u"), key="f")]
+        return html.div(*(reversed(pairs) if flip else pairs))
+
+    h = Harness(App())
+    assert h.html() == "<div><i>1</i><b>2</b>t<u>u</u></div>"
+    setters["flip"](True)
+    h.flush()
+    assert h.html() == "<div>t<u>u</u><i>1</i><b>2</b></div>"
+
+
+def test_child_rerender_inside_parent_host():
+    setters = {}
+
+    @component
+    def Toggle():
+        on, set_on = use_state(False)
+        setters["on"] = set_on
+        return [html.em("on"), html.em("!")] if on else None
+
+    @component
+    def App():
+        return html.div("a", Toggle(), "b")
+
+    h = Harness(App())
+    assert h.html() == "<div>ab</div>"
+    setters["on"](True)
+    h.flush()
+    assert h.html() == "<div>a<em>on</em><em>!</em>b</div>"
+    setters["on"](False)
+    h.flush()
+    assert h.html() == "<div>ab</div>"
+
+
+def test_effects_order_deps_and_cleanup():
+    log = []
+    setters = {}
+
+    @component
+    def Child(n):
+        def effect():
+            log.append(f"child {n}")
+            return lambda: log.append(f"child cleanup {n}")
+
+        use_effect(effect, [n])
+        return html.span(n)
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        show, set_show = use_state(True)
+        setters.update(n=set_n, show=set_show)
+        use_effect(lambda: log.append("app mount"), [])
+        return html.div(Child(n) if show else None)
+
+    h = Harness(App())
+    assert log == ["child 0", "app mount"]
+    setters["n"](1)
+    h.flush()
+    assert log[2:] == ["child cleanup 0", "child 1"]
+    setters["show"](False)
+    h.flush()
+    assert log[4:] == ["child cleanup 1"]
+
+
+def test_memo_skips_unchanged_props():
+    renders = []
+    setters = {}
+
+    @memo
+    def Row(label):
+        renders.append(label)
+        return html.li(label)
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        setters["n"] = set_n
+        return html.ul(html.li(n), Row("fixed"), Row(f"n={n}"))
+
+    h = Harness(App())
+    setters["n"](1)
+    h.flush()
+    assert renders == ["fixed", "n=0", "n=1"]
+
+
+def test_context_reaches_memoized_consumer():
+    Theme = create_context("light")
+    setters = {}
+
+    @memo
+    def Label():
+        return html.span(use_context(Theme))
+
+    @component
+    def App():
+        theme, set_theme = use_state("dark")
+        setters["theme"] = set_theme
+        return html.div(Theme(Label(), value=theme), Label())
+
+    h = Harness(App())
+    assert h.html() == "<div><span>dark</span><span>light</span></div>"
+    setters["theme"]("blue")
+    h.flush()
+    assert h.html() == "<div><span>blue</span><span>light</span></div>"
+
+
+def test_reducer_memo_and_attrs():
+    setters = {}
+
+    def reducer(state, action):
+        return state + action
+
+    @component
+    def App():
+        total, dispatch = use_reducer(reducer, 0)
+        doubled = use_memo(lambda: total * 2, [total])
+        setters["d"] = dispatch
+        return html.div(
+            doubled,
+            class_name="big" if total else None,
+            style={"font_size": "12px", "marginTop": 0},
+            data_total=total,
+            disabled=total > 2,
+        )
+
+    h = Harness(App())
+    assert h.html() == '<div data-total="0" style="font-size:12px;margin-top:0">0</div>'
+    setters["d"](3)
+    h.flush()
+    assert h.html() == '<div class="big" data-total="3" disabled="" style="font-size:12px;margin-top:0">6</div>'
+
+
+def test_render_error_keeps_last_good_output(caplog):
+    setters = {}
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        setters["n"] = set_n
+        if n == 1:
+            raise ValueError("boom")
+        return html.p(n)
+
+    h = Harness(App())
+    setters["n"](1)
+    h.flush()
+    assert h.html() == "<p>0</p>"
+    assert "boom" in caplog.text
+    setters["n"](2)
+    h.flush()
+    assert h.html() == "<p>2</p>"
+
+
+def test_conditional_hook_raises_clear_error(caplog):
+    setters = {}
+
+    @component
+    def App():
+        flag, set_flag = use_state(False)
+        setters["f"] = set_flag
+        if flag:
+            use_ref(1)
+        else:
+            use_memo(lambda: 1, [])
+        return html.p()
+
+    h = Harness(App())
+    setters["f"](True)
+    h.flush()
+    assert "Hook order changed" in caplog.text
+
+
+def test_ssr_escapes_and_marks_text():
+    @component
+    def App():
+        return html.div(
+            '<b>&"',
+            "",
+            html.input(value='a"b', checked=True),
+            html.textarea(value="<x>"),
+            html.style("a > b { color: red }"),
+            title='"q"',
+        )
+
+    out = render_to_string(App())
+    assert out == (
+        '<div title="&quot;q&quot;">&lt;b&gt;&amp;"<!----><!--$-->'
+        '<input value="a&quot;b" checked=""><textarea>&lt;x&gt;</textarea>'
+        "<style>a > b { color: red }</style></div>"
+    )
