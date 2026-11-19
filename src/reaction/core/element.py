@@ -77,6 +77,9 @@ PROPERTY_PROPS = frozenset({"value", "checked", "selected", "indeterminate", "mu
 # Where an element's raw inner HTML is kept among its attributes; not a valid
 # attribute name, so it cannot collide with a real one.
 RAW_HTML = "#html"
+# The operations carry an element's only text child under this name, set as the
+# element's textContent, instead of as a text node of its own (as React does).
+TEXT = "#text"
 # Marks an element whose contents are raw HTML, so the browser does not try to
 # match them against the tree when adopting server-rendered markup.
 RAW_MARK = "data-pyreaction-raw"

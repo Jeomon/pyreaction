@@ -50,6 +50,8 @@ class FakeDom:
                 node = Node(op[2])
                 node.attrs = dict(op[3]) if len(op) > 3 else {}
                 node.events = dict(op[4]) if len(op) > 4 else {}
+                if "#text" in node.attrs:
+                    self._set_text(node, node.attrs.pop("#text"))
                 self.nodes[op[1]] = node
             elif kind == "t":
                 self.nodes[op[1]] = Node(None, op[2])
@@ -72,7 +74,9 @@ class FakeDom:
                 self._forget(op[1], node)
             elif kind == "p":
                 node = self.nodes[op[1]]
-                if op[3] is None:
+                if op[2] == "#text":
+                    self._set_text(node, op[3])
+                elif op[3] is None:
                     node.attrs.pop(op[2], None)
                 else:
                     node.attrs[op[2]] = op[3]
@@ -96,6 +100,18 @@ class FakeDom:
         parent.children.insert(index, node)
         node.parent = parent
 
+    @staticmethod
+    def _set_text(node: Node, text: str | None) -> None:
+        """textContent: child nodes still registered here would be a bug in the
+        operations, so they are not forgotten, only detached."""
+        for child in node.children:
+            child.parent = None
+        node.children = []
+        if text:
+            child = Node(None, text)
+            child.parent = node
+            node.children.append(child)
+
     def _forget(self, node_id: int, node: Node) -> None:
         del self.nodes[node_id]
         for other_id, other in list(self.nodes.items()):
@@ -115,16 +131,24 @@ class FakeDom:
         if any(op[0] == "P" for op in ops):
             raise AssertionError("FakeDom.adopt does not handle portals")
         found = _dom_order(_body(page), self.root)
-        made = [op for op in ops if op[0] in ("c", "t", "j")]
+        made: list[list[Any]] = []
+        for op in ops:
+            if op[0] in ("c", "t", "j"):
+                made.append(op)
+                # An element's own text is a text node in the HTML, listed after it.
+                if op[0] == "c" and len(op) > 3 and op[3].get("#text"):
+                    made.append(["t", None, op[3]["#text"]])
         mismatch = len(made) != len(found) or any(
             (n.tag is not None or n.text != op[2]) if op[0] == "t" else n.tag != op[2] for op, n in zip(made, found)
         )
         if mismatch:
             raise AssertionError(f"the HTML does not match the render: {[op[:3] for op in made]} vs {found}")
         for op, node in zip(made, found):
+            if op[1] is None:
+                continue
             self.nodes[op[1]] = node
             if op[0] == "c":
-                node.attrs = dict(op[3]) if len(op) > 3 else {}
+                node.attrs = {k: v for k, v in (op[3] if len(op) > 3 else {}).items() if k != "#text"}
                 node.events = dict(op[4]) if len(op) > 4 else {}
             elif op[0] == "j":
                 node.js = {"module": op[3], "export": op[4], "props": op[5]}
@@ -225,8 +249,23 @@ def tree_html(root: Any) -> str:
                 node.attrs = dict(child.attrs)
                 html = node.html()
                 if child.type not in VOID:
-                    html = html[: -len(f"</{child.type}>")] + nodes(child.children) + f"</{child.type}>"
+                    inner = escape(child.text, quote=False) if child.text is not None else nodes(child.children)
+                    html = html[: -len(f"</{child.type}>")] + inner + f"</{child.type}>"
                 out.append(html)
         return "".join(out)
 
     return nodes(root.container.children)
+
+
+def texts(ops: list[list[Any]]) -> list[str]:
+    """The text the operations create or change, in order: text nodes ("t", "x") and
+    elements holding their own text ("#text" when created, or set with "p")."""
+    out = []
+    for op in ops:
+        if op[0] in ("t", "x"):
+            out.append(op[2])
+        elif op[0] == "c" and len(op) > 3 and "#text" in op[3]:
+            out.append(op[3]["#text"])
+        elif op[0] == "p" and op[2] == "#text" and op[3] is not None:
+            out.append(op[3])
+    return out

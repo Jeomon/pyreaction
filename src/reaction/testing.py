@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator
 from html import escape
 from typing import Any
 
-from .core.element import Element
+from .core.element import TEXT, Element
 from .core.vdom import Root
 
 __all__ = ["LiveServer", "Page", "TestNode", "poll", "render", "serve"]
@@ -156,6 +156,8 @@ class _Dom:
                 if kind == "c":
                     node.attrs = dict(op[3]) if len(op) > 3 else {}
                     node.events = dict(op[4]) if len(op) > 4 else {}
+                    if TEXT in node.attrs:
+                        self._set_text(node, node.attrs.pop(TEXT))
                 else:
                     node.js = {"module": op[3], "export": op[4], "props": op[5]}
                 self.nodes[op[1]] = node
@@ -176,6 +178,9 @@ class _Dom:
                 for child in node.walk():
                     self.nodes.pop(child.id, None)
             elif kind == "p":
+                if op[2] == TEXT:
+                    self._set_text(self.nodes[op[1]], op[3])
+                    continue
                 attrs = self.nodes[op[1]].attrs
                 if op[3] is None:
                     attrs.pop(op[2], None)
@@ -208,6 +213,18 @@ class _Dom:
         index = len(parent.children) if before is None else parent.children.index(before)
         parent.children.insert(index, node)
         node.parent = parent
+
+    @staticmethod
+    def _set_text(node: TestNode, text: str | None) -> None:
+        """An element's own text ("#text"), as the browser's textContent: one text
+        child, or none when empty."""
+        for child in node.children:
+            child.parent = None
+        node.children = []
+        if text:
+            child = TestNode(None, text)
+            child.parent = node
+            node.children.append(child)
 
 
 class Page:

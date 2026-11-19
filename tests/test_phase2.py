@@ -28,7 +28,7 @@ from reaction import (
     use_transition,
 )
 
-from .fakedom import FakeDom
+from .fakedom import FakeDom, texts
 
 
 class Live:
@@ -455,7 +455,7 @@ def test_socket_waits_for_data_so_its_first_render_matches_the_html():
     assert "<p>Ada</p>" in client.get("/").text
     with client.websocket_connect("/_pyreaction/ws?p=/&h=1") as ws:
         first = json.loads(ws.receive_text())
-        assert [op[2] for op in first["ops"] if op[0] == "t"] == ["Ada"], "same as the server's HTML"
+        assert texts(first["ops"]) == ["Ada"], "same as the server's HTML"
 
 
 # ---- per-page stores with selectors --------------------------------------------------------

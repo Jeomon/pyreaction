@@ -8,6 +8,8 @@ from starlette.testclient import TestClient
 
 from reaction import create_app
 
+from .fakedom import texts as op_texts
+
 EXAMPLE = Path(__file__).parent.parent / "examples" / "login.py"
 
 
@@ -23,7 +25,7 @@ def test_login_sets_httponly_cookie_that_components_read():
     assert good.status_code == 303 and "httponly" in good.headers["set-cookie"].lower()
     assert "Hello, ada" in client.get("/").text
     with client.websocket_connect("/_pyreaction/ws?p=/") as ws:
-        texts = [op[2] for op in json.loads(ws.receive_text())["ops"] if op[0] == "t"]
+        texts = op_texts(json.loads(ws.receive_text())["ops"])
         assert texts[0] == "Hello, ada"
 
     client.post("/logout")

@@ -8,7 +8,7 @@ from starlette.testclient import TestClient
 
 from reaction import Navigate, Router, component, html, use_location, use_request, use_state, wrap
 
-from .fakedom import FakeDom
+from .fakedom import FakeDom, texts
 
 django = pytest.importorskip("django")
 flask = pytest.importorskip("flask")
@@ -308,4 +308,4 @@ def test_component_tag_only_names_listed_components_and_signed_props():
                 ops = json.loads(conn.receive_text())["ops"]
                 assert not [op for op in ops if op[0] in ("c", "t")], f"refused, nothing drawn: {bad[:20]}"
         with client.websocket_connect(f"/_pyreaction/ws?c={token}&p=/") as conn:
-            assert any(op[0] == "t" and "hi ada" in str(op) for op in json.loads(conn.receive_text())["ops"])
+            assert any("hi ada" in t for t in texts(json.loads(conn.receive_text())["ops"]))

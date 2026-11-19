@@ -743,3 +743,25 @@ def test_virtual_list_scrolls_in_chrome(page):
             for (let k = 1; k <= 20; k++) box.scrollTop = 24 * (1000 + k * 100); }""")
         page.wait_for_function("[...document.querySelectorAll('.row')].some(r => r.textContent === 'row 3000')")
         assert page.locator(".row").count() < 30
+
+
+def test_elements_holding_their_own_text_hydrate_and_update_in_chrome(page):
+    @component
+    def App():
+        n, set_n = use_state(0)
+        cell = html.td(html.b(f"bold {n}"), " tail") if n % 2 else html.td(n)
+        return html.table(html.tbody(html.tr(cell, html.td(""), html.td("x < y")),
+                                     html.tr(html.td(html.button("+", id="inc", on_click=lambda: set_n(n + 1))))))
+
+    with serve(App) as server:
+        open_page(page, server)
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+        cell = "document.querySelector('td')"
+        assert page.evaluate(f"{cell}.innerHTML") == "0"
+        page.click("#inc")
+        page.wait_for_function(f"{cell}.innerHTML === '<b>bold 1</b> tail'")
+        page.click("#inc")
+        page.wait_for_function(f"{cell}.innerHTML === '2'")
+        page.click("#inc")
+        page.wait_for_function(f"{cell}.innerHTML === '<b>bold 3</b> tail'")
+        assert page.evaluate("document.querySelectorAll('td')[2].textContent") == "x < y"

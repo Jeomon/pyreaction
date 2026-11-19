@@ -10,7 +10,9 @@ of operations on those ids, so an update costs what changed, not what exists:
     ["A", parent, [ids]]            append children to a new element
     ["a", parent, id, before]       insert or move a child before ``before`` (null: at the end)
     ["r", id]                       remove a node and everything under it
-    ["p", id, name, value]          set an attribute or property (null removes it)
+    ["p", id, name, value]          set an attribute or property (null removes it); "#text"
+                                    is the element's text, for an element whose only child
+                                    is a string or number (no text node of its own)
     ["x", id, text]                 change a text node
     ["e", id, name, spec]           listen to an event (null stops listening)
     ["m", id, method, args, reply]  call a method on an element (or "#get"/"#set" a
@@ -46,7 +48,7 @@ from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qs
 
-from .element import FRAGMENT, PORTAL, RAW_HTML, RAW_MARK, Component, Element, JsComponent
+from .element import FRAGMENT, PORTAL, RAW_HTML, RAW_MARK, TEXT, Component, Element, JsComponent
 from .hooks import ACTIVE_ROOT, BROWSER_ONLY, CURRENT, CURRENT_ACTION, BrowserOnly, Context, EffectSlot, Suspended, same
 
 logger = logging.getLogger("reaction")
@@ -102,7 +104,7 @@ class TextNode:
 class HostNode:
     __slots__ = (
         "id", "type", "key", "parent", "element", "attrs", "events", "children", "dom", "depth", "ns",
-        "ref_cleanup",
+        "ref_cleanup", "text",
     )
 
     def __init__(self, id: int, element: Element, key: Any, parent: Any) -> None:
@@ -118,6 +120,8 @@ class HostNode:
         self.dom: list[int] = []
         self.depth = parent.depth + 1 if parent is not None else 0
         self.ns = _namespace(self.type, parent)
+        # Its only child as text, kept here instead of as a TextNode (None: it has children).
+        self.text: str | None = None
 
 
 # Elements inside <svg> or <math> must be created in that XML namespace, or the
@@ -511,6 +515,23 @@ def _same_props(new: Element, old: Element) -> bool:
             return False
     return True
 
+
+def _only_text(item: Element) -> str | None:
+    """The text of a tag whose only child is a string or number, else None.
+
+    Such a tag holds its text itself (its textContent, as React does), which
+    saves a text node, its id and two operations per element. A <textarea>'s
+    text is its value, so it keeps the general path."""
+    children = item.children
+    if len(children) != 1 or item.type == "textarea":
+        return None
+    child = children[0]
+    kind = type(child)
+    if kind is str:
+        return child
+    if kind is int or kind is float:
+        return str(child)
+    return None
 
 def _flatten_items(
     items: Iterable[Any], prefix: tuple[Any, ...], out: list[tuple[Any, Any]], unkeyed: list[int] | None = None
@@ -1515,11 +1536,16 @@ class Root:
         if type(item.type) is str and item.type != FRAGMENT:
             host = HostNode(next(self._ids), item, key, parent)
             self.hosts[host.id] = host
-            self.ops.append(self._create_op(host))
-            host.children = self._reconcile(host, [], item.children)
-            host.dom = self._dom_ids(host.children)
-            if host.dom:
-                self.ops.append(["A", host.id, host.dom])
+            text = _only_text(item)
+            if text is not None:
+                host.text = text
+                self.ops.append(self._create_op(host))
+            else:
+                self.ops.append(self._create_op(host))
+                host.children = self._reconcile(host, [], item.children)
+                host.dom = self._dom_ids(host.children)
+                if host.dom:
+                    self.ops.append(["A", host.id, host.dom])
             self._attach_ref(host, item.ref)
             return host
         node = ComponentNode(self, item, key, parent)
@@ -1579,6 +1605,24 @@ class Root:
         node.element = item
         node.attrs = new_attrs
         node.events = new_events
+        text = _only_text(item)
+        if text is not None:
+            if node.text is None:
+                # It had child nodes: they go, and its own text takes their place.
+                for child in node.children:
+                    self._unmount(child, emit=True)
+                node.children = []
+                node.dom = []
+                ops.append(["p", node.id, TEXT, text])
+            elif text != node.text:
+                ops.append(["p", node.id, TEXT, text])
+            node.text = text
+            return
+        if node.text is not None:
+            # Its text gives way to child nodes, inserted by the reconcile below.
+            if node.text:
+                ops.append(["p", node.id, TEXT, None])
+            node.text = None
         reshapes = self._reshapes
         node.children = self._reconcile(node, node.children, item.children)
         if self._reshapes != reshapes:
@@ -1784,12 +1828,13 @@ class Root:
     def _create_op(host: HostNode) -> list[Any]:
         # Trailing fields left empty are left out: most elements have no events,
         # many no attributes, and 10,000 rows of `{},{}` add up.
+        attrs = {**host.attrs, TEXT: host.text} if host.text else host.attrs
         if host.ns is not None:
-            return ["c", host.id, host.type, host.attrs, {n: h.spec() for n, h in host.events.items()}, host.ns]
+            return ["c", host.id, host.type, attrs, {n: h.spec() for n, h in host.events.items()}, host.ns]
         if host.events:
-            return ["c", host.id, host.type, host.attrs, {n: h.spec() for n, h in host.events.items()}]
-        if host.attrs:
-            return ["c", host.id, host.type, host.attrs]
+            return ["c", host.id, host.type, attrs, {n: h.spec() for n, h in host.events.items()}]
+        if attrs:
+            return ["c", host.id, host.type, attrs]
         return ["c", host.id, host.type]
 
     def _unmount(self, node: Any, emit: bool) -> None:
@@ -1946,7 +1991,7 @@ def _host(node: HostNode) -> dict[str, Any]:
             name: {k: v for k, v in zip(_SPEC_NAMES, handler.spec()) if v not in (None, False)}
             for name, handler in node.events.items()
         }
-    children = _children(node.children)
+    children = [node.text] if node.text else _children(node.children)
     if children:
         out["children"] = children
     return out

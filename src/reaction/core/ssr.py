@@ -205,6 +205,10 @@ def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = No
     elif tag == "textarea" and not node.children:
         text = node.attrs.get("value", node.attrs.get("defaultValue", ""))
         out.append(escape(str(text), quote=False))
+    elif node.text is not None:
+        # Its only child, kept as its own text: one text node in the HTML (none when
+        # empty), which is what the browser finds when it adopts the page.
+        out.append(node.text.replace("</", "<\\/") if tag in RAW_TEXT else escape(node.text, quote=False))
     else:
         _children(node.children, out, raw=tag in RAW_TEXT, boundaries=boundaries, static=static)
     out.append(f"</{tag}>")

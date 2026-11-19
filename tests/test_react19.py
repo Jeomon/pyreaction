@@ -35,6 +35,7 @@ from reaction import (
 from reaction.testing import render
 
 from .fakedom import FakeDom
+from .fakedom import texts as op_texts
 
 
 @pytest.fixture(autouse=True)
@@ -314,9 +315,9 @@ def test_use_deferred_value_renders_the_new_value_in_a_second_message():
         return live.sent, live.dom.html()
 
     sent, final = asyncio.run(main())
-    texts = [[op for op in m["ops"] if op[0] == "x"] for m in sent if m["ops"]]
+    texts = [op_texts(m["ops"]) for m in sent if m["ops"]]
     assert texts[0] == [], "the input updates first, results unchanged"
-    assert texts[1][0][2] == "results for ab"
+    assert texts[1] == ["results for ab"]
     assert "results for ab" in final
 
 

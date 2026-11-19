@@ -11,7 +11,7 @@ from starlette.websockets import WebSocketDisconnect
 from reaction import component, create_app, html, use_effect, use_location, use_state, use_title
 from reaction.server.app import _Outbox
 
-from .fakedom import FakeDom
+from .fakedom import FakeDom, texts
 
 effects = []
 
@@ -126,7 +126,7 @@ def test_malformed_messages_are_ignored():
         ws.send_bytes(b"\x00\x01")
         ws.send_text(json.dumps([1, button, "click", {}]))
         update = json.loads(ws.receive_text())
-        assert ["x", 5, "1"] in update["ops"], "the socket still works after bad input"
+        assert texts(update["ops"]) == ["1"], "the socket still works after bad input"
 
 
 def test_location_and_title_come_from_the_url():
@@ -661,3 +661,24 @@ def test_a_streamed_page_still_streams_when_gzipped():
         assert first_at is not None and first_at < 0.4, f"the shell came at {first_at:.2f}s, not before the data"
     finally:
         server.should_exit = True
+
+
+def test_elements_holding_their_own_text_are_adopted_and_update():
+    sets = {}
+
+    @component
+    def List():
+        n, set_n = use_state(0)
+        sets["n"] = set_n
+        last = html.li(html.b("bold")) if n else html.li(n)
+        return html.ul(html.li("a"), html.li(""), html.li("x < y"), last)
+
+    client = TestClient(create_app(List))
+    page = client.get("/").text
+    assert "<ul><li>a</li><li></li><li>x &lt; y</li><li>0</li></ul>" in page
+    with connect(client) as ws:
+        first = json.loads(ws.receive_text())
+        assert not [op for op in first["ops"] if op[0] == "t"]
+        dom = FakeDom()
+        dom.adopt(page, first["ops"])
+        assert dom.html() == "<ul><li>a</li><li></li><li>x &lt; y</li><li>0</li></ul>"

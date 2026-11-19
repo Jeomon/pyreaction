@@ -25,7 +25,7 @@ from reaction import (  # noqa: E402
     use_request,
 )
 
-from .fakedom import FakeDom  # noqa: E402
+from .fakedom import FakeDom, texts  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -143,7 +143,7 @@ def test_components_reach_the_host_app_state_lifespan_and_session():
         assert "<p>FastAPI the-db the-pool ada</p>" in client.get("/app/").text
         with client.websocket_connect("/app/_pyreaction/ws?p=/&b=/app") as ws:
             ops = json.loads(ws.receive_text())["ops"]
-            assert ["t", ops[1][1], "FastAPI the-db the-pool ada"] in ops
+            assert texts(ops) == ["FastAPI the-db the-pool ada"]
 
 
 def test_create_app_on_its_own_is_unchanged():

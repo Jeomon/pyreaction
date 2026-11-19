@@ -58,6 +58,12 @@
       el.innerHTML = value === null ? "" : value;
       return;
     }
+    if (name === "#text") {
+      // An element whose only child is text holds it itself, as React does.
+      const text = value === null ? "" : value;
+      if (el.textContent !== text) el.textContent = text;
+      return;
+    }
     if (name === "defaultValue" || name === "defaultChecked") {
       // Uncontrolled: only the starting value; the browser keeps what is typed.
       if (el.localName === "select") {
@@ -467,7 +473,18 @@
     return out;
   }
 
-  const created = (ops) => ops.filter((op) => op[0] === "c" || op[0] === "t" || op[0] === "j");
+  // The nodes the operations create, in document order. An element holding its own
+  // text ("#text") has that text node in the HTML too: it is listed after the
+  // element, without an id, so the two lists line up.
+  function created(ops) {
+    const out = [];
+    for (const op of ops) {
+      if (op[0] !== "c" && op[0] !== "t" && op[0] !== "j") continue;
+      out.push(op);
+      if (op[0] === "c" && op[3] && op[3]["#text"]) out.push(["t", null, op[3]["#text"]]);
+    }
+    return out;
+  }
 
   function matches(ops, found) {
     const made = created(ops);
@@ -482,6 +499,7 @@
 
   function adopt(ops, found) {
     created(ops).forEach((op, i) => {
+      if (op[1] === null) return; // an element's own text, set with the element
       const n = found[i];
       register(op[1], n);
       if (op[0] === "j") {

@@ -82,7 +82,7 @@ def test_state_updates_are_batched_and_minimal():
     setters["n"](1)
     setters["n"](lambda v: v + 1)
     ops = h.flush()
-    assert ops == [["x", 5, "2"]]
+    assert ops == [["p", 3, "#text", "2"]]
     assert len(h.sent) == 1
     assert h.html() == "<div><span>static</span><b>2</b></div>"
 
@@ -550,3 +550,39 @@ def test_a_live_root_shows_its_current_state():
         page.click("button")
         page.click("button")
         assert to_vdom(page.root)["children"][0]["children"] == ["n=2"]
+
+
+def test_an_only_text_child_is_the_elements_own_text():
+    setters = {}
+
+    @component
+    def App():
+        mode, set_mode = use_state("text")
+        setters["mode"] = set_mode
+        cells = {
+            "text": lambda: html.td("hi"),
+            "number": lambda: html.td(3.5),
+            "empty": lambda: html.td(""),
+            "nodes": lambda: html.td(html.b("bold"), " tail"),
+        }
+        return html.tr(cells[mode](), html.textarea("notes"))
+
+    created = Root(App()).snapshot()
+    assert ["c", 2, "td", {"#text": "hi"}] in created, "no text node of its own"
+    assert [op[0] for op in created].count("t") == 1, "a textarea's text keeps its text node"
+
+    h = Harness(App())
+    for mode, ops, shown in [
+        ("text", [], "<td>hi</td>"),
+        ("number", [["p", 2, "#text", "3.5"]], "<td>3.5</td>"),
+        ("empty", [["p", 2, "#text", ""]], "<td></td>"),
+        ("nodes", None, "<td><b>bold</b> tail</td>"),
+        ("text", None, "<td>hi</td>"),
+    ]:
+        setters["mode"](mode)
+        sent = h.flush()  # also checks the fake DOM still matches the tree
+        if ops is not None:
+            assert sent == ops
+        assert shown in h.html()
+    assert sent[:2] == [["r", 5], ["r", 6]], "child nodes are removed before the text replaces them"
+    assert sent[-1] == ["p", 2, "#text", "hi"]

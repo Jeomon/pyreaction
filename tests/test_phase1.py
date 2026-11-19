@@ -23,6 +23,7 @@ from reaction import (
     use_status,
 )
 
+from .fakedom import texts as op_texts
 from .test_vdom import Harness
 
 
@@ -93,7 +94,7 @@ def test_sync_handlers_and_effects_run_off_the_loop_in_order():
         "each click saw the state the previous one left, from a worker thread"
     )
     assert [o for o in order if o[0] == "effect"] == [("effect", 0), ("effect", 1), ("effect", 2), ("effect", 3)]
-    texts = [op[2] for m in sent[1:] for op in m["ops"] if op[0] == "x"]
+    texts = op_texts([op for m in sent[1:] for op in m["ops"]])
     assert texts[-1] == "3"
 
 
