@@ -492,6 +492,24 @@ def _stable_positions(seq: list[int]) -> set[int]:
     return keep
 
 
+def _same_props(new: Element, old: Element) -> bool:
+    """Whether a memo component can skip rendering: every prop ``same`` as before.
+
+    The identity test before ``same`` saves a call for the common case of a value
+    passed through unchanged; this runs once per memo child on every parent render."""
+    if len(new.args) != len(old.args) or new.kwargs.keys() != old.kwargs.keys():
+        return False
+    for a, b in zip(new.args, old.args):
+        if a is not b and not same(a, b):
+            return False
+    old_kwargs = old.kwargs
+    for name, value in new.kwargs.items():
+        before = old_kwargs[name]
+        if value is not before and not same(value, before):
+            return False
+    return True
+
+
 def _flatten_items(
     items: Iterable[Any], prefix: tuple[Any, ...], out: list[tuple[Any, Any]], unkeyed: list[int] | None = None
 ) -> None:
@@ -596,6 +614,9 @@ class Root:
         # Files received ahead of the event that refers to them, by upload id.
         self.uploads: dict[str, UploadedFile] = {}
         self._ids = itertools.count(1)
+        # Bumped whenever a child list gains, loses or reorders a node. A pass that
+        # leaves it alone cannot have moved any DOM node, so DOM order is not recomputed.
+        self._reshapes = 0
         # For use_id: handed out in render order, the same on the server and live.
         self.next_id = itertools.count(1)
         # Element calls waiting for the browser's answer, by reply id.
@@ -791,7 +812,7 @@ class Root:
                     "(on_click=vote), not its result (on_click=vote())."
                 ))
                 continue
-            before = self._dom_ids(node.children)
+            reshapes = self._reshapes
             if not self._animate:
                 self._animate = self._under_view_transition(node)
             start = time.perf_counter() if self._profiling else 0.0
@@ -804,7 +825,7 @@ class Root:
                     if isinstance(above, ComponentNode) and above.profile is not None:
                         self._add_profile(above, "update", elapsed, start)
                     above = above.parent
-            if self._dom_ids(node.children) != before:
+            if self._reshapes != reshapes:
                 self._sync_dom(self._host_of(node))
 
     def _render_failed(self, node: ComponentNode, exc: BaseException) -> None:
@@ -1417,6 +1438,8 @@ class Root:
         by_key = {child.key: child for child in old}
         result: list[Any] = []
         seen: set[Any] = set()
+        # A different length, a new node, or an old one in another place reshapes the list.
+        reshaped = len(pairs) != len(old)
         for key, item in pairs:
             if key in seen:
                 logger.warning("Duplicate key %r under %s", key[-1], getattr(parent, "name", parent.type))
@@ -1427,13 +1450,18 @@ class Root:
             # Tag names are compared by value: strings built at runtime are not interned.
             if prev is not None and (prev.type is item_type or prev.type == item_type):
                 self._update(prev, item)
+                if not reshaped and old[len(result)] is not prev:
+                    reshaped = True
                 result.append(prev)
             else:
                 if prev is not None:
                     self._unmount(prev, emit=True)
+                reshaped = True
                 result.append(self._mount(item, key, parent))
         for leftover in by_key.values():
             self._unmount(leftover, emit=True)
+        if reshaped:
+            self._reshapes += 1
         return result
 
     def _mount(self, item: Any, key: Any, parent: Any) -> Any:
@@ -1483,14 +1511,7 @@ class Root:
         if not node.dirty:
             if node.element is item:
                 return
-            if (
-                isinstance(node.type, Component)
-                and node.type.memo
-                and len(item.args) == len(node.element.args)
-                and all(same(a, b) for a, b in zip(item.args, node.element.args))
-                and item.kwargs.keys() == node.element.kwargs.keys()
-                and all(same(v, node.element.kwargs[k]) for k, v in item.kwargs.items())
-            ):
+            if isinstance(node.type, Component) and node.type.memo and _same_props(item, node.element):
                 node.element = item
                 return
         self._render(node, item)
@@ -1506,8 +1527,10 @@ class Root:
             node.element = item
             node.attrs = new_attrs
             node.events = item.events
+            reshapes = self._reshapes
             node.children = self._reconcile(node, node.children, item.children)
-            self._sync_dom(node)
+            if self._reshapes != reshapes:
+                self._sync_dom(node)
             return
         if old_attrs != new_attrs:
             for name, value in new_attrs.items():
@@ -1527,8 +1550,10 @@ class Root:
         node.element = item
         node.attrs = new_attrs
         node.events = new_events
+        reshapes = self._reshapes
         node.children = self._reconcile(node, node.children, item.children)
-        self._sync_dom(node)
+        if self._reshapes != reshapes:
+            self._sync_dom(node)
 
     def _render(self, node: ComponentNode, item: Element, timed: bool = False) -> None:
         kind = node.type

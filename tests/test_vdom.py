@@ -265,6 +265,27 @@ def test_child_rerender_inside_parent_host():
     assert h.html() == "<div>ab</div>"
 
 
+def test_reorder_inside_a_component_moves_the_dom_of_its_host():
+    # The div's own children stay in place; only the component among them reorders.
+    setters = {}
+
+    @component
+    def Pair(flip):
+        a, b = html.i("a", key="a"), html.b("b", key="b")
+        return [b, a] if flip else [a, b]
+
+    @component
+    def App():
+        flip, set_flip = use_state(False)
+        setters["flip"] = set_flip
+        return html.div("x", Pair(flip), "y")
+
+    h = Harness(App())
+    assert h.html() == "<div>x<i>a</i><b>b</b>y</div>"
+    setters["flip"](True)
+    assert [op[0] for op in h.flush()] == ["a"]
+    assert h.html() == "<div>x<b>b</b><i>a</i>y</div>"
+
 def test_effects_order_deps_and_cleanup():
     log = []
     setters = {}

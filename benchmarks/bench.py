@@ -5,11 +5,11 @@
 The numbers decide whether any part is worth moving to Rust.
 """
 
-import json
 import random
 import time
 
 from reaction import Root, component, html, memo, use_state
+from reaction.server.app import _dumps  # what the server sends with: orjson when installed
 
 ROWS = 10_000
 setters = {}
@@ -42,7 +42,8 @@ def timed(label, fn, repeat=5):
 def main():
     root = timed(f"mount {ROWS} rows", lambda: Root(Table()), repeat=3)
     ops = root.ops
-    timed(f"encode {len(ops)} mount ops (json)", lambda: json.dumps(ops, separators=(",", ":")))
+    encoder = "orjson" if "orjson" in _dumps.__code__.co_names else "json"
+    timed(f"encode {len(ops)} mount ops ({encoder})", lambda: _dumps({"ops": ops}))
     root.ops = []
     sent = []
     root._sink = sent.append  # stands in for the WebSocket
