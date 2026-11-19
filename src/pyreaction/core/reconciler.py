@@ -11,7 +11,9 @@ of operations on those ids, so an update costs what changed, not what exists:
     ["p", id, name, value]          set an attribute or property (null removes it)
     ["x", id, text]                 change a text node
     ["e", id, name, spec]           listen to an event (null stops listening)
-    ["m", id, method, args]         call a method on an element, e.g. focus
+    ["m", id, method, args, reply]  call a method on an element (or "#get"/"#set" a
+                                    property); the browser answers [seq, 0, "#reply",
+                                    {r: reply, value | error}]
     ["j", id, tag, module, export, props]   create an element a JavaScript module draws into
     ["J", id, props]               pass new props to that module
 
@@ -25,10 +27,13 @@ which is what lets the browser adopt server-rendered HTML without markers.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import heapq
 import inspect
+import io
 import itertools
 import logging
+import shutil
 import threading
 import traceback
 from bisect import bisect_left
@@ -36,14 +41,17 @@ from collections.abc import Callable, Iterable
 from typing import Any
 from urllib.parse import parse_qs
 
-from .element import FRAGMENT, Component, Element, JsComponent
-from .hooks import CURRENT, Context, EffectSlot, same
+from .element import FRAGMENT, PORTAL, Component, Element, JsComponent
+from .hooks import CURRENT, Context, EffectSlot, Suspended, same
 
 logger = logging.getLogger("pyreaction")
 
-__all__ = ["ElementHandle", "Event", "Location", "Root", "UploadedFile"]
+__all__ = ["ElementHandle", "Event", "FormFields", "Location", "Reply", "Root", "UploadedFile"]
 
 _SKIP = object()
+
+# The event a worker thread is handling, so state updates it makes carry its ack.
+_handling = threading.local()
 
 
 class TextNode:
@@ -58,7 +66,9 @@ class TextNode:
 
 
 class HostNode:
-    __slots__ = ("id", "type", "key", "parent", "element", "attrs", "events", "children", "dom", "depth")
+    __slots__ = (
+        "id", "type", "key", "parent", "element", "attrs", "events", "children", "dom", "depth", "ns",
+    )
 
     def __init__(self, id: int, element: Element, key: Any, parent: Any) -> None:
         self.id = id
@@ -71,6 +81,24 @@ class HostNode:
         self.children: list[Any] = []
         self.dom: list[int] = []
         self.depth = parent.depth + 1 if parent is not None else 0
+        self.ns = _namespace(self.type, parent)
+
+
+# Elements inside <svg> or <math> must be created in that XML namespace, or the
+# browser treats them as unknown HTML tags and draws nothing.
+def _namespace(tag: Any, parent: Any) -> str | None:
+    if tag == "svg":
+        return "svg"
+    if tag == "math":
+        return "math"
+    host = parent
+    while host is not None and not isinstance(host, HostNode):
+        host = host.parent
+    if host is None or host.ns is None:
+        return None
+    if host.ns == "svg" and host.type == "foreignObject":
+        return None
+    return host.ns
 
 
 class ComponentNode:
@@ -79,7 +107,7 @@ class ComponentNode:
     __slots__ = (
         "type", "key", "parent", "root", "element", "depth", "children", "hooks",
         "hook_index", "pending_effects", "dirty", "mounted", "value", "subscribers",
-        "subscriptions", "catch",
+        "subscriptions", "catch", "suspend",
     )
 
     def __init__(self, root: Root, element: Element, key: Any, parent: Any) -> None:
@@ -100,6 +128,8 @@ class ComponentNode:
         self.subscriptions: list[ComponentNode] = []
         # Set by an error boundary: receives errors thrown while rendering its descendants.
         self.catch: Callable[[BaseException], None] | None = None
+        # Set by a Suspense boundary: told when a descendant waits for data.
+        self.suspend: Callable[[Any], None] | None = None
 
     @property
     def name(self) -> str:
@@ -114,26 +144,69 @@ class Event(dict):
 
     def __getattr__(self, name: str) -> Any:
         value = self.get(name)
-        return Event(value) if isinstance(value, dict) and not isinstance(value, Event) else value
+        return Event(value) if type(value) is dict else value
+
+
+class FormFields(dict):
+    """A submitted form's fields: ``e.form["email"]`` is a field's value (the last,
+    when several share the name) and ``e.form.getlist("tags")`` all of them, for
+    checkbox groups and multi-selects."""
+
+    def __init__(self, pairs: Iterable[Any] = ()) -> None:
+        super().__init__()
+        self._lists: dict[str, list[str]] = {}
+        for pair in pairs:
+            if isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], str):
+                key, value = pair[0], str(pair[1])
+                self[key] = value
+                self._lists.setdefault(key, []).append(value)
+
+    def getlist(self, key: str) -> list[str]:
+        return list(self._lists.get(key, []))
 
 
 class UploadedFile:
     """A file the person picked, in ``e.files`` of a file input's event.
 
-    ``error`` is set, and ``data`` empty, when the file was refused (too large).
+    ``.data`` is its bytes and ``.text()`` its text; for large files read ``.file``
+    (a binary file object, spooled to disk past 1 MiB) or ``.save(path)``, which
+    copy it without loading it whole. ``error`` is set, and the file empty, when
+    it was refused (too large).
     """
 
-    __slots__ = ("name", "type", "size", "data", "error")
+    __slots__ = ("name", "type", "size", "error", "file", "_data")
 
-    def __init__(self, name: str, type: str, data: bytes, error: str | None = None, size: int | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        type: str,
+        data: bytes = b"",
+        error: str | None = None,
+        size: int | None = None,
+        file: Any = None,
+    ) -> None:
         self.name = name
         self.type = type
-        self.data = data
-        self.size = len(data) if size is None else size
         self.error = error
+        self.file = file if file is not None else io.BytesIO(data)
+        self._data: bytes | None = None if file is not None else data
+        self.size = (len(data) if file is None else 0) if size is None else size
+
+    @property
+    def data(self) -> bytes:
+        if self._data is None:
+            self.file.seek(0)
+            self._data = self.file.read()
+        return self._data
 
     def text(self, encoding: str = "utf-8") -> str:
         return self.data.decode(encoding)
+
+    def save(self, path: Any) -> None:
+        """Write the file to ``path``, streaming it."""
+        self.file.seek(0)
+        with open(path, "wb") as out:
+            shutil.copyfileobj(self.file, out)
 
     def __repr__(self) -> str:
         return f"<UploadedFile {self.name!r} {self.size} bytes{' ' + self.error if self.error else ''}>"
@@ -166,8 +239,32 @@ class Location:
         return f"Location({str(self)!r})"
 
 
+class Reply:
+    """The browser's answer to an element call: ``await`` it in an ``async`` handler,
+    or call ``.result()`` in a plain one (which runs in a worker thread). Ignoring
+    it is fine when you only want the call made."""
+
+    __slots__ = ("_future", "_loop_thread")
+
+    def __init__(self, future: concurrent.futures.Future[Any], loop_thread: int | None) -> None:
+        self._future = future
+        self._loop_thread = loop_thread
+
+    def __await__(self) -> Any:
+        return asyncio.wrap_future(self._future).__await__()
+
+    def result(self, timeout: float | None = 5.0) -> Any:
+        if not self._future.done() and threading.get_ident() == self._loop_thread:
+            raise RuntimeError("waiting here would block the event loop; use 'await' in an async handler")
+        return self._future.result(timeout)
+
+    def done(self) -> bool:
+        return self._future.done()
+
+
 class ElementHandle:
-    """What a ``ref`` attached to an element holds: tells the browser to act on it."""
+    """What a ``ref`` attached to an element holds: acts on the element in the browser
+    and reads values back from it."""
 
     __slots__ = ("_root", "id")
 
@@ -175,24 +272,34 @@ class ElementHandle:
         self._root = root
         self.id = node_id
 
-    def call(self, method: str, *args: Any) -> None:
-        """Call a method of the DOM element, e.g. ``call("setSelectionRange", 0, 3)``."""
-        self._root.command(self.id, method, list(args))
+    def call(self, method: str, *args: Any) -> Reply:
+        """Call a method of the DOM element and get its result, e.g.
+        ``rect = await ref.current.call("getBoundingClientRect")``. Results come
+        back as JSON values; a promise is awaited first."""
+        return self._root.command(self.id, method, list(args))
 
-    def focus(self) -> None:
-        self.call("focus")
+    def get(self, name: str) -> Reply:
+        """Read a property: ``await ref.current.get("scrollTop")``."""
+        return self._root.command(self.id, "#get", [name])
 
-    def blur(self) -> None:
-        self.call("blur")
+    def set(self, name: str, value: Any) -> Reply:
+        """Set a property: ``ref.current.set("scrollTop", 0)``."""
+        return self._root.command(self.id, "#set", [name, value])
 
-    def click(self) -> None:
-        self.call("click")
+    def focus(self) -> Reply:
+        return self.call("focus")
 
-    def select(self) -> None:
-        self.call("select")
+    def blur(self) -> Reply:
+        return self.call("blur")
 
-    def scroll_into_view(self, behavior: str = "auto", block: str = "start") -> None:
-        self.call("scrollIntoView", {"behavior": behavior, "block": block})
+    def click(self) -> Reply:
+        return self.call("click")
+
+    def select(self) -> Reply:
+        return self.call("select")
+
+    def scroll_into_view(self, behavior: str = "auto", block: str = "start") -> Reply:
+        return self.call("scrollIntoView", {"behavior": behavior, "block": block})
 
     def __repr__(self) -> str:
         return f"<ElementHandle {self.id}>"
@@ -238,21 +345,31 @@ def _stable_positions(seq: list[int]) -> set[int]:
     return keep
 
 
-def _flatten_items(items: Iterable[Any], prefix: tuple[Any, ...], out: list[tuple[Any, Any]]) -> None:
+def _flatten_items(
+    items: Iterable[Any], prefix: tuple[Any, ...], out: list[tuple[Any, Any]], unkeyed: list[int] | None = None
+) -> None:
     """Children as (key, item) pairs. Keys are scoped to the list they came from, and
-    None/False holes keep their index, so a conditional child never shifts its siblings."""
+    None/False holes keep their index, so a conditional child never shifts its siblings.
+
+    Elements without a key inside a list (not the element's direct arguments) are
+    counted into ``unkeyed``, for the debug warning."""
     for i, item in enumerate(items):
         if item is None or item is True or item is False:
             continue
         if isinstance(item, Element):
-            key = (prefix, "$", item.key) if item.key is not None else (*prefix, i)
+            if item.key is not None:
+                key = (prefix, "$", item.key)
+            else:
+                key = (*prefix, i)
+                if prefix and unkeyed is not None:
+                    unkeyed.append(i)
             out.append((key, item))
         elif isinstance(item, str):
             out.append(((*prefix, i), item))
         elif isinstance(item, (int, float)):
             out.append(((*prefix, i), str(item)))
         elif isinstance(item, (list, tuple)) or inspect.isgenerator(item):
-            _flatten_items(item, (*prefix, i), out)
+            _flatten_items(item, (*prefix, i), out, unkeyed)
         else:
             out.append(((*prefix, i), str(item)))
 
@@ -263,6 +380,11 @@ class Root:
     ``location`` is the page URL (path and query), ``connection`` the request or
     WebSocket it serves (read with ``use_request``), and ``debug`` sends errors to
     the browser as well as the log.
+
+    With ``threaded`` (the default), synchronous event handlers and effects run in
+    a worker thread, one at a time and in order, so a slow one (a database call)
+    does not freeze every other session on the event loop. ``async def`` ones run
+    on the loop as tasks.
     """
 
     def __init__(
@@ -272,6 +394,7 @@ class Root:
         location: str = "/",
         connection: Any = None,
         debug: bool = False,
+        threaded: bool = True,
     ) -> None:
         self.container = HostNode(0, Element("#root"), None, None)
         self.hosts: dict[int, HostNode] = {}
@@ -279,15 +402,31 @@ class Root:
         self.location = Location(location)
         self.connection = connection
         self.debug = debug
+        self.threaded = threaded
+        # Called with (exc, where) for every error not caught by an ErrorBoundary.
+        self.on_error: Callable[[BaseException, str], None] | None = None
         self.title: str | None = None
+        # For the server's first response: the HTTP status, or a URL to redirect to.
+        self.status = 200
+        self.redirect: str | None = None
         self.ack = 0
         self._title_dirty = False
+        # Tags each Head component puts into <head>, in the order they rendered.
+        self._head: dict[ComponentNode, tuple[Element, ...]] = {}
+        self._head_dirty = False
+        # Where a list without keys was already reported (debug mode), once each.
+        self._warned_unkeyed: set[Any] = set()
         self._nav: dict[str, Any] | None = None
         self._errors: list[str] = []
         self._location_subs: set[ComponentNode] = set()
         # Files received ahead of the event that refers to them, by upload id.
         self.uploads: dict[str, UploadedFile] = {}
         self._ids = itertools.count(1)
+        # For use_id: handed out in render order, the same on the server and live.
+        self.next_id = itertools.count(1)
+        # Element calls waiting for the browser's answer, by reply id.
+        self._replies: dict[int, concurrent.futures.Future[Any]] = {}
+        self._reply_ids = itertools.count(1)
         self._dirty: list[tuple[int, int, ComponentNode]] = []
         self._seq = itertools.count()
         self._effects: list[EffectSlot] = []
@@ -297,6 +436,11 @@ class Root:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: int | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
+        # Work started by background(): what settle() waits for.
+        self._pending: set[asyncio.Task[Any]] = set()
+        # Events and effect batches, run in order by one worker once attached.
+        self._queue: asyncio.Queue[tuple[str, Any]] | None = None
+        self._busy = False
         self.container.children = self._reconcile(self.container, [], (element,))
         self.container.dom = self._dom_ids(self.container.children)
         # An error boundary that caught during the first render re-renders now,
@@ -312,18 +456,22 @@ class Root:
         """
         self._loop = asyncio.get_running_loop()
         self._thread = threading.get_ident()
+        self._queue = asyncio.Queue()
+        self.spawn(self._work())
         # Operations so far only built the tree; the snapshot replaces them.
         # Element commands made before now still have to run.
         commands = [op for op in self.ops if op[0] == "m"]
         self.ops = []
         if self.title is not None:
             self._title_dirty = True
+        if self._head:
+            self._head_dirty = True
         message = self._message(self.snapshot() + commands)
         message["init"] = "hydrate" if hydrate else "replace"
         self._sink = sink
         sink(message)
         self._run_effects()
-        if self._dirty or self.ops or self._nav or self._errors or self._title_dirty:
+        if self._dirty or self.ops or self._nav or self._errors or self._title_dirty or self._head_dirty:
             self.flush()
 
     def close(self) -> None:
@@ -334,26 +482,41 @@ class Root:
         self.container.children = []
         for task in list(self._tasks):
             task.cancel()
+        replies, self._replies = self._replies, {}
+        for future in replies.values():
+            if not future.done():
+                future.set_exception(ConnectionError("the page closed"))
 
     def snapshot(self) -> list[list[Any]]:
-        """Operations that build the current tree from nothing, in document order."""
+        """Operations that build the current tree from nothing, in document order.
+
+        Portals come last, after the page's own tree, since their content lives
+        elsewhere in the document and is not part of the server's HTML.
+        """
         ops: list[list[Any]] = []
+        portals: list[HostNode] = []
 
         def walk(host: HostNode) -> None:
-            for node in self._dom_nodes(host.children):
+            for node in self._dom_nodes(host.children, portals):
                 if isinstance(node, TextNode):
                     ops.append(["t", node.id, node.text])
                     continue
                 if isinstance(node.type, JsComponent):
-                    ops.append(self._js_create(node.id, node.type, node.attrs))
-                    continue
-                ops.append(["c", node.id, node.type, node.attrs, {n: h.spec() for n, h in node.events.items()}])
+                    ops.append(self._js_create(node))
+                else:
+                    ops.append(self._create_op(node))
                 walk(node)
                 if node.dom:
                     ops.append(["A", node.id, node.dom])
 
         walk(self.container)
         ops.append(["A", 0, self.container.dom])
+        while portals:
+            node = portals.pop(0)
+            ops.append(["P", node.id, node.attrs["target"]])
+            walk(node)
+            if node.dom:
+                ops.append(["A", node.id, node.dom])
         return ops
 
     # ---- scheduling ------------------------------------------------------------
@@ -361,7 +524,17 @@ class Root:
     def call(self, fn: Callable[[], None]) -> None:
         """Run ``fn`` on this root's event loop; state setters go through here."""
         if self._loop is not None and threading.get_ident() != self._thread:
-            self._loop.call_soon_threadsafe(fn)
+            seq = getattr(_handling, "seq", None)
+            if seq is None:
+                self._loop.call_soon_threadsafe(fn)
+            else:
+                # From an event handler in a worker thread: acknowledge the event in
+                # the same step, so the render this update causes carries the ack.
+                def apply() -> None:
+                    self._ack(seq)
+                    fn()
+
+                self._loop.call_soon_threadsafe(apply)
         else:
             fn()
 
@@ -419,24 +592,83 @@ class Root:
         if self._errors:
             message["errors"] = self._errors
             self._errors = []
+        if self._head_dirty:
+            message["head"] = self.head_html()
+            self._head_dirty = False
         return message
 
+    def head_html(self) -> str:
+        """The tags Head components asked for, as HTML for the page's <head>."""
+        from .ssr import render_head
+
+        return render_head([el for elements in self._head.values() for el in elements])
+
     def _run_effects(self) -> None:
-        effects, self._effects = self._effects, []
-        for slot in effects:
+        # Each effect runs the function from the render that queued it, even when
+        # later renders replace it before a queued batch runs.
+        effects = [(slot, slot.fn) for slot in self._effects]
+        self._effects = []
+        if not effects:
+            return
+        if self._queue is not None:
+            self._queue.put_nowait(("effects", effects))
+            return
+        for slot, fn in effects:
             if not slot.node.mounted:
                 continue
             self._cleanup(slot)
             try:
-                result = slot.fn()  # type: ignore[misc]
+                result = fn()  # type: ignore[misc]
             except Exception as exc:
                 self.report(exc, f"an effect in {slot.node.name}")
                 continue
+            self._keep_effect_result(slot, result)
+
+    def _keep_effect_result(self, slot: EffectSlot, result: Any) -> None:
+        if not slot.node.mounted:
+            # Unmounted while the effect ran in a thread: clean up at once.
             if inspect.iscoroutine(result):
-                task = self.spawn(result)
-                slot.cleanup = task.cancel
+                result.close()
             elif callable(result):
                 slot.cleanup = result
+                self._cleanup(slot)
+            return
+        if inspect.iscoroutine(result):
+            task = self.spawn(result)
+            slot.cleanup = task.cancel
+        elif callable(result):
+            slot.cleanup = result
+
+    async def _run_effects_async(self, effects: list[tuple[EffectSlot, Any]]) -> None:
+        for slot, fn in effects:
+            if not slot.node.mounted:
+                continue
+            self._cleanup(slot)
+            try:
+                if self.threaded and not inspect.iscoroutinefunction(fn):
+                    result = await asyncio.to_thread(fn)
+                else:
+                    result = fn()
+            except Exception as exc:
+                self.report(exc, f"an effect in {slot.node.name}")
+                continue
+            self._keep_effect_result(slot, result)
+
+    async def _work(self) -> None:
+        """Run queued events and effect batches one at a time, in arrival order."""
+        assert self._queue is not None
+        while True:
+            kind, job = await self._queue.get()
+            self._busy = True
+            try:
+                if kind == "event":
+                    await self._dispatch_async(*job)
+                else:
+                    await self._run_effects_async(job)
+            except Exception as exc:  # never let one bad job stop the session
+                self.report(exc, "the event worker")
+            finally:
+                self._busy = False
 
     def _cleanup(self, slot: EffectSlot) -> None:
         cleanup, slot.cleanup = slot.cleanup, None
@@ -458,9 +690,95 @@ class Root:
         if not task.cancelled() and task.exception() is not None:
             self.report(task.exception(), "a background task")  # type: ignore[arg-type]
 
+    def background(
+        self,
+        fn: Callable[..., Any],
+        args: tuple[Any, ...] = (),
+        done: Callable[[Any, BaseException | None], None] | None = None,
+        after: asyncio.Task[Any] | None = None,
+    ) -> asyncio.Task[Any] | None:
+        """Run ``fn(*args)`` without holding up rendering, then ``done(result, error)``
+        on the event loop. ``async`` functions run as tasks; others in a worker thread
+        when ``threaded``. ``after`` waits for an earlier job first, to keep order.
+
+        Call on the root's loop (from a worker thread, go through :meth:`call`).
+        Outside any running loop (a plain unit test) a sync ``fn`` runs at once.
+        """
+        try:
+            running = self._loop or asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is None:
+            error: BaseException | None
+            try:
+                result, error = fn(*args), None
+                if inspect.iscoroutine(result):
+                    result.close()
+                    result, error = None, RuntimeError("async work needs a running event loop")
+            except Exception as exc:
+                result, error = None, exc
+            if done is not None:
+                done(result, error)
+            return None
+
+        async def job() -> Any:
+            if after is not None and not after.done():
+                await asyncio.wait([after])
+            try:
+                if inspect.iscoroutinefunction(fn) or not self.threaded:
+                    result = fn(*args)
+                else:
+                    result = await asyncio.to_thread(fn, *args)
+                if inspect.iscoroutine(result):
+                    result = await result
+                error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                result, error = None, exc
+            if done is not None:
+                done(result, error)
+            return result
+
+        task = self.spawn(job())
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+        return task
+
+    async def settle(self, timeout: float = 5.0) -> bool:
+        """Wait until queued events, effects, background work (data loads, actions,
+        async handlers) are done and their updates rendered. False if ``timeout``
+        (seconds) ran out first. Long-running async effects are not waited for."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if self._dirty:
+                self._render_dirty() if self._sink is None else self.flush()
+            queued = self._queue is not None and (not self._queue.empty() or self._busy)
+            if not self._pending and not queued:
+                await asyncio.sleep(0)  # done-callbacks and thread hand-offs land
+                if not self._dirty and not self._pending and not (
+                    self._queue is not None and (not self._queue.empty() or self._busy)
+                ):
+                    return True
+                continue
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            if self._pending:
+                await asyncio.wait(set(self._pending), timeout=min(remaining, 0.05))
+            else:
+                await asyncio.sleep(0.005)
+            await asyncio.sleep(0)
+
     def report(self, exc: BaseException, where: str) -> None:
-        """Log an error; in debug mode also show it in the browser."""
+        """Log an error, pass it to ``on_error``, and in debug mode show it in the browser."""
         logger.error("Error in %s", where, exc_info=exc)
+        if self.on_error is not None:
+            try:
+                self.on_error(exc, where)
+            except Exception:
+                logger.exception("on_error failed")
         if self.debug:
             text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             self._errors.append(f"Error in {where}\n\n{text}")
@@ -474,6 +792,12 @@ class Root:
             self._title_dirty = True
             self.request_flush()
 
+    def set_head(self, node: ComponentNode, elements: tuple[Element, ...]) -> None:
+        if self._head.get(node) != elements:
+            self._head[node] = elements
+            self._head_dirty = True
+            self.request_flush()
+
     def set_location(self, url: str) -> None:
         """The browser moved to ``url`` (a link or the back button): re-render what reads it."""
         location = Location(url)
@@ -483,12 +807,16 @@ class Root:
         for node in list(self._location_subs):
             self.schedule(node)
 
-    def navigate(self, url: str, replace: bool = False) -> None:
-        """Go to ``url`` without reloading the page."""
+    def navigate(self, url: str, replace: bool = False, reload: bool = False) -> None:
+        """Go to ``url`` without reloading the page; with ``reload``, load it afresh
+        from the server (after login or logout, when cookies changed)."""
 
         def apply() -> None:
-            self.set_location(url)
-            self._nav = {"to": str(self.location), "replace": replace}
+            if reload:
+                self._nav = {"to": url, "replace": replace, "reload": True}
+            else:
+                self.set_location(url)
+                self._nav = {"to": str(self.location), "replace": replace}
             self.request_flush()
 
         self.call(apply)
@@ -496,45 +824,136 @@ class Root:
     def subscribe_location(self, node: ComponentNode) -> None:
         self._location_subs.add(node)
 
-    def command(self, node_id: int, method: str, args: list[Any]) -> None:
-        """Ask the browser to call ``method`` on an element."""
+    def command(self, node_id: int, method: str, args: list[Any]) -> Reply:
+        """Ask the browser to call ``method`` on an element; the reply carries its result."""
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        reply_id = next(self._reply_ids)
 
         def apply() -> None:
-            if node_id in self.hosts:
-                self.ops.append(["m", node_id, method, args])
-                self.request_flush()
+            if node_id not in self.hosts:
+                future.set_exception(LookupError("the element is no longer on the page"))
+                return
+            self._replies[reply_id] = future
+            self.ops.append(["m", node_id, method, args, reply_id])
+            self.request_flush()
 
         self.call(apply)
+        return Reply(future, self._thread)
+
+    def _answer(self, data: dict[str, Any]) -> None:
+        future = self._replies.pop(data.get("r"), None)  # type: ignore[arg-type]
+        if future is None or future.done():
+            return
+        if isinstance(data.get("error"), str):
+            future.set_exception(RuntimeError(data["error"]))
+        else:
+            future.set_result(data.get("value"))
 
     # ---- events ----------------------------------------------------------------
 
     def dispatch(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> None:
         """Deliver a browser event. ``seq`` is acknowledged once the handler finishes,
-        which tells the browser that edits it sent before then are reflected."""
-        if node_id == 0 and name == "#navigate":
-            to = data.get("to")
-            if isinstance(to, str) and to.startswith("/"):
-                self.set_location(to)
-            self._ack(seq)
+        which tells the browser that edits it sent before then are reflected.
+
+        Once attached, events queue and run one at a time, each seeing the page as
+        the previous one left it; before that (tests, server rendering) they run now.
+        """
+        if node_id == 0 and name == "#reply":
+            # Never queued: the handler waiting for this answer may be the one
+            # holding the queue's worker.
+            self._answer(data)
             return
-        files = data.get("files")
-        if isinstance(files, list):
-            # Taken out of storage now, whether or not a handler wants them.
-            data["files"] = [self._take_upload(f) for f in files if isinstance(f, dict)]
-        node = self.hosts.get(node_id)
-        handler = node.events.get(name) if node is not None else None
-        if handler is None:
-            self._ack(seq)
+        if self._queue is not None:
+            self._queue.put_nowait(("event", (seq, node_id, name, data)))
             return
-        fn = handler.fn
+        call = self._resolve(seq, node_id, name, data)
+        if call is None:
+            return
         try:
-            result = fn(Event(data)) if _wants_event(fn) else fn()
+            result = call()
         except Exception as exc:
             self.report(exc, f"the {name!r} handler")
             self._ack(seq)
             return
+        self._after_handler(seq, result)
+
+    async def _dispatch_async(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> None:
+        call = self._resolve(seq, node_id, name, data)
+        if call is None:
+            return
+        try:
+            if self.threaded and not inspect.iscoroutinefunction(call.fn):  # type: ignore[attr-defined]
+                loop = self._loop
+                assert loop is not None
+
+                def run() -> Any:
+                    _handling.seq = seq
+                    try:
+                        result = call()
+                    finally:
+                        _handling.seq = None
+                    if not inspect.iscoroutine(result):
+                        loop.call_soon_threadsafe(self._ack, seq)
+                    return result
+
+                result = await asyncio.to_thread(run)
+            else:
+                result = call()
+        except Exception as exc:
+            self.report(exc, f"the {name!r} handler")
+            self._ack(seq)
+            return
+        self._after_handler(seq, result)
+
+    def _resolve(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> Callable[[], Any] | None:
+        """The handler call for an event, or None when there is nothing to run."""
+        if node_id == 0:
+            self._special(name, data)
+            self._ack(seq)
+            return None
+        files = data.get("files")
+        if isinstance(files, list):
+            # Taken out of storage now, whether or not a handler wants them.
+            data["files"] = [self._take_upload(f) for f in files if isinstance(f, dict)]
+        form = data.get("form")
+        if isinstance(form, list):
+            data["form"] = FormFields(form)
+        node = self.hosts.get(node_id)
+        handler = node.events.get(name) if node is not None else None
+        fn = handler.fn if handler is not None else None
+        if fn is None:
+            self._ack(seq)
+            return None
+        event = Event(data)
+        wants = _wants_event(fn)
+
+        def call() -> Any:
+            return fn(event) if wants else fn()
+
+        call.fn = fn  # type: ignore[attr-defined]
+        return call
+
+    def _special(self, name: str, data: dict[str, Any]) -> None:
+        """Messages from the client script itself, not from an element."""
+        if name == "#navigate":
+            to = data.get("to")
+            if isinstance(to, str) and to.startswith("/") and not to.startswith("//"):
+                self.set_location(to)
+        elif name == "#mismatch":
+            # The server's HTML differed from the live render, so the browser rebuilt
+            # the page: usually a render reading the clock or a random number.
+            message = f"the server's HTML for {self.location} did not match the live render; the page was rebuilt"
+            logger.warning(message)
+            if self.debug:
+                self._errors.append("Warning: " + message + " (does a component read the time or a random number?)")
+                self.request_flush()
+        # "#ping" keeps proxies from closing an idle connection; nothing to do.
+
+    def _after_handler(self, seq: int, result: Any) -> None:
         if inspect.iscoroutine(result):
             task = self.spawn(result)
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
             task.add_done_callback(lambda _: self._ack(seq))
         else:
             self._ack(seq)
@@ -558,9 +977,12 @@ class Root:
 
     def _reconcile(self, parent: Any, old: list[Any], items: Iterable[Any]) -> list[Any]:
         pairs: list[tuple[Any, Any]] = []
-        _flatten_items(items, (), pairs)
+        unkeyed: list[int] | None = [] if self.debug else None
+        _flatten_items(items, (), pairs, unkeyed)
+        if unkeyed and len(unkeyed) > 1:
+            self._warn_unkeyed(parent)
         by_key = {child.key: child for child in old}
-        result = []
+        result: list[Any] = []
         seen: set[Any] = set()
         for key, item in pairs:
             if key in seen:
@@ -586,17 +1008,25 @@ class Root:
             node_id = next(self._ids)
             self.ops.append(["t", node_id, item])
             return TextNode(node_id, item, key, parent)
-        if isinstance(item.type, JsComponent):
+        if isinstance(item.type, JsComponent) or item.type == PORTAL:
             host = HostNode(next(self._ids), item, key, parent)
             self.hosts[host.id] = host
-            self.ops.append(self._js_create(host.id, item.type, item.attrs))
+            if item.type == PORTAL:
+                host.ns = None
+                self.ops.append(["P", host.id, item.attrs["target"]])
+            else:
+                self.ops.append(self._js_create(host))
+            host.children = self._reconcile(host, [], item.children)
+            host.dom = self._dom_ids(host.children)
+            if host.dom:
+                self.ops.append(["A", host.id, host.dom])
             if item.ref is not None:
                 item.ref.current = ElementHandle(self, host.id)
             return host
         if isinstance(item.type, str) and item.type != FRAGMENT:
             host = HostNode(next(self._ids), item, key, parent)
             self.hosts[host.id] = host
-            self.ops.append(["c", host.id, item.type, item.attrs, {n: h.spec() for n, h in item.events.items()}])
+            self.ops.append(self._create_op(host))
             host.children = self._reconcile(host, [], item.children)
             host.dom = self._dom_ids(host.children)
             if host.dom:
@@ -637,14 +1067,16 @@ class Root:
     def _diff_host(self, node: HostNode, item: Element) -> None:
         ops = self.ops
         old_attrs, new_attrs = node.attrs, item.attrs
-        if isinstance(node.type, JsComponent):
-            # The module gets all its props at once; callbacks are looked up on dispatch.
+        if isinstance(node.type, JsComponent) or node.type == PORTAL:
+            # A module gets all its props at once; callbacks are looked up on dispatch.
             if old_attrs != new_attrs:
                 ops.append(["J", node.id, new_attrs])
             self._swap_ref(node, item)
             node.element = item
             node.attrs = new_attrs
             node.events = item.events
+            node.children = self._reconcile(node, node.children, item.children)
+            self._sync_dom(node)
             return
         if old_attrs != new_attrs:
             for name, value in new_attrs.items():
@@ -676,9 +1108,19 @@ class Root:
             token = CURRENT.set(node)
             try:
                 out = kind.fn(*item.args, **item.kwargs)
+            except Suspended as waiting:
+                # Waiting for data: show the nearest Suspense fallback meanwhile. The
+                # hook re-renders this component when the data arrives.
+                node.pending_effects.clear()
+                boundary = self._boundary_for(node, "suspend")
+                if boundary is not None:
+                    boundary.suspend(waiting.task)  # type: ignore[misc]
+                if node.children:
+                    return
+                out = None
             except Exception as exc:
                 node.pending_effects.clear()
-                boundary = self._boundary_for(node)
+                boundary = self._boundary_for(node, "catch")
                 if boundary is None:
                     self.report(exc, f"rendering {node.name}")
                 else:
@@ -705,13 +1147,28 @@ class Root:
             node.pending_effects.clear()
 
     @staticmethod
-    def _boundary_for(node: ComponentNode) -> ComponentNode | None:
+    def _boundary_for(node: ComponentNode, kind: str) -> ComponentNode | None:
         parent = node.parent
         while parent is not None:
-            if isinstance(parent, ComponentNode) and parent.catch is not None:
+            if isinstance(parent, ComponentNode) and getattr(parent, kind) is not None:
                 return parent
             parent = parent.parent
         return None
+
+    def _warn_unkeyed(self, parent: Any) -> None:
+        owner = parent
+        while owner is not None and not isinstance(owner, ComponentNode):
+            owner = owner.parent
+        name = owner.name if owner is not None else "the root"
+        where = (name, getattr(parent, "type", None))
+        if where in self._warned_unkeyed:
+            return
+        self._warned_unkeyed.add(where)
+        logger.warning(
+            "Items of a list in %s have no key: pass key= (an id), so reordering or removing "
+            "one keeps the right state with the right item",
+            name,
+        )
 
     def _sync_dom(self, host: HostNode) -> None:
         """Move and insert ``host``'s DOM children to match its new child order."""
@@ -742,8 +1199,16 @@ class Root:
                 item.ref.current = ElementHandle(self, node.id)
 
     @staticmethod
-    def _js_create(node_id: int, js: JsComponent, props: dict[str, Any]) -> list[Any]:
-        return ["j", node_id, js.tag, js.module, js.export, props]
+    def _js_create(host: HostNode) -> list[Any]:
+        js: JsComponent = host.type
+        return ["j", host.id, js.tag, js.module, js.export, host.attrs, host.element.kwargs.get("fallback")]
+
+    @staticmethod
+    def _create_op(host: HostNode) -> list[Any]:
+        op = ["c", host.id, host.type, host.attrs, {n: h.spec() for n, h in host.events.items()}]
+        if host.ns is not None:
+            op.append(host.ns)
+        return op
 
     def _unmount(self, node: Any, emit: bool) -> None:
         if isinstance(node, TextNode):
@@ -751,7 +1216,9 @@ class Root:
                 self.ops.append(["r", node.id])
             return
         if isinstance(node, HostNode):
-            if emit:
+            # A portal's content lives elsewhere in the page, so removing an
+            # ancestor does not take it along: it is always removed itself.
+            if emit or node.type == PORTAL:
                 self.ops.append(["r", node.id])
             del self.hosts[node.id]
             self._release_ref(node)
@@ -765,21 +1232,34 @@ class Root:
         for slot in node.hooks:
             if isinstance(slot, EffectSlot):
                 self._cleanup(slot)
+            elif hasattr(slot, "dispose"):
+                # Subscriptions and background work a hook started.
+                try:
+                    slot.dispose()
+                except Exception as exc:
+                    self.report(exc, f"unmounting {node.name}")
         for provider in node.subscriptions:
             provider.subscribers.discard(node)
         self._location_subs.discard(node)
+        if self._head.pop(node, None) is not None:
+            self._head_dirty = True
 
     # ---- tree helpers ----------------------------------------------------------
 
     @staticmethod
-    def _dom_nodes(children: list[Any]) -> list[Any]:
-        """The DOM-level nodes (hosts and texts) among ``children``, components flattened."""
+    def _dom_nodes(children: list[Any], portals: list[Any] | None = None) -> list[Any]:
+        """The DOM-level nodes (hosts and texts) among ``children``, components
+        flattened. Portals are left out (their DOM is elsewhere) and added to
+        ``portals`` when given."""
         out: list[Any] = []
         stack = list(reversed(children))
         while stack:
             node = stack.pop()
             if isinstance(node, ComponentNode):
                 stack.extend(reversed(node.children))
+            elif isinstance(node, HostNode) and node.type == PORTAL:
+                if portals is not None:
+                    portals.append(node)
             else:
                 out.append(node)
         return out

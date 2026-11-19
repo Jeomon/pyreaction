@@ -12,10 +12,10 @@ from __future__ import annotations
 from html import escape
 from typing import Any
 
-from .element import Element, JsComponent
+from .element import PORTAL, RAW_HTML, Element, JsComponent
 from .reconciler import ComponentNode, HostNode, Root, TextNode
 
-__all__ = ["render_to_string"]
+__all__ = ["render_head", "render_to_string"]
 
 VOID = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
@@ -56,14 +56,37 @@ def _children(children: list[Any], out: list[str], raw: bool) -> None:
             prev_text = False
 
 
+def render_head(elements: list[Element]) -> str:
+    """Tags for the page's <head>, each marked so the browser can replace them later."""
+    out = []
+    for el in elements:
+        marked = Element(el.type, el.key, {**el.attrs, "data-pyreaction-head": ""}, {}, el.children)
+        out.append(render_to_string(marked))
+    return "".join(out)
+
+
 def _host(node: HostNode, out: list[str]) -> None:
+    if node.type == PORTAL:
+        return  # portals appear once the page is live
     if isinstance(node.type, JsComponent):
-        # An empty box; the module draws into it once the page is live.
-        out.append(f"<{node.type.tag}></{node.type.tag}>")
+        # The module draws into this box once the page is live. Until then it shows
+        # the fallback; Python children sit in a slot the module places later.
+        tag = node.type.tag
+        out.append(f"<{tag}>")
+        fallback = node.element.kwargs.get("fallback")
+        if fallback:
+            out.append(f'<div data-pyreaction-fallback style="display:contents">{fallback}</div>')
+        if node.children:
+            out.append('<div data-pyreaction-slot style="display:contents">')
+            _children(node.children, out, raw=False)
+            out.append("</div>")
+        out.append(f"</{tag}>")
         return
     tag = node.type
     out.append("<" + tag)
     for name, value in node.attrs.items():
+        if name == RAW_HTML:
+            continue
         if name == "value":
             if tag == "textarea" or tag == "select":
                 continue  # set as a property once the page is live
@@ -78,7 +101,10 @@ def _host(node: HostNode, out: list[str]) -> None:
     out.append(">")
     if tag in VOID:
         return
-    if tag == "textarea" and not node.children:
+    if RAW_HTML in node.attrs:
+        out.append(str(node.attrs[RAW_HTML]))
+    elif tag == "textarea" and not node.children:
         out.append(escape(str(node.attrs.get("value", "")), quote=False))
-    _children(node.children, out, raw=tag in RAW_TEXT)
+    else:
+        _children(node.children, out, raw=tag in RAW_TEXT)
     out.append(f"</{tag}>")

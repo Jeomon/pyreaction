@@ -1,3 +1,3 @@
-from .app import create_app, run
+from .app import create_app, embed, run
 
-__all__ = ["create_app", "run"]
+__all__ = ["create_app", "embed", "run"]

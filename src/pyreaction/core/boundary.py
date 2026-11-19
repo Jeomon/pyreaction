@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from .element import component, html
-from .hooks import CURRENT, use_ref, use_state
+from .hooks import CURRENT, Ref, use_ref, use_state
 
 __all__ = ["ErrorBoundary"]
 
@@ -23,20 +23,22 @@ def ErrorBoundary(*children: Any, fallback: Any = None, reset_keys: Sequence[Any
     Errors in event handlers and effects are not caught here, as in React; they
     are logged (and shown in the browser in debug mode).
     """
-    error, set_error = use_state(None)
-    last_keys = use_ref(None)
+    no_error: BaseException | None = None
+    error, set_error = use_state(no_error)
+    last_keys: Ref[tuple[Any, ...] | None] = use_ref(None)
     keys = tuple(reset_keys)
     if error is not None and last_keys.current is not None and keys != last_keys.current:
         error = None
         set_error(None)
     last_keys.current = keys
     node = CURRENT.get()
+    assert node is not None
     if error is None:
-        node.catch = set_error  # type: ignore[union-attr]
+        node.catch = set_error
         return children
     # While the fallback shows, errors go to the next boundary up: catching them
     # here would re-render the same fallback forever.
-    node.catch = None  # type: ignore[union-attr]
+    node.catch = None
     if callable(fallback):
         return fallback(error, lambda: set_error(None))
     if fallback is not None:

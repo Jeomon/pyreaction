@@ -37,8 +37,8 @@ def test_ref_commands_reach_the_browser_and_release_on_unmount():
     handle.scroll_into_view(behavior="smooth")
     ops = h.flush()
     assert ops == [
-        ["m", handle.id, "focus", []],
-        ["m", handle.id, "scrollIntoView", [{"behavior": "smooth", "block": "start"}]],
+        ["m", handle.id, "focus", [], 1],
+        ["m", handle.id, "scrollIntoView", [{"behavior": "smooth", "block": "start"}], 2],
     ]
     setters["show"](False)
     h.flush()
@@ -67,7 +67,7 @@ def test_commands_before_attach_run_after_hydration():
     asyncio.run(go())
     ops = sent[0]["ops"]
     assert ops[0][0] == "c", "the snapshot comes first"
-    assert ops[-1] == ["m", refs["input"].current.id, "focus", []]
+    assert ops[-1] == ["m", refs["input"].current.id, "focus", [], 1]
 
 
 def test_router_matches_params_and_follows_navigation():

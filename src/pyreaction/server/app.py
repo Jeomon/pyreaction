@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 from collections.abc import Callable, Sequence
 from html import escape
 from pathlib import Path
@@ -21,7 +22,7 @@ from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
 from starlette.requests import HTTPConnection, Request
-from starlette.responses import FileResponse, HTMLResponse
+from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket
@@ -38,9 +39,11 @@ try:
 
 except ImportError:  # pragma: no cover - depends on the optional extra
     _encoder = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False)
-    _dumps = _encoder.encode
 
-__all__ = ["create_app", "run"]
+    def _dumps(data: Any) -> str:
+        return _encoder.encode(data)
+
+__all__ = ["create_app", "embed", "run"]
 
 logger = logging.getLogger("pyreaction")
 
@@ -58,7 +61,7 @@ POLICY_VIOLATION = 1008
 def _as_factory(app: Component | Element | Callable[[], Element]) -> Callable[[], Element]:
     if isinstance(app, Element):
         return lambda: app
-    return app  # type: ignore[return-value]
+    return app
 
 
 def _origin_allowed(conn: HTTPConnection, allowed: Sequence[str]) -> bool:
@@ -94,15 +97,17 @@ def _parse_event(text: str) -> tuple[int, int, str, dict[str, Any]] | None:
 
 DEFAULT_MAX_UPLOAD = 10 * 1024 * 1024
 _MAX_HEADER = 64 * 1024
+# The browser sends files in chunks of this size; frames stay far below servers'
+# WebSocket message limits (uvicorn: 16 MiB) whatever max_upload_size is.
+UPLOAD_CHUNK = 256 * 1024
+# Received files are kept in memory up to this size, then on disk.
+_SPOOL_IN_MEMORY = 1024 * 1024
+# Files a connection may have in transfer, or waiting for their event, at once.
+_MAX_OPEN_UPLOADS = 16
 
 
-def ws_max_size(max_upload_size: int) -> int:
-    """The WebSocket frame limit uvicorn needs so a file of the largest allowed size fits."""
-    return max(16 * 1024 * 1024, max_upload_size + _MAX_HEADER + 4)
-
-
-def _parse_upload(frame: bytes, max_size: int) -> tuple[str, UploadedFile] | None:
-    """A binary frame from the browser: 4-byte header length, JSON header, file bytes."""
+def _parse_frame(frame: bytes) -> tuple[dict[str, Any], bytes] | None:
+    """A binary frame from the browser: 4-byte header length, JSON header, bytes."""
     if len(frame) < 4:
         return None
     n = int.from_bytes(frame[:4], "big")
@@ -115,15 +120,57 @@ def _parse_upload(frame: bytes, max_size: int) -> tuple[str, UploadedFile] | Non
     if not isinstance(header, dict) or not isinstance(header.get("u"), str):
         return None
     data = frame[4 + n :]
-    if len(data) > max_size:
+    if len(data) > UPLOAD_CHUNK:
         return None
-    name = header.get("name")
-    type_ = header.get("type")
-    return header["u"], UploadedFile(
-        name if isinstance(name, str) else "",
-        type_ if isinstance(type_, str) else "",
-        bytes(data),
-    )
+    return header, data
+
+
+class _Uploads:
+    """Files arriving in chunks on one connection, assembled in spooled temp files."""
+
+    def __init__(self, root: Root, max_size: int) -> None:
+        self.root = root
+        self.max_size = max_size
+        self.open: dict[str, tuple[Any, int, str, str]] = {}  # id -> (file, next part, name, type)
+
+    def receive(self, frame: bytes) -> bool:
+        """Take one frame; False when it is refused (and that file is dropped)."""
+        parsed = _parse_frame(frame)
+        if parsed is None:
+            return False
+        header, data = parsed
+        upload_id = header["u"]
+        part = header.get("part", 0)
+        entry = self.open.get(upload_id)
+        if entry is None:
+            if part != 0 or len(self.open) + len(self.root.uploads) >= _MAX_OPEN_UPLOADS:
+                return False
+            name, type_ = header.get("name"), header.get("type")
+            entry = (
+                tempfile.SpooledTemporaryFile(max_size=_SPOOL_IN_MEMORY),
+                0,
+                name if isinstance(name, str) else "",
+                type_ if isinstance(type_, str) else "",
+            )
+        file, expected, name, type_ = entry
+        if part != expected or file.tell() + len(data) > self.max_size:
+            file.close()
+            self.open.pop(upload_id, None)
+            return False
+        file.write(data)
+        if header.get("last", True):
+            self.open.pop(upload_id, None)
+            size = file.tell()
+            file.seek(0)
+            self.root.uploads[upload_id] = UploadedFile(name, type_, size=size, file=file)
+        else:
+            self.open[upload_id] = (file, expected + 1, name, type_)
+        return True
+
+    def close(self) -> None:
+        for file, *_ in self.open.values():
+            file.close()
+        self.open.clear()
 
 class _Outbox:
     """Messages waiting for a slow socket are merged into one, up to a limit of
@@ -189,6 +236,11 @@ def create_app(
     max_pending_ops: int = 100_000,
     max_upload_size: int = DEFAULT_MAX_UPLOAD,
     prefix: str = "/_pyreaction",
+    data_timeout: float = 5.0,
+    routes: Sequence[Any] = (),
+    on_error: Callable[[BaseException, str, Any], None] | None = None,
+    threaded: bool = True,
+    reconnect_max: int = 8000,
     debug: bool = False,
 ) -> Starlette:
     """An ASGI app serving ``app`` on every GET path.
@@ -200,19 +252,37 @@ def create_app(
 
     WebSockets are only accepted from the page's own origin plus
     ``allowed_origins`` (needed behind a proxy that rewrites the Host header;
-    ``"*"`` allows any). ``max_upload_size`` (bytes) caps each file a file input
-    sends; serve with :func:`run` or ``pyreaction run`` so uvicorn's frame limit
-    is raised to match. ``debug`` shows errors in the browser. Mount the result
-    inside another ASGI app, or serve it with :func:`run`.
+    ``"*"`` allows any). ``max_upload_size`` (bytes) caps each uploaded file.
+
+    The first HTML waits up to ``data_timeout`` seconds for data that
+    ``use_async``/``use_data`` load, so it arrives with the data in it.
+    ``routes`` are extra Starlette routes (a login POST endpoint, an API), matched
+    before the page. ``on_error(exc, where, connection)`` is called for every
+    error not caught by an ErrorBoundary, for Sentry-style reporting. With
+    ``threaded`` (default) synchronous handlers and effects run in worker
+    threads. After a dropped connection the page retries with growing delays of
+    at most ``reconnect_max`` milliseconds. ``debug`` shows errors in the browser.
     """
     make = _as_factory(app)
 
-    async def page(request: Request) -> HTMLResponse:
+    def new_root(url: str, connection: Any) -> Root:
+        root = Root(make(), location=url, connection=connection, debug=debug, threaded=threaded)
+        if on_error is not None:
+            root.on_error = lambda exc, where: on_error(exc, where, connection)
+        return root
+
+    async def page(request: Request) -> Response:
         url = request.url.path + (f"?{request.url.query}" if request.url.query else "")
-        root = Root(make(), location=url, connection=request, debug=debug)
+        root = new_root(url, request)
         try:
+            if not await root.settle(data_timeout):
+                logger.warning("Rendering %s before its data loaded (data_timeout=%ss)", url, data_timeout)
+            if root.redirect is not None:
+                return RedirectResponse(root.redirect, status_code=307)
             body = render_to_string(root)
             page_title = root.title if root.title is not None else title
+            head_tags = root.head_html()
+            status = root.status
         finally:
             root.close()
         root_path = request.scope.get("root_path", "")
@@ -225,10 +295,12 @@ def create_app(
                 lang=escape(lang),
                 title=escape(page_title),
                 style=STYLE,
-                head=links + head,
+                head=links + head + head_tags,
                 body=body,
                 base=escape(root_path + prefix),
-            )
+                reconnect_max=int(reconnect_max),
+            ),
+            status_code=status,
         )
 
     async def client_js(request: Request) -> FileResponse:
@@ -245,6 +317,7 @@ def create_app(
             url = "/"
         outbox = _Outbox(max_pending_ops)
         root: Root | None = None
+        uploads: _Uploads | None = None
 
         async def writer() -> None:
             while (message := await outbox.take()) is not None:
@@ -254,28 +327,26 @@ def create_app(
 
         writing = asyncio.create_task(writer())
         try:
-            root = Root(make(), location=url, connection=ws, debug=debug)
+            root = new_root(url, ws)
 
             def send(message: dict[str, Any]) -> None:
                 if "init" in message:
                     message["maxUpload"] = max_upload_size  # the browser checks sizes first
                 outbox.push(message)
 
+            # Load data as the page's HTML did, so this render matches it and the
+            # browser can adopt the HTML instead of rebuilding it.
+            await root.settle(data_timeout)
             root.attach(send, hydrate=ws.query_params.get("h") == "1")
-            # Files waiting for their event may hold at most a few uploads' worth of memory.
-            budget = 4 * max_upload_size
+            uploads = _Uploads(root, max_upload_size)
             while True:
                 message = await ws.receive()
                 if message["type"] == "websocket.disconnect":
                     break
                 frame = message.get("bytes")
                 if frame is not None:
-                    upload = _parse_upload(frame, max_upload_size)
-                    held = sum(f.size for f in root.uploads.values())
-                    if upload is None or held + upload[1].size > budget:
+                    if not uploads.receive(frame):
                         logger.warning("Refused a file upload on a WebSocket")
-                        continue
-                    root.uploads[upload[0]] = upload[1]
                     continue
                 text = message.get("text")
                 event = _parse_event(text) if text is not None else None
@@ -284,18 +355,23 @@ def create_app(
                     continue
                 root.dispatch(*event)
         finally:
+            if uploads is not None:
+                uploads.close()
             if root is not None:
+                for upload in root.uploads.values():
+                    upload.file.close()
                 root.close()
             writing.cancel()
 
-    routes: list[Any] = [
+    table: list[Any] = [
         Route(prefix + "/client.js", client_js),
         WebSocketRoute(prefix + "/ws", socket),
+        *routes,
     ]
     if static_dir is not None:
-        routes.append(Mount(static_path, StaticFiles(directory=static_dir), name="static"))
-    routes += [Route("/", page), Route("/{path:path}", page)]
-    return Starlette(debug=debug, routes=routes)
+        table.append(Mount(static_path, StaticFiles(directory=static_dir), name="static"))
+    table += [Route("/", page), Route("/{path:path}", page)]
+    return Starlette(debug=debug, routes=table)
 
 
 def run(
@@ -310,11 +386,36 @@ def run(
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    max_upload = options.get("max_upload_size", DEFAULT_MAX_UPLOAD)
-    uvicorn.run(
-        create_app(app, **options),
-        host=host,
-        port=port,
-        log_level=log_level,
-        ws_max_size=ws_max_size(max_upload),
+    uvicorn.run(create_app(app, **options), host=host, port=port, log_level=log_level)
+
+
+def embed(
+    app: Component | Element | Callable[[], Element] | None = None,
+    *,
+    mount_path: str = "",
+    location: str = "/",
+    element_id: str = "pyreaction-root",
+    prefix: str = "/_pyreaction",
+) -> str:
+    """HTML that puts a pyreaction app inside an existing page (Jinja, Django, plain HTML).
+
+    Mount the app's ASGI app at ``mount_path`` in your server
+    (``api.mount("/ui", create_app(Widget))``), then place
+    ``embed(Widget, mount_path="/ui", location=request.url.path)`` in the page,
+    unescaped (Jinja: ``| safe``). With ``app`` the snippet carries the
+    server-rendered HTML, adopted once live; without it the box fills in when the
+    page connects. ``location`` is the URL the app sees, normally the host page's
+    path. Use a different ``element_id`` for each app on a page.
+    """
+    body = ""
+    if app is not None:
+        root = Root(_as_factory(app)(), location=location)
+        try:
+            body = render_to_string(root)
+        finally:
+            root.close()
+    base = escape(mount_path.rstrip("/") + prefix)
+    return (
+        f'<div id="{escape(element_id)}">{body}</div>'
+        f'<script src="{base}/client.js" data-ws="{base}/ws" data-mount="{escape(element_id)}"></script>'
     )

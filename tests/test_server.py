@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import json
+import time
 import tracemalloc
 
 import pytest
@@ -36,6 +37,15 @@ def test_page_renders_html_and_client_script():
     assert js.status_code == 200 and "insertBefore" in js.text
 
 
+def wait_for(condition, timeout=2.0):
+    """Effects run in a worker after a message is sent; give them a moment."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out")
+        time.sleep(0.01)
+
+
 def test_socket_renders_again_and_handles_events():
     effects.clear()
     client = TestClient(create_app(Counter))
@@ -47,14 +57,14 @@ def test_socket_renders_again_and_handles_events():
         dom = FakeDom()
         dom.apply(first["ops"])
         assert dom.html() == "<div><button>+</button><span>0</span></div>"
-        assert effects == [0]
+        wait_for(lambda: effects == [0])
         button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
         ws.send_text(json.dumps([1, button, "click", {}]))
         update = json.loads(ws.receive_text())
         dom.apply(update["ops"])
         assert dom.html() == "<div><button>+</button><span>1</span></div>"
         assert update["ack"] == 1
-    assert effects == [0, 1]
+        wait_for(lambda: effects == [0, 1])
 
 
 def test_reconnect_without_markup_replaces():

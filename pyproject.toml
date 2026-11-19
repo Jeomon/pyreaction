@@ -32,6 +32,7 @@ fast = ["orjson>=3.9"]
 [dependency-groups]
 dev = [
     "httpx2>=2.16.2",
+    "mypy>=2.4.1",
     "pytest>=8",
 ]
 
@@ -41,3 +42,17 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/pyreaction"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# The project template imports modules that only exist in a generated project.
+exclude = ["cli/templates/"]
+
+[[tool.mypy.overrides]]
+module = ["orjson"]
+ignore_missing_imports = true
