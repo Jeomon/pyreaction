@@ -877,3 +877,36 @@ def test_mounted_portals_are_counted_so_pages_without_them_skip_the_walk():
     root.flush()
     assert root.portals == 0, "removing the outer portal drops the nested one too"
     assert render_portals(root) == ""
+
+
+def test_a_render_made_before_any_browser_records_no_ops_until_attached():
+    """The server's first-HTML render (ops=False) builds no create operations; a
+    browser that attaches gets the same tree, and updates from then on as usual."""
+    import asyncio
+
+    setters = {}
+
+    @component
+    def App():
+        rows, set_rows = use_state([1, 2, 3])
+        setters["rows"] = set_rows
+        return html.ul([html.li(html.b(i), " row", key=i) for i in rows], html.p("end"))
+
+    expected = Root(App()).snapshot()
+    quiet = Root(App(), ops=False)  # built last: setters["rows"] is now its state
+    assert quiet.ops == [], "nothing recorded for a browser that is not there"
+    assert quiet.snapshot() == expected, "the same tree as a normal render"
+
+    async def live():
+        sent = []
+        quiet.attach(sent.append)
+        dom = FakeDom()
+        dom.apply(sent[0]["ops"])
+        setters["rows"]([3, 4, 1])
+        quiet.flush()
+        for message in sent[1:]:
+            dom.apply(message["ops"])
+        quiet.close()
+        return dom.html()
+
+    assert asyncio.run(live()) == "<ul><li><b>3</b> row</li><li><b>4</b> row</li><li><b>1</b> row</li><p>end</p></ul>"

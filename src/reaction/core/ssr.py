@@ -15,7 +15,7 @@ from typing import Any
 from .element import PORTAL, RAW_HTML, Element, JsComponent
 from .vdom import ComponentNode, HostNode, Root, TextNode, _gc_paused
 
-__all__ = ["render_children", "render_head", "render_portals", "render_to_static_markup", "render_to_string"]
+__all__ = ["image_preloads", "render_children", "render_head", "render_portals", "render_to_static_markup", "render_to_string"]
 
 VOID = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
@@ -23,17 +23,23 @@ VOID = frozenset(
 RAW_TEXT = frozenset({"script", "style"})
 
 
-def render_to_string(target: Root | Element, boundaries: dict[Any, int] | None = None) -> str:
+def render_to_string(
+    target: Root | Element, boundaries: dict[Any, int] | None = None, images: list[HostNode] | None = None
+) -> str:
     """Render a root, or an element (mounted just for this), to HTML.
 
     With ``boundaries`` (for streaming), each Suspense boundary is wrapped in
     ``<!--pr-s:N-->`` ... ``<!--/pr-s:N-->`` comments, and its number is recorded
-    in the dict, so a later chunk can replace what is between them.
+    in the dict, so a later chunk can replace what is between them. ``images``
+    collects the <img> elements written, in order, for the page to preload.
     """
     root = target if isinstance(target, Root) else Root(target)
     out: list[str] = []
     with _gc_paused():
-        _children(root.container.children, out, raw=False, boundaries=boundaries)
+        if images is None:
+            _children(root.container.children, out, raw=False, boundaries=boundaries)
+        else:
+            _children_fast(root.container.children, out, boundaries, images)
     if root is not target:
         root.close()
     return "".join(out)
@@ -67,6 +73,111 @@ class _End:
 
 
 def _children(
+    children: list[Any], out: list[str], raw: bool, boundaries: dict[Any, int] | None = None, static: bool = False
+) -> None:
+    if not raw and not static:
+        _children_fast(children, out, boundaries)
+    else:
+        _children_general(children, out, raw, boundaries, static)
+
+
+# Attributes _host treats specially (live properties, raw HTML): an element with any
+# of them takes the general path.
+_SPECIAL_ATTRS = frozenset(
+    {RAW_HTML, "value", "checked", "selected", "indeterminate", "muted", "defaultValue", "defaultChecked"}
+)
+_CLOSE: dict[str, str] = {}
+
+
+def _children_fast(
+    children: list[Any], out: list[str], boundaries: dict[Any, int] | None, images: list[HostNode] | None = None
+) -> None:
+    """``_children_general`` for live markup, as one loop: an element's closing tag
+    goes on the stack instead of a call per element, closing tags are made once per
+    tag name, and text is escaped only when it holds something to escape (React's
+    escapeTextForBrowser fast path). Anything unusual (raw text, JS components,
+    portals, special attributes, textarea) goes to ``_host``. The output is the same
+    byte for byte."""
+    append = out.append
+    prev_text = False
+    stack: list[Any] = list(reversed(children))
+    pop = stack.pop
+    push = stack.append
+    while stack:
+        node = pop()
+        kind = type(node)
+        if kind is str:  # a closing tag or a boundary's end marker
+            append(node)
+            prev_text = False
+            continue
+        if kind is HostNode:
+            prev_text = False
+            tag = node.type
+            attrs = node.attrs
+            if (
+                type(tag) is not str or tag == PORTAL or tag in RAW_TEXT or tag == "textarea"
+                or (attrs and not _SPECIAL_ATTRS.isdisjoint(attrs))
+            ):
+                _host(node, out, boundaries)
+                continue
+            if attrs:
+                if tag == "img" and images is not None:
+                    images.append(node)
+                append("<" + tag)
+                for name, value in attrs.items():
+                    s = value if type(value) is str else str(value)
+                    if "&" in s or "<" in s or ">" in s or '"' in s or "'" in s:
+                        s = escape(s)
+                    append(f' {name}="{s}"')
+                append(">")
+            elif tag not in VOID:
+                text = node.text
+                if text is not None:  # the most common element: <td>text</td>
+                    if "&" in text or "<" in text or ">" in text:
+                        text = escape(text, quote=False)
+                    append(f"<{tag}>{text}</{tag}>")
+                    continue
+                append(f"<{tag}>")
+            if tag in VOID:
+                if not attrs:
+                    append(f"<{tag}>")
+                continue
+            close = _CLOSE.get(tag)
+            if close is None:
+                close = _CLOSE[tag] = f"</{tag}>"
+            text = node.text
+            if text is not None:
+                if "&" in text or "<" in text or ">" in text:
+                    text = escape(text, quote=False)
+                append(text)
+                append(close)
+            else:
+                push(close)
+                if node.children:
+                    stack.extend(reversed(node.children))
+            continue
+        if kind is TextNode:
+            if prev_text:
+                append("<!---->")
+            text = node.text
+            if not text:
+                append("<!--$-->")
+            else:
+                if "&" in text or "<" in text or ">" in text:
+                    text = escape(text, quote=False)
+                append(text)
+            prev_text = True
+            continue
+        # A component: its children in its place, a Suspense boundary marked.
+        if boundaries is not None and node.suspend is not None:
+            n = boundaries.setdefault(node, len(boundaries) + 1)
+            append(f"<!--pr-s:{n}-->")
+            prev_text = False
+            push(f"<!--/pr-s:{n}-->")
+        stack.extend(reversed(node.children))
+
+
+def _children_general(
     children: list[Any], out: list[str], raw: bool, boundaries: dict[Any, int] | None = None, static: bool = False
 ) -> None:
     prev_text = False
@@ -103,6 +214,51 @@ def _children(
         else:
             _host(node, out, boundaries, static)
             prev_text = False
+
+
+# At most this many images are preloaded from the page's <head> (React's limit),
+# besides those marked fetch_priority="high".
+MAX_IMAGE_PRELOADS = 10
+
+
+def image_preloads(images: list[HostNode]) -> list[tuple[tuple[str, str], Element]]:
+    """Preload hints for the images a page's HTML shows, as React's Fizz writes them
+    (pushImg): the browser starts fetching them from <head>, before it reaches them in
+    a long page. Not for lazy or low-priority images, data: URLs, or images in
+    <picture> (its <source> may pick another file) or <noscript>."""
+    out: list[tuple[tuple[str, str], Element]] = []
+    count = 0
+    for node in images:
+        attrs = node.attrs
+        src, srcset = attrs.get("src"), attrs.get("src-set") or attrs.get("srcset")
+        if not (src or srcset) or attrs.get("loading") == "lazy":
+            continue
+        priority = attrs.get("fetch-priority") or attrs.get("fetchpriority")
+        if priority == "low" or any(str(u).lstrip()[:5].lower() == "data:" for u in (src, srcset) if u):
+            continue
+        host = node.parent
+        while host is not None and type(host) is not HostNode:
+            host = host.parent
+        if host is not None and host.type in ("picture", "noscript"):
+            continue
+        if priority != "high":
+            if count >= MAX_IMAGE_PRELOADS:
+                continue
+            count += 1
+        link = {"rel": "preload", "as": "image"}
+        if srcset:
+            link["imagesrcset"] = str(srcset)
+            if attrs.get("sizes"):
+                link["imagesizes"] = str(attrs["sizes"])
+        else:
+            link["href"] = str(src)
+        for name in ("crossorigin", "referrerpolicy"):
+            if attrs.get(name):
+                link[name] = str(attrs[name])
+        if priority:
+            link["fetchpriority"] = str(priority)
+        out.append((("preload", str(srcset or src)), Element("link", None, link)))
+    return out
 
 
 def render_head(elements: list[Element]) -> str:

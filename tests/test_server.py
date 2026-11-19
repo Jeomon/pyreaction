@@ -727,3 +727,60 @@ def test_a_render_not_handed_off_is_closed_after_its_response():
                 assert closed, "with no hand-off, the render is closed after the response"
             else:
                 assert not closed, "kept for the page's live connection"
+
+
+def test_images_in_the_page_are_preloaded_from_its_head():
+    """As React's Fizz: the first 10 images (and any marked high priority) get a
+    preload in <head>, so the browser fetches them before reaching them in a long
+    page; lazy and low-priority images, data: URLs and <picture> are left alone."""
+    import re
+
+    @component
+    def App():
+        return html.main(
+            html.ul([html.li(f"row {i}") for i in range(50)]),
+            html.img(src="/hero.jpg", alt="hero"),
+            html.img(src="/lazy.jpg", loading="lazy"),
+            html.img(src="/low.jpg", fetch_priority="low"),
+            html.img(src="data:image/png;base64,AAAA"),
+            html.picture(html.source(src_set="/wide.webp"), html.img(src="/pic.jpg")),
+            html.img(src_set="/a.jpg 1x, /a2.jpg 2x", sizes="100vw"),
+            [html.img(src=f"/many/{i}.jpg") for i in range(12)],
+            html.img(src="/lcp.jpg", fetch_priority="high"),
+        )
+
+    page = TestClient(create_app(App)).get("/").text
+    head = page.split("</head>")[0]
+    links = re.findall(r'<link rel="preload" as="image"[^>]*>', head)
+    hrefs = [re.search(r'(href|imagesrcset)="([^"]*)"', link).group(2) for link in links]
+    assert hrefs[:2] == ["/hero.jpg", "/a.jpg 1x, /a2.jpg 2x"]
+    assert 'imagesizes="100vw"' in links[1]
+    assert "/lcp.jpg" in hrefs and 'fetchpriority="high"' in links[hrefs.index("/lcp.jpg")]
+    assert len(hrefs) == 11, "10, plus the high-priority one"
+    for skipped in ("/lazy.jpg", "/low.jpg", "data:", "/pic.jpg", "/many/8.jpg"):
+        assert not any(h.startswith(skipped) for h in hrefs), skipped
+
+
+def test_the_page_response_lists_its_hints_in_a_link_header():
+    """A Link header (for CDNs that send 103 Early Hints): the client script first,
+    then the page's preconnects and preloads, URLs encoded, at most about 2 kB."""
+    from reaction import preconnect, preinit, preload
+
+    @component
+    def App():
+        preconnect("https://cdn.example", cross_origin="anonymous")
+        preload("/static/font café.woff2", as_="font", type_="font/woff2", cross_origin="")
+        preinit("/static/app.css", as_="style")
+        for i in range(100):
+            preload(f"/static/extra-{i}-with-a-long-name-to-fill-the-header.js", as_="script")
+        return html.p("x")
+
+    response = TestClient(create_app(App)).get("/")
+    link = response.headers["link"]
+    parts = [p.strip() for p in link.split(", <")]
+    assert parts[0].startswith("</_pyreaction/client.js?v=") and parts[0].endswith("rel=preload; as=script")
+    assert '<https://cdn.example>; rel=preconnect; crossorigin="anonymous"' in link
+    assert '/static/font%20caf%C3%A9.woff2>; rel=preload; as=font; crossorigin; type="font/woff2"' in link
+    assert "/static/app.css>; rel=preload; as=style" in link
+    assert len(link) <= 2000 and "extra-99" not in link, "capped"
+    assert link.isascii()

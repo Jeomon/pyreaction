@@ -630,6 +630,11 @@ class Root:
     a worker thread, one at a time and in order, so a slow one (a database call)
     does not freeze every other session on the event loop. ``async def`` ones run
     on the loop as tasks.
+
+    ``ops=False`` is for a render made before any browser is connected (the server's
+    first HTML): mounting then builds no create operations, which nothing would
+    read, since a browser that connects gets a snapshot of the tree. They start
+    with :meth:`attach`.
     """
 
     def __init__(
@@ -642,10 +647,13 @@ class Root:
         threaded: bool = True,
         on_error: Callable[[BaseException, str], None] | None = None,
         base: str = "",
+        ops: bool = True,
     ) -> None:
         self.container = HostNode(0, Element("#root"), None, None)
         self.hosts: dict[int, HostNode] = {}
         self.ops: list[list[Any]] = []
+        # Whether mounting records create operations (see ``ops`` above).
+        self._emit = ops
         # Where the app is mounted ("/ui"), or "" at the root of the site.
         self.base = base.rstrip("/")
         self.location = Location(location, self.base)
@@ -735,6 +743,8 @@ class Root:
         self._from_threads: list[Callable[[], None]] = []
         self._from_threads_lock = threading.Lock()
         self._drain_scheduled = False
+        # The last ack sent to the browser (see flush).
+        self._ack_sent = 0
         # Set when this tree's HTML went to the browser unchanged (a handed-off GET
         # render): its first hydrate message can then leave out what the HTML holds.
         self._html_matches = False
@@ -764,6 +774,7 @@ class Root:
             self.spawn(self._work())
         self._render_dirty()
         self._sink = sink
+        self._emit = True  # a browser from here on: it reads what changes
         self._send_tree("hydrate" if hydrate else "replace")
         self._run_effects()
         self._render_browser_only()
@@ -796,6 +807,7 @@ class Root:
         message["init"] = init
         if rebuild:
             message["rebuild"] = True  # the same session: the browser keeps its event numbers
+        self._ack_sent = message["ack"]
         self._sink(message)
 
     def detach(self) -> None:
@@ -875,6 +887,9 @@ class Root:
 
         None when the browser could not line its DOM up with it: a <textarea> with
         child nodes, whose text the browser's walk does not enter."""
+        if not self.portals:
+            with _gc_paused():
+                return self._adopt_page()
         segments: list[dict[str, Any]] = []
         portals: list[HostNode] = []
         unsupported = False
@@ -936,6 +951,65 @@ class Root:
                 seg["box"] = node.id
                 segments.append(seg)
         return None if unsupported else segments
+
+    def _adopt_page(self) -> list[dict[str, Any]] | None:
+        """``_adopt_segments`` for a page without portals (most pages): one loop in
+        document order, with no list built per element. The same message."""
+        ids: list[int] = []
+        tags: list[str] = []
+        events: list[list[Any]] = []
+        props: list[list[Any]] = []
+        mounts: list[list[Any]] = []
+        add_id = ids.append
+        add_tag = tags.append
+        live_props = _LIVE_PROPS
+        prev = 0
+        stack: list[Any] = list(reversed(self.container.children))
+        pop = stack.pop
+        extend = stack.extend
+        while stack:
+            node = pop()
+            kind = type(node)
+            if kind is ComponentNode:
+                extend(reversed(node.children))
+                continue
+            step = (node.id - prev) * 2
+            prev = node.id
+            if kind is TextNode:
+                add_id(step)
+                add_tag("#")
+                continue
+            tag = node.type
+            if type(tag) is not str:  # a js_component: its box, mounted by its module
+                add_id(step)
+                add_tag(tag.tag)
+                mounts.append(self._js_create(node))
+                extend(reversed(node.children))
+                continue
+            add_tag(tag)
+            if node.text:
+                add_id(step + 1)
+                add_tag("#")
+            else:
+                add_id(step)
+            if node.events:
+                events.append([node.id, {n: h.spec() for n, h in node.events.items()}])
+            attrs = node.attrs
+            if attrs and not live_props.isdisjoint(attrs):
+                props.append([node.id, {k: v for k, v in attrs.items() if k in live_props}])
+            if tag == "textarea":
+                if node.children:
+                    return None  # its text nodes are not in the browser's walk
+            elif node.children:
+                extend(reversed(node.children))
+        out: dict[str, Any] = {"ids": ids, "sig": zlib.crc32(",".join(tags).encode())}
+        if events:
+            out["ev"] = events
+        if props:
+            out["pr"] = props
+        if mounts:
+            out["js"] = mounts
+        return [out]
 
     # ---- scheduling ------------------------------------------------------------
 
@@ -999,7 +1073,10 @@ class Root:
             return
         ops, self.ops = self.ops, []
         message = self._message(ops)
-        if ops or len(message) > 2:
+        # An event handled with nothing to change still tells the browser so: its
+        # controlled inputs then show the server's value again (a rejected keystroke).
+        if ops or len(message) > 2 or message["ack"] > self._ack_sent:
+            self._ack_sent = message["ack"]
             self._sink(message)
         self._run_effects()
 
@@ -1152,10 +1229,15 @@ class Root:
     def head_html(self) -> str:
         """Resource hints, then the tags Head components asked for, as HTML for the
         page's <head>."""
+        return "".join(self.head_parts())
+
+    def head_parts(self) -> list[str]:
+        """``head_html`` one tag at a time, so a streamed page can send the tags a
+        boundary added after the shell went out."""
         from .ssr import render_head
 
-        tags = list(self._resources.values())
-        return render_head(tags + [el for elements in self._head.values() for el in elements])
+        elements = [*self._resources.values(), *(el for elements in self._head.values() for el in elements)]
+        return [render_head([el]) for el in elements]
 
     def defer(self, fn: Callable[[], None]) -> bool:
         """Run ``fn`` on the loop once what is being rendered now has been sent.
@@ -1775,6 +1857,8 @@ class Root:
     def _ack(self, seq: int) -> None:
         if seq > self.ack:
             self.ack = seq
+            if self._sink is not None:
+                self.request_flush()  # sends the ack, alone when nothing changed
 
     def _take_upload(self, meta: dict[str, Any]) -> UploadedFile:
         name = str(meta.get("name", ""))
@@ -1911,9 +1995,11 @@ class Root:
         return result
 
     def _mount(self, item: Any, key: Any, parent: Any) -> Any:
+        emit = self._emit
         if type(item) is str:
             node_id = next(self._ids)
-            self.ops.append(["t", node_id, item])
+            if emit:
+                self.ops.append(["t", node_id, item])
             return TextNode(node_id, item, key, parent)
         if isinstance(item.type, JsComponent) or item.type == PORTAL:
             host = HostNode(next(self._ids), item, key, parent)
@@ -1921,14 +2007,15 @@ class Root:
             if item.type == PORTAL:
                 host.ns = None
                 self.portals += 1
-                self.ops.append(["P", host.id, item.attrs["target"]])
-            else:
+                if emit:
+                    self.ops.append(["P", host.id, item.attrs["target"]])
+            elif emit:
                 self.ops.append(self._js_create(host))
             host.reshaped = True  # its order is computed whole below
             host.children = self._reconcile(host, [], item.children)
             host.dom = self._dom_ids(host.children)
             host.reshaped = False
-            if host.dom:
+            if host.dom and emit:
                 self.ops.append(["A", host.id, host.dom])
             self._attach_ref(host, item.ref)
             return host
@@ -1938,14 +2025,16 @@ class Root:
             text = _only_text(item)
             if text is not None:
                 host.text = text
-                self.ops.append(self._create_op(host))
+                if emit:
+                    self.ops.append(self._create_op(host))
             else:
-                self.ops.append(self._create_op(host))
+                if emit:
+                    self.ops.append(self._create_op(host))
                 host.reshaped = True  # its order is computed whole below
                 host.children = self._reconcile(host, [], item.children)
                 host.dom = self._dom_ids(host.children)
                 host.reshaped = False
-                if host.dom:
+                if host.dom and emit:
                     self.ops.append(["A", host.id, host.dom])
             self._attach_ref(host, item.ref)
             return host
@@ -2357,7 +2446,15 @@ class Root:
 
     @classmethod
     def _dom_ids(cls, children: list[Any]) -> list[int]:
-        return [node.id for node in cls._dom_nodes(children)]
+        # Elements and text only (a <tr> of <td>s, most elements): their own ids,
+        # without the walk that flattens components and sets portals aside.
+        ids = []
+        for node in children:
+            kind = type(node)
+            if kind is ComponentNode or (kind is HostNode and node.type == PORTAL):
+                return [node.id for node in cls._dom_nodes(children)]
+            ids.append(node.id)
+        return ids
 
     @staticmethod
     def _host_of(node: Any) -> HostNode:

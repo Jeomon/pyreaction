@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import gzip
+import json
 import hashlib
 import hmac
 import inspect
@@ -25,6 +26,7 @@ from html import escape
 from pathlib import Path
 from string import Template
 from typing import Any
+from urllib.parse import quote
 from urllib.parse import urlsplit
 
 import orjson
@@ -40,7 +42,7 @@ from starlette.websockets import WebSocket
 
 from ..core.element import Component, Element
 from ..core.vdom import Root, UploadedFile
-from ..core.ssr import render_children, render_portals, render_to_string
+from ..core.ssr import image_preloads, render_children, render_portals, render_to_string
 from .encoding import dumps as _dumps
 from .encoding import loads as _loads
 from .settings import UNSET, resolve
@@ -100,8 +102,24 @@ _STREAM_SPLIT = "<!--pyreaction-stream-->"
 # Replaces the content between a boundary's <!--pr-s:N--> markers with its chunk.
 # The markers are found by one walk of the page, kept by name in __prM; a boundary
 # whose markers came inside an earlier chunk (or were removed with one) walks again.
+# __prHead moves the <head> tags a chunk brought (<template class="pr-h">) into
+# <head>; a boundary is revealed once the stylesheets among them have loaded (at most
+# 3 s), as React's Fizz waits, so its content never shows unstyled. Swaps stay in
+# order behind a waiting one (__prL), and client.js waits for them before adopting.
 _SWAP = (
-    "<script>function __prSwap(n){var t=document.getElementById('pr-c'+n),m=window.__prM,s,e,c,w;"
+    "<script>function __prHead(){var w=[];"
+    "document.querySelectorAll('.pr-h').forEach(function(t){"
+    "Array.from(t.content.children).forEach(function(el){var n=el,i;"
+    "if(el.localName==='script'){n=document.createElement('script');"
+    "for(i=0;i<el.attributes.length;i++)n.setAttribute(el.attributes[i].name,el.attributes[i].value);n.text=el.text}"
+    "if(n.localName==='link'&&n.rel==='stylesheet')w.push(new Promise(function(r){n.onload=n.onerror=r}));"
+    "document.head.appendChild(n)});t.remove()});"
+    "if(!w.length)return null;"
+    "var p=Promise.race([Promise.all(w),new Promise(function(r){setTimeout(r,3000)})]);"
+    "window.__prL=Promise.all([window.__prL,p]);return p}"
+    "function __prSwap(n){var p=__prHead(),l=window.__prL;"
+    "if(p||l){window.__prL=Promise.all([l,p]).then(function(){__prDo(n)});return}__prDo(n)}"
+    "function __prDo(n){var t=document.getElementById('pr-c'+n),m=window.__prM,s,e,c,w;"
     "function find(){m=window.__prM={};w=document.createTreeWalker(document.body,128);"
     "while(c=w.nextNode())if(/^\\/?pr-s:/.test(c.data))m[c.data]=c}"
     "s=m&&m['pr-s:'+n];e=m&&m['/pr-s:'+n];"
@@ -117,18 +135,27 @@ async def _stream_page(
     boundaries: dict[Any, int],
     waiting: set[int],
     deadline: float,
-    hand_off: Callable[[], None] | None = None,
+    hand_off: tuple[Callable[[], None], Callable[[], None]] | None = None,
+    head_sent: set[str] | None = None,
+    early_socket: str = "",
 ) -> AsyncIterator[str]:
     """The page in pieces: the shell with Suspense fallbacks at once, then each
     boundary's content as its data arrives, then the client script.
 
-    ``hand_off`` keeps the render for the page's live connection. It runs just before
-    the last piece: the browser connects only once that piece (the client script)
-    arrives, so the render it takes over is the one the HTML shows."""
+    ``hand_off`` is (finish, abandon) for the render already registered for the
+    page's live connection. ``early_socket`` is a script in the shell that opens that
+    connection at once, so its handshake happens while the page streams; the server
+    holds it until ``finish`` runs, at the end of the stream, when the render is the
+    page the browser has. ``abandon`` runs instead when the stream stops early.
+
+    ``head_sent`` is the shell's <head> tags. Tags a boundary adds later (a
+    stylesheet it preinits, an image it preloads, Head tags) go out with its chunk,
+    for the swap script to move into <head> (and wait for stylesheets) before the
+    content shows, as React's Fizz does, instead of after the whole stream."""
     loop = asyncio.get_running_loop()
     handed_off = False
     try:
-        yield parts[0] + _SWAP
+        yield parts[0] + _SWAP + early_socket
         while waiting:
             remaining = deadline - loop.time()
             pending = set(root._pending)
@@ -159,15 +186,94 @@ async def _stream_page(
             waiting |= {n for node, n in boundaries.items() if node.waiting and node.mounted} - {
                 boundaries[d] for d in done
             }
+            if head_sent is not None:
+                new = [tag for tag in root.head_parts() if tag not in head_sent]
+                if new:
+                    head_sent.update(new)
+                    chunks.insert(0, f'<template class="pr-h">{"".join(new)}</template>')
+                    if len(chunks) == 1:  # tags with no content this round: move them now
+                        chunks.append("<script>__prHead();document.currentScript.remove()</script>\n")
             if chunks:
                 yield "".join(chunks)
         if hand_off is not None:
-            hand_off()
+            hand_off[0]()
             handed_off = True
         yield parts[1]
     finally:
         if not handed_off:
+            if hand_off is not None:
+                hand_off[1]()
             root.close()  # streaming stopped early, or nothing will connect
+
+
+# The most a page's Link header may hold (React's default, maxHeadersLength): proxies
+# and servers limit header sizes, and the first few hints matter most.
+_LINK_HEADER_MAX = 2000
+
+
+def _link_url(url: str) -> str | None:
+    """A URL as a Link header carries it: non-ASCII and <> percent-encoded; None for
+    one no header can hold (control characters)."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in url):
+        return None
+    return quote(url, safe="!#$&'()*+,/:;=?@[]~%")
+
+
+def _link_header(script: str, resources: Any) -> str:
+    """A Link header for the page's response: the client script and the resource
+    hints in its <head> (preconnects, preloads, preinit stylesheets and scripts), so a
+    CDN can send them as 103 Early Hints and the browser starts on them before the
+    HTML arrives, as React's onHeaders gives frameworks."""
+    links = [f"<{script}>; rel=preload; as=script"]
+    for (kind, _), element in resources.items():
+        attrs = element.attrs
+        href = attrs.get("href") or attrs.get("src")
+        if kind == "dns" and href:
+            link = f"<{href}>; rel=dns-prefetch"
+        elif kind == "connect" and href:
+            link = f"<{href}>; rel=preconnect"
+        elif kind == "preload" and attrs.get("rel") == "modulepreload" and href:
+            link = f"<{href}>; rel=modulepreload"
+        elif kind == "preload" and href:
+            link = f"<{href}>; rel=preload; as={attrs.get('as', 'fetch')}"
+        elif kind == "init" and element.type == "link" and href:
+            link = f"<{href}>; rel=preload; as=style"
+        elif kind == "init" and href:
+            link = f"<{href}>; rel=" + ("modulepreload" if attrs.get("type") == "module" else "preload; as=script")
+        else:
+            continue  # an image known only by its srcset: left to the <head>
+        url = _link_url(href)
+        if url is None:
+            continue
+        link = link.replace(f"<{href}>", f"<{url}>", 1)
+        if "crossorigin" in attrs:  # an empty value is the bare attribute: anonymous
+            link += f'; crossorigin="{attrs["crossorigin"]}"' if attrs["crossorigin"] else "; crossorigin"
+        if kind == "preload" and attrs.get("type"):
+            link += f'; type="{attrs["type"]}"'
+        if attrs.get("fetchpriority"):
+            link += f'; fetchpriority="{attrs["fetchpriority"]}"'
+        links.append(link)
+    out = links[0]
+    for link in links[1:]:
+        if len(out) + 2 + len(link) > _LINK_HEADER_MAX:
+            break
+        out += ", " + link
+    return out
+
+
+def _early_socket(ws_path: str, url: str, base: str, token: str) -> str:
+    """For a streamed page: open its WebSocket from the shell, so the handshake is done
+    by the time the stream ends, and keep what arrives for client.js. The URL is the
+    one client.js would open (``p`` the page inside the app, ``b`` the app's base, the
+    hand-off token), with ``h=1``: the browser adopts the HTML it has."""
+    config = json.dumps({"ws": ws_path, "p": url, "b": base, "k": token}).replace("</", "<\\/")
+    return (
+        "<script>(function(c){try{var u=new URL(c.ws,location.href),q=[],w;"
+        "u.protocol=u.protocol==='https:'?'wss:':'ws:';u.searchParams.set('p',c.p);"
+        "if(c.b)u.searchParams.set('b',c.b);u.searchParams.set('h','1');u.searchParams.set('k',c.k);"
+        "w=new WebSocket(u);w.onmessage=function(e){q.push(e)};window.__prWS={ws:w,queue:q,k:c.k}}catch(e){}})"
+        f"({config});document.currentScript.remove()</script>\n"
+    )
 
 
 def _app_path(scope: Any) -> tuple[str, str]:
@@ -293,10 +399,10 @@ def _parse_frame(frame: bytes) -> tuple[dict[str, Any], bytes] | None:
 class _Handoff:
     """A first-HTML render kept for its page's live connection (see ``handoff_timeout``)."""
 
-    __slots__ = ("root", "timer", "loop", "cookie", "url", "base")
+    __slots__ = ("root", "timer", "loop", "cookie", "url", "base", "ready")
 
     def __init__(
-        self, root: Root, timer: asyncio.TimerHandle, loop: asyncio.AbstractEventLoop,
+        self, root: Root, timer: asyncio.TimerHandle | None, loop: asyncio.AbstractEventLoop,
         cookie: str | None, url: str, base: str,
     ) -> None:
         self.root = root
@@ -305,6 +411,10 @@ class _Handoff:
         self.cookie = cookie
         self.url = url
         self.base = base
+        # Done once the render matches the page the browser has: at once for a whole
+        # page, at the end of the stream for a streamed one (True), or False when the
+        # stream stopped early and the render is gone.
+        self.ready: asyncio.Future[bool] = loop.create_future()
 
 
 class _Uploads:
@@ -504,7 +614,8 @@ def create_app(
                 on_error(exc, where, root.connection)
 
         root = Root(
-            make(), location=url, connection=connection, debug=debug, threaded=threaded, on_error=report, base=base
+            make(), location=url, connection=connection, debug=debug, threaded=threaded, on_error=report, base=base,
+            ops=False,  # a browser that connects gets a snapshot, not the mount's operations
         )
         return root
 
@@ -527,31 +638,66 @@ def create_app(
     def drop_handoff(token: str) -> None:
         entry = handoffs.pop(token, None)
         if entry is not None:
-            entry.timer.cancel()
+            if entry.timer is not None:
+                entry.timer.cancel()
             entry.root.close()
 
-    def hand_off(token: str, root: Root, request: Request, url: str, base: str) -> None:
+    def register_handoff(token: str, root: Root, request: Request, url: str, base: str) -> _Handoff:
+        """Keep ``root`` for the page's live connection under ``token``; it can be
+        taken once ``finish_handoff`` says the render is the page's HTML."""
         while len(handoffs) >= max_handoffs:
             # The oldest waiting render makes way (a browser that never connected: a
-            # bot, a link preview). Closing a large tree takes milliseconds, so it
-            # happens after this response, not on its path.
-            evicted = handoffs.pop(next(iter(handoffs)))
-            evicted.timer.cancel()
+            # bot, a link preview); renders still streaming are not evicted. Closing a
+            # large tree takes milliseconds, so it happens after this response.
+            oldest = next((k for k, e in handoffs.items() if e.ready.done()), None)
+            if oldest is None:
+                break
+            evicted = handoffs.pop(oldest)
+            if evicted.timer is not None:
+                evicted.timer.cancel()
             asyncio.get_running_loop().call_soon(evicted.root.close)
+        entry = _Handoff(root, None, asyncio.get_running_loop(), request.headers.get("cookie"), url, base)
+        handoffs[token] = entry
+        return entry
+
+    def finish_handoff(token: str, entry: _Handoff) -> None:
+        """The render now matches the page the browser has: it can be taken over."""
+        root = entry.root
         # The mount operations were for a browser building the page; it adopts the
         # HTML instead. Element commands still have to run once it connects.
         root.ops = [op for op in root.ops if op[0] == "m"]
         # The browser's page is this tree's HTML: its first message can say less.
         root._html_matches = True
-        loop = asyncio.get_running_loop()
-        timer = loop.call_later(handoff_timeout, drop_handoff, token)
-        handoffs[token] = _Handoff(root, timer, loop, request.headers.get("cookie"), url, base)
+        entry.timer = entry.loop.call_later(handoff_timeout, drop_handoff, token)
+        if not entry.ready.done():
+            entry.ready.set_result(True)
 
-    def take_handoff(ws: WebSocket, url: str, base: str) -> Root | None:
-        entry = handoffs.pop(ws.query_params.get("k", ""), None)
+    def abandon_handoff(token: str, entry: _Handoff) -> None:
+        """The stream stopped early: the render goes, and a socket waiting for it
+        renders the page itself."""
+        handoffs.pop(token, None)
+        if not entry.ready.done():
+            entry.ready.set_result(False)
+
+    def hand_off(token: str, root: Root, request: Request, url: str, base: str) -> None:
+        finish_handoff(token, register_handoff(token, root, request, url, base))
+
+    async def take_handoff(ws: WebSocket, url: str, base: str) -> Root | None:
+        token = ws.query_params.get("k", "")
+        entry = handoffs.get(token)
         if entry is None:
             return None
-        entry.timer.cancel()
+        if not entry.ready.done():
+            # Opened while its page was still streaming (to save the handshake):
+            # wait for the stream to end, when the render is the page's HTML.
+            try:
+                await asyncio.wait_for(asyncio.shield(entry.ready), data_timeout + 5)
+            except TimeoutError:
+                return None
+        if not entry.ready.result() or handoffs.pop(token, None) is not entry:
+            return None
+        if entry.timer is not None:
+            entry.timer.cancel()
         # Only the browser the page was rendered for (its cookies), for the same URL,
         # served by the same event loop the render's work runs on.
         same = (
@@ -591,12 +737,20 @@ def create_app(
                     target, status_code=code, headers=root.headers, background=BackgroundTask(root.close)
                 )
             boundaries: dict[Any, int] = {}
-            body = render_to_string(root, boundaries if stream else None)
+            images: list[Any] = []
+            body = render_to_string(root, boundaries if stream else None, images)
+            for key, link in image_preloads(images):
+                root.add_resource(key, link)
             portals = render_portals(root, boundaries if stream else None)
             page_title = root.title if root.title is not None else title
-            head_tags = root.head_html()
+            head_parts = root.head_parts()
+            head_tags = "".join(head_parts)
             status = root.status
             root_path = request.scope.get("root_path", "")
+            script_url = f"{request.scope.get(_SCRIPT_BASE, root_path + prefix)}/client.js?v={CLIENT_VERSION}"
+            hints = _link_header(script_url, root._resources)
+            existing = root.headers.get("Link") or root.headers.get("link")
+            root.headers["Link"] = f"{existing}, {hints}" if existing else hints
             # Lets the page's live connection take over this render (see hand_off).
             token = secrets.token_urlsafe(18) if handoff_timeout > 0 and max_handoffs > 0 else ""
             links = "".join(
@@ -632,11 +786,17 @@ def create_app(
                 handed_off = True
                 return response
             handed_off = True  # _stream_page keeps or closes it from here
+            stream_handoff = None
+            early = ""
+            if token:
+                entry = register_handoff(token, root, request, url, base)
+                stream_handoff = (
+                    lambda: finish_handoff(token, entry),
+                    lambda: abandon_handoff(token, entry),
+                )
+                early = _early_socket(request.scope.get(_SCRIPT_BASE, root_path + prefix) + "/ws", url, base, token)
             return StreamingResponse(
-                _stream_page(
-                    root, parts, boundaries, waiting, deadline,
-                    (lambda: hand_off(token, root, request, url, base)) if token else None,
-                ),
+                _stream_page(root, parts, boundaries, waiting, deadline, stream_handoff, set(head_parts), early),
                 media_type="text/html",
                 status_code=status,
                 headers=root.headers,
@@ -709,7 +869,7 @@ def create_app(
                 root.connection = ws
                 root.set_location(url)
                 root.attach(send, hydrate=True)
-            elif (root := take_handoff(ws, url, base)) is not None:
+            elif (root := await take_handoff(ws, url, base)) is not None:
                 # The render that made this page's HTML: no need to render it again.
                 root.connection = ws
                 root.attach(send, hydrate=ws.query_params.get("h") == "1")

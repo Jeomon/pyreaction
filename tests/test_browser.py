@@ -972,3 +972,175 @@ def test_rows_removed_and_created_again_still_take_clicks_in_chrome(page):
         page.click("#r1000")
         page.wait_for_timeout(200)
         assert picked == [1499, 1000]
+
+
+def test_a_boundarys_stylesheet_arrives_with_it_and_styles_it_on_reveal_in_chrome(page, tmp_path):
+    """A stylesheet a Suspense boundary preinits is sent with that boundary's chunk, and
+    the content shows only once it has loaded (React's Fizz does the same), instead of
+    unstyled until the whole stream ends and the WebSocket delivers the <head>."""
+    from reaction import preinit
+
+    (tmp_path / "chart.css").write_text(".chart { color: rgb(0, 128, 0); }")
+
+    @component
+    def Chart():
+        async def load():
+            await asyncio.sleep(0.3)
+            return "chart"
+
+        value = use_data(load)
+        preinit("/static/chart.css", as_="style")
+        return html.p(value, class_name="chart")
+
+    @component
+    def Late():
+        async def load():
+            await asyncio.sleep(1.0)
+            return "late"
+
+        return html.p(use_data(load), id="late")
+
+    @component
+    def App():
+        return html.main(
+            Suspense(Chart(), fallback=html.p("loading chart")),
+            Suspense(Late(), fallback=html.p("loading late")),  # keeps the stream open
+        )
+
+    # Record the chart's colour the moment it appears, and when the stylesheet loaded.
+    page.add_init_script("""
+        window.__seen = null;
+        new MutationObserver(() => {
+          const el = document.querySelector('.chart');
+          if (el && window.__seen === null) {
+            window.__seen = { color: getComputedStyle(el).color, live: document.documentElement.hasAttribute('data-pyreaction-ready') };
+          }
+        }).observe(document, { childList: true, subtree: true });
+    """)
+    with serve(App, static_dir=tmp_path) as server:
+        open_page(page, server)
+        seen = page.evaluate("window.__seen")
+        assert seen == {"color": "rgb(0, 128, 0)", "live": False}, "styled when it appeared, before the stream ended"
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+        page.wait_for_timeout(300)  # the live <head> update, if any
+        assert page.evaluate("document.querySelectorAll('link[href$=\"chart.css\"]').length") == 1, "not added twice"
+        assert page.text_content("#late") == "late"
+
+
+def test_focus_and_selection_survive_a_reorder_in_chrome(page):
+    """Moving the focused input (a keyed list reordering) keeps its focus and text
+    selection, and the browser's own blur from the move is not sent as the person's."""
+    blurs = []
+
+    @component
+    def App():
+        order, set_order = use_state([1, 2, 3])
+        return html.div(
+            html.button("rotate", id="rotate", on_click=lambda: set_order(order[1:] + order[:1])),
+            html.ul([html.li(html.input(id=f"f{i}", default_value=f"item {i}", on_blur=lambda: blurs.append(1)), key=i)
+                     for i in order]),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.focus("#f1")
+        page.eval_on_selector("#f1", "e => e.setSelectionRange(2, 4)")
+        page.eval_on_selector("#rotate", "e => e.click()")  # a click that does not take the focus
+        page.wait_for_function("document.querySelector('li:last-child input').id === 'f1'")
+        assert page.evaluate("document.activeElement.id") == "f1"
+        assert page.evaluate("[f1.selectionStart, f1.selectionEnd]") == [2, 4]
+        page.wait_for_timeout(200)
+        assert blurs == [], "the move's blur is not the person's"
+
+
+def test_a_controlled_input_shows_the_servers_value_after_a_rejected_edit_in_chrome(page):
+    @component
+    def App():
+        digits, set_digits = use_state("")
+        num, set_num = use_state(1.0)
+
+        def on_num(e):
+            try:
+                set_num(float(e.value))
+            except ValueError:
+                pass
+
+        return html.div(
+            # a filter: the server keeps "12" when "12a" is typed, so its value does not change
+            html.input(id="digits", value=digits, on_change=lambda e: set_digits("".join(c for c in e.value if c.isdigit()))),
+            html.input(id="num", type="number", value=str(num), on_change=on_num),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.click("#digits")
+        page.keyboard.type("12a", delay=120)
+        page.wait_for_timeout(400)
+        assert page.input_value("#digits") == "12", "the rejected keystroke is undone"
+        page.click("#num", click_count=3)
+        page.keyboard.type("2.50", delay=150)
+        page.wait_for_timeout(400)
+        assert page.input_value("#num") == "2.50", "2.5 from the server is the same number: what was typed stays"
+
+
+def test_style_removals_apply_before_additions_in_chrome(page):
+    @component
+    def App():
+        flip, set_flip = use_state(False)
+        return html.div(
+            html.button("flip", id="flip", on_click=lambda: set_flip(not flip)),
+            # margin (a shorthand) goes, margin-top (one of its parts) comes, in one update
+            html.div("styled", id="styled", style={"margin_top": "5px"} if flip else {"margin": "10px"}),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.click("#flip")
+        page.wait_for_function("document.querySelector('#styled').style.margin !== '10px'")
+        assert page.evaluate("styled.style.marginTop") == "5px"
+
+
+def test_a_streamed_page_opens_its_socket_before_the_stream_ends_in_chrome(page):
+    """The shell opens the WebSocket at once, so its handshake is done while the page
+    streams; the server holds it until the stream ends, then hands over the render:
+    the page is adopted, the data loaded once, and events work."""
+    loads = []
+
+    @component
+    def Slow():
+        async def load():
+            loads.append(1)
+            await asyncio.sleep(0.6)
+            return "loaded"
+
+        return html.p(use_data(load), id="slow")
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        return html.main(
+            Suspense(Slow(), fallback=html.p("loading", id="fallback")),
+            html.button(f"n={n}", id="inc", on_click=lambda: set_n(n + 1)),
+        )
+
+    page.add_init_script("""
+        window.__opened = null;
+        const Real = WebSocket;
+        window.WebSocket = function (...args) {
+          const ws = new Real(...args);
+          ws.addEventListener('open', () => { if (window.__opened === null) window.__opened = performance.now(); });
+          return ws;
+        };
+        window.WebSocket.prototype = Real.prototype;
+        Object.assign(window.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+        window.__streamEnd = null;
+        document.addEventListener('DOMContentLoaded', () => { window.__streamEnd = performance.now(); });
+    """)
+    with serve(App) as server:
+        open_page(page, server)
+        timing = page.evaluate("[window.__opened, window.__streamEnd]")
+        assert timing[0] is not None and timing[0] < timing[1], f"socket open before the stream ended: {timing}"
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+        assert page.text_content("#slow") == "loaded" and loads == [1], "the data loaded once"
+        page.click("#inc")
+        page.wait_for_function("document.querySelector('#inc').textContent === 'n=1'")

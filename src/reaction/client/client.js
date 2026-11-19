@@ -52,6 +52,24 @@
     }
   }
 
+  // "2.50" typed and 2.5 from the server are the same number: what was typed stays.
+  const sameNumber = (el, value) =>
+    el.type === "number" && el.value !== "" && value !== "" && Number(el.value) === Number(value);
+  // Controlled inputs that sent an edit. Once the server has handled it, the field
+  // shows the server's value even when that did not change (a rejected keystroke,
+  // which no "p" op would undo), as React's restoreControlledState does.
+  const edited = new Set();
+  function markEdited(target) {
+    if (target && target.__ctl !== undefined) edited.add(target);
+  }
+  function restoreControlled() {
+    for (const el of edited) {
+      if ((lastSent.get(el) || 0) > ack) continue; // its edit is not handled yet
+      edited.delete(el);
+      if (el.isConnected && el.value !== el.__ctl && !sameNumber(el, el.__ctl)) el.value = el.__ctl;
+    }
+  }
+
   function setProp(el, name, value) {
     if (name === "#html") {
       // dangerously_set_inner_html: the server's string, as markup.
@@ -67,14 +85,15 @@
     if (name === "style" && value !== null && typeof value === "object") {
       // Only the properties that changed (null: removed); the rest stay, including
       // any a script set on the element.
+      // Removals first, as React does: removing a shorthand (margin) must not clear
+      // a part of it (margin-top) set in the same update.
+      for (const k in value) if (value[k] === null) el.style.removeProperty(k);
       for (const k in value) {
         const v = value[k];
-        if (v === null) el.style.removeProperty(k);
-        else {
-          const important = /\s*!important\s*$/i;
-          if (important.test(v)) el.style.setProperty(k, v.replace(important, ""), "important");
-          else el.style.setProperty(k, v);
-        }
+        if (v === null) continue;
+        const important = /\s*!important\s*$/i;
+        if (important.test(v)) el.style.setProperty(k, v.replace(important, ""), "important");
+        else el.style.setProperty(k, v);
       }
       return;
     }
@@ -95,8 +114,10 @@
       if (name === "value") {
         value = value == null ? "" : String(value);
         if (el.localName === "select") el.__value = value;
+        el.__ctl = value; // the server's value, restored after an edit it did not take
       }
       if ((lastSent.get(el) || 0) > ack) return;
+      if (name === "value" && sameNumber(el, value)) return;
       if (el[name] !== value) el[name] = value;
       return;
     }
@@ -213,7 +234,14 @@
 
   const hasFiles = (t) => t && t.localName === "input" && t.type === "file" && t.files && t.files.length;
 
+  // While a message is being applied: focus events the browser fires because the
+  // client moved the focused element are not the person's (React turns its event
+  // system off during a commit).
+  let applying = false;
+  const FOCUS_EVENTS = new Set(["focus", "blur", "focusin", "focusout"]);
+
   function dispatchFromRoot(e, root, name, capture) {
+    if (applying && FOCUS_EVENTS.has(e.type)) return;
     // A portal box inside the page is a root inside a root: handle the event once.
     const mark = "__pr " + name;
     if (e[mark]) return;
@@ -247,6 +275,7 @@
     const s = ++seq;
     for (const el of batch) lastSent.set(el, s);
     if (e.target) lastSent.set(e.target, s);
+    markEdited(e.target);
     remember(s, e);
     send([s, batch.length === 1 ? batch[0].__id : batch.map((el) => el.__id), name, serialize(e)]);
   }
@@ -268,6 +297,7 @@
     const fire = (data, e) => {
       const s = ++seq;
       lastSent.set(el, s);
+      markEdited(e && e.target);
       remember(s, e);
       send([s, el.__id, name, data]);
     };
@@ -327,6 +357,7 @@
       return;
     }
     record.native = (e) => {
+      if (applying && FOCUS_EVENTS.has(e.type)) return;
       if (keys && !keys.includes(e.key)) return;
       if (preventDefault) e.preventDefault();
       if (stopPropagation) e.stopPropagation();
@@ -905,24 +936,35 @@
   let heartbeat = null;
 
   function connect() {
-    const url = new URL(wsPath, location.href);
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    url.searchParams.set("p", here());
-    if (base) url.searchParams.set("b", base);
-    // Offer to adopt what is on the page: the server's HTML, or the last session's tree.
-    if (mount.firstChild) url.searchParams.set("h", "1");
-    // Ask to resume the last session, which the server keeps for a while.
-    if (sid) url.searchParams.set("s", sid);
-    // The first connection takes over the render that made this page's HTML.
-    if (handoff) url.searchParams.set("k", handoff);
+    // A streamed page opened its socket from the shell (to save the handshake): take
+    // it over if it is for this page's render and still usable, with what it got.
+    const early = handoff && window.__prWS && window.__prWS.k === handoff ? window.__prWS : null;
+    window.__prWS = null;
+    let url;
+    if (early && early.ws.readyState <= 1) {
+      socket = early.ws;
+      url = new URL(socket.url);
+    } else {
+      url = new URL(wsPath, location.href);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      url.searchParams.set("p", here());
+      if (base) url.searchParams.set("b", base);
+      // Offer to adopt what is on the page: the server's HTML, or the last session's tree.
+      if (mount.firstChild) url.searchParams.set("h", "1");
+      // Ask to resume the last session, which the server keeps for a while.
+      if (sid) url.searchParams.set("s", sid);
+      // The first connection takes over the render that made this page's HTML.
+      if (handoff) url.searchParams.set("k", handoff);
+      socket = new WebSocket(url);
+    }
     handoff = "";
-    socket = new WebSocket(url);
     socket.onopen = () => {
       retry = 0;
       document.documentElement.removeAttribute("data-pyreaction-offline");
       clearInterval(heartbeat);
       heartbeat = setInterval(() => send([0, 0, "#ping", {}]), HEARTBEAT);
     };
+    if (socket.readyState === 1) socket.onopen();
     const receive = (data) => {
       if (data.vt && !data.init && document.startViewTransition) {
         // Types (add_transition_type) need the object form, where the browser has it.
@@ -942,7 +984,32 @@
       if (animating) waiting.push(data);
       else receive(data);
     };
+    // Applies a message keeping the focused element and its text selection: moving a
+    // node in the DOM takes the focus away (React's prepareForCommit/resetAfterCommit).
     const handle = (data) => {
+      const focused = document.activeElement;
+      let range = null;
+      try {
+        if (focused && typeof focused.selectionStart === "number") {
+          range = [focused.selectionStart, focused.selectionEnd, focused.selectionDirection];
+        }
+      } catch (_) {} // selectionStart throws on some input types
+      applying = true;
+      try {
+        handleMessage(data);
+      } finally {
+        applying = false;
+        if (focused && focused !== document.body && focused.isConnected && document.activeElement !== focused) {
+          focused.focus({ preventScroll: true });
+          if (range) {
+            try {
+              focused.setSelectionRange(range[0], range[1], range[2]);
+            } catch (_) {}
+          }
+        }
+      }
+    };
+    const handleMessage = (data) => {
       if (data.init) {
         sid = data.sid || null;
         maxUpload = data.maxUpload || 0;
@@ -968,6 +1035,7 @@
         }
       } else if (data.init === "replace") replace(data.ops);
       else apply(data.ops);
+      restoreControlled();
       if (data.title != null) document.title = data.title;
       if (data.head != null) setHead(data.head);
       if (data.nav) followServer(data.nav);
@@ -990,6 +1058,9 @@
       const delay = Math.min(250 * 2 ** retry++, RECONNECT_MAX);
       setTimeout(connect, delay / 2 + Math.random() * (delay / 2));
     };
+    // What the early socket received before this script ran, in order.
+    if (early) for (const msg of early.queue.splice(0)) socket.onmessage(msg);
+    if (early && socket.readyState === 3) socket.onclose();
   }
 
   // Out of attempts: say so, and offer a reload (which starts a fresh session).
@@ -1009,5 +1080,8 @@
     document.body.append(box);
   }
 
-  connect();
+  // A streamed page may still be revealing a boundary (waiting for its stylesheet):
+  // adopt the page once it has, so the DOM is the render the server keeps.
+  if (window.__prL) window.__prL.then(connect, connect);
+  else connect();
 })();
