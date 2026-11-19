@@ -42,13 +42,17 @@ import shutil
 import threading
 import time
 import traceback
+import zlib
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qs
 
-from .element import FRAGMENT, PORTAL, RAW_HTML, RAW_MARK, TEXT, Component, Element, JsComponent
+from .element import (
+    FRAGMENT, PORTAL, PROPERTY_PROPS, RAW_HTML, RAW_MARK, TEXT, Component, Element, JsComponent,
+    style_changes,
+)
 from .hooks import ACTIVE_ROOT, BROWSER_ONLY, CURRENT, CURRENT_ACTION, BrowserOnly, Context, EffectSlot, Suspended, same
 
 logger = logging.getLogger("reaction")
@@ -68,6 +72,10 @@ def _too_many_renders(name: str) -> RuntimeError:
 __all__ = ["ElementHandle", "Event", "FormFields", "Location", "Reply", "Root", "UploadedFile"]
 
 _SKIP = object()
+
+# Attributes the browser sets as live properties, which the server's HTML cannot
+# always carry (a <select>'s value, a textarea's): sent even when adopting the HTML.
+_LIVE_PROPS = PROPERTY_PROPS | {"defaultValue", "defaultChecked"}
 
 # The event a worker thread is handling, so state updates it makes carry its ack.
 _handling = threading.local()
@@ -683,11 +691,18 @@ class Root:
         self._queue: asyncio.Queue[tuple[str, Any]] | None = None
         self.pending_events = 0  # browser events queued and not yet started
         self._busy = False
+        # While the handlers of one native event run (several elements on its path),
+        # renders wait, so the page renders once after all of them, as in React.
+        self._holding = False
+        self._flush_held = False
         # State updates from worker threads, waiting to run on the loop. A burst of them
         # wakes the loop once (see call), not once per update.
         self._from_threads: list[Callable[[], None]] = []
         self._from_threads_lock = threading.Lock()
         self._drain_scheduled = False
+        # Set when this tree's HTML went to the browser unchanged (a handed-off GET
+        # render): its first hydrate message can then leave out what the HTML holds.
+        self._html_matches = False
         with _gc_paused():
             self.container.reshaped = True  # its order is computed whole below
             self.container.children = self._reconcile(self.container, [], (element,))
@@ -729,12 +744,20 @@ class Root:
         # Element commands made before now still have to run, unless their caller
         # already gave up waiting for the answer.
         commands = [op for op in self.ops if op[0] == "m" and (op[4] is None or op[4] in self._replies)]
+        # The browser's DOM is this tree's HTML when nothing has changed it since.
+        compact = init == "hydrate" and self._html_matches and all(op[0] == "m" for op in self.ops)
+        self._html_matches = False
         self.ops = []
         if self.title is not None:
             self._title_dirty = True
         if self._head or self._resources:
             self._head_dirty = True
-        message = self._message(self.snapshot(structure=init != "hydrate") + commands)
+        adopt = self._adopt_segments() if compact else None
+        if adopt is not None:
+            message = self._message(commands)
+            message["adopt"] = adopt
+        else:
+            message = self._message(self.snapshot(structure=init != "hydrate") + commands)
         message["init"] = init
         if rebuild:
             message["rebuild"] = True  # the same session: the browser keeps its event numbers
@@ -804,6 +827,81 @@ class Root:
                 ops.append(["A", node.id, node.dom])
         return ops
 
+    def _adopt_segments(self) -> list[dict[str, Any]] | None:
+        """A hydrate message for a browser whose HTML came from this very tree, as
+        React's production hydration: only what the HTML cannot carry. One segment
+        for the page, then one per portal (in the order the server numbered the
+        portal boxes). Each has its nodes' ids in document order, each the difference
+        from the one before times two, plus one for an element holding its own text
+        (whose text node comes next and needs no id); a CRC-32 of the tag sequence
+        ("#" for text) the browser checks its DOM against, catching HTML-parser
+        fix-ups; and, only where present, event specs, properties the HTML cannot set
+        (value, checked...) and js_component mounts.
+
+        None when the browser could not line its DOM up with it: a <textarea> with
+        child nodes, whose text the browser's walk does not enter."""
+        segments: list[dict[str, Any]] = []
+        portals: list[HostNode] = []
+        unsupported = False
+
+        def segment(top: HostNode) -> dict[str, Any]:
+            ids: list[int] = []
+            tags: list[str] = []
+            events: list[list[Any]] = []
+            props: list[list[Any]] = []
+            mounts: list[list[Any]] = []
+            prev = 0
+
+            def walk(host: HostNode) -> None:
+                nonlocal prev, unsupported
+                for node in self._dom_nodes(host.children, portals):
+                    step = (node.id - prev) * 2
+                    prev = node.id
+                    if type(node) is TextNode:
+                        ids.append(step)
+                        tags.append("#")
+                        continue
+                    if isinstance(node.type, JsComponent):
+                        ids.append(step)
+                        tags.append(node.type.tag)
+                        mounts.append(self._js_create(node))
+                        walk(node)
+                        continue
+                    tags.append(node.type)
+                    if node.text:
+                        ids.append(step + 1)
+                        tags.append("#")
+                    else:
+                        ids.append(step)
+                    if node.events:
+                        events.append([node.id, {n: h.spec() for n, h in node.events.items()}])
+                    set_live = {k: v for k, v in node.attrs.items() if k in _LIVE_PROPS}
+                    if set_live:
+                        props.append([node.id, set_live])
+                    if node.type == "textarea":
+                        unsupported = unsupported or bool(node.children)
+                    else:
+                        walk(node)
+
+            walk(top)
+            out: dict[str, Any] = {"ids": ids, "sig": zlib.crc32(",".join(tags).encode())}
+            if events:
+                out["ev"] = events
+            if props:
+                out["pr"] = props
+            if mounts:
+                out["js"] = mounts
+            return out
+
+        with _gc_paused():
+            segments.append(segment(self.container))
+            while portals:
+                node = portals.pop(0)
+                seg = segment(node)
+                seg["box"] = node.id
+                segments.append(seg)
+        return None if unsupported else segments
+
     # ---- scheduling ------------------------------------------------------------
 
     def call(self, fn: Callable[[], None]) -> None:
@@ -847,6 +945,9 @@ class Root:
 
     def request_flush(self) -> None:
         """Send what is pending at the end of this event-loop tick."""
+        if self._holding:
+            self._flush_held = True
+            return
         if self._loop is not None and not self._flush_scheduled and not self._flushing:
             self._flush_scheduled = True
             self._loop.call_soon(self.flush)
@@ -1199,12 +1300,14 @@ class Root:
         ACTIVE_ROOT.set(self)  # this task's context: its handlers, effects and threads
         while True:
             kind, job = await self._queue.get()
-            if kind == "event":
+            if kind == "event" or kind == "batch":
                 self.pending_events -= 1
             self._busy = True
             try:
                 if kind == "event":
                     await self._dispatch_async(*job)
+                elif kind == "batch":
+                    await self._dispatch_batch(*job)
                 else:
                     await self._run_effects_async(job)
                 if self._dirty:
@@ -1404,13 +1507,40 @@ class Root:
 
     # ---- events ----------------------------------------------------------------
 
-    def dispatch(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> None:
+    def dispatch(self, seq: int, node_id: int | list[int], name: str, data: dict[str, Any]) -> None:
         """Deliver a browser event. ``seq`` is acknowledged once the handler finishes,
         which tells the browser that edits it sent before then are reflected.
+
+        ``node_id`` is a list when one native event reached several elements with
+        handlers (the browser delegates from the root, as React does): they run in
+        that order, and the page renders once after all of them, so each sees the
+        state from before the event (``set_n(lambda n: n + 1)`` builds on another's).
 
         Once attached, events queue and run one at a time, each seeing the page as
         the previous one left it; before that (tests, server rendering) they run now.
         """
+        if isinstance(node_id, list):
+            if self._queue is not None:
+                self.pending_events += 1
+                self._queue.put_nowait(("batch", (seq, node_id, name, data)))
+                return
+            calls = self._resolve_batch(seq, node_id, name, data)
+            token = ACTIVE_ROOT.set(self)
+            try:
+                for handler_call in calls:
+                    try:
+                        result = handler_call()
+                    except Exception as exc:
+                        self.report(exc, f"the {name!r} handler")
+                        continue
+                    if inspect.iscoroutine(result):
+                        task = self.spawn(result)
+                        self._pending.add(task)
+                        task.add_done_callback(self._pending.discard)
+            finally:
+                ACTIVE_ROOT.reset(token)
+            self._ack(seq)
+            return
         if node_id == 0 and name == "#reply":
             # Never queued: the handler waiting for this answer may be the one
             # holding the queue's worker.
@@ -1481,12 +1611,62 @@ class Root:
             return None
         return self._after_handler(seq, result)
 
-    def _resolve(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> Callable[[], Any] | None:
-        """The handler call for an event, or None when there is nothing to run."""
-        if node_id == 0:
-            self._special(name, data)
+    async def _dispatch_batch(self, seq: int, node_ids: list[int], name: str, data: dict[str, Any]) -> None:
+        """The handlers one native event reached, in order, with renders held until
+        all have run. ``seq`` is acknowledged once they (and async work they returned)
+        are done."""
+        calls = self._resolve_batch(seq, node_ids, name, data)
+        if not calls:
             self._ack(seq)
-            return None
+            return
+        assert self._loop is not None
+        loop = self._loop
+        action: asyncio.Future[None] = loop.create_future()
+        token = CURRENT_ACTION.set(action)
+        tasks: list[asyncio.Task[Any]] = []
+        self._holding = True
+        try:
+            for call in calls:
+                try:
+                    if self.threaded and not inspect.iscoroutinefunction(call.fn):  # type: ignore[attr-defined]
+
+                        def run(call: Callable[[], Any] = call) -> Any:
+                            _handling.seq = seq
+                            try:
+                                return call()
+                            finally:
+                                _handling.seq = None
+
+                        result = await self._in_thread(run)
+                    else:
+                        result = call()
+                except Exception as exc:
+                    self.report(exc, f"the {name!r} handler")
+                    continue
+                if inspect.iscoroutine(result):
+                    task = self.spawn(result)
+                    self._pending.add(task)
+                    task.add_done_callback(self._pending.discard)
+                    tasks.append(task)
+        finally:
+            CURRENT_ACTION.reset(token)
+            self._holding = False
+            if self._flush_held:
+                self._flush_held = False
+                self.request_flush()
+
+        def finish(_: Any = None) -> None:
+            if all(task.done() for task in tasks):
+                self._ack(seq)
+                if not action.done():
+                    action.set_result(None)
+
+        if not tasks:
+            finish()
+        for task in tasks:
+            task.add_done_callback(finish)
+
+    def _prepare_event_data(self, data: dict[str, Any]) -> None:
         files = data.get("files")
         if isinstance(files, list):
             # Taken out of storage now, whether or not a handler wants them.
@@ -1494,11 +1674,12 @@ class Root:
         form = data.get("form")
         if isinstance(form, list):
             data["form"] = FormFields(form)
+
+    def _handler_call(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> Callable[[], Any] | None:
         node = self.hosts.get(node_id)
         handler = node.events.get(name) if node is not None else None
         fn = handler.fn if handler is not None else None
         if fn is None:
-            self._ack(seq)
             return None
         event = Event(data, self, seq)
         wants = _wants_event(fn)
@@ -1507,6 +1688,23 @@ class Root:
             return fn(event) if wants else fn()
 
         call.fn = fn  # type: ignore[attr-defined]
+        return call
+
+    def _resolve_batch(self, seq: int, node_ids: list[int], name: str, data: dict[str, Any]) -> list[Callable[[], Any]]:
+        self._prepare_event_data(data)
+        calls = [self._handler_call(seq, node_id, name, data) for node_id in node_ids if node_id != 0]
+        return [call for call in calls if call is not None]
+
+    def _resolve(self, seq: int, node_id: int, name: str, data: dict[str, Any]) -> Callable[[], Any] | None:
+        """The handler call for an event, or None when there is nothing to run."""
+        if node_id == 0:
+            self._special(name, data)
+            self._ack(seq)
+            return None
+        self._prepare_event_data(data)
+        call = self._handler_call(seq, node_id, name, data)
+        if call is None:
+            self._ack(seq)
         return call
 
     def _special(self, name: str, data: dict[str, Any]) -> None:
@@ -1728,6 +1926,13 @@ class Root:
         if old_attrs != new_attrs:
             for name, value in new_attrs.items():
                 if old_attrs.get(name, _SKIP) != value:
+                    if name == "style":
+                        changes = style_changes(old_attrs.get(name), value)
+                        if changes is not None:
+                            # Only the properties that changed: the browser keeps the
+                            # rest, and any a script set on the element itself.
+                            ops.append(["p", node.id, "style", changes])
+                            continue
                     ops.append(["p", node.id, name, value])
             for name in old_attrs.keys() - new_attrs.keys():
                 ops.append(["p", node.id, name, None])

@@ -208,6 +208,8 @@ def test_outbox_gives_up_past_its_limit():
 
 
 def _button(message):
+    if "adopt" in message:  # a kept render: only elements with listeners are listed
+        return next(node_id for node_id, events in message["adopt"][0]["ev"] if "click" in events)
     return next(op[1] for op in message["ops"] if op[0] == "c" and op[2] == "button")
 
 
@@ -526,8 +528,9 @@ def test_the_live_connection_takes_over_the_first_render():
         with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&k={token}") as ws:
             first = json.loads(ws.receive_text())
             assert renders == ["/"], "not rendered again"
+            assert "adopt" in first, "the HTML is this render: the compact message"
             dom = FakeDom()
-            dom.adopt(page, first["ops"])
+            dom.adopt(page, first)
             ws.send_text(json.dumps([1, _button(first), "click", {}]))
             dom.apply(json.loads(ws.receive_text())["ops"])
             assert dom.html() == "<div><button>+</button><span>1</span></div>"

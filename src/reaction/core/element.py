@@ -143,10 +143,16 @@ class EventHandler:
         self.form = form
 
     def spec(self) -> list[Any]:
-        return [
+        """What the browser needs: [prevent_default, stop_propagation, debounce,
+        throttle, keys, code, stop_immediate_propagation, form], with trailing
+        defaults left out (most handlers send []); a missing field reads as unset."""
+        spec = [
             self.prevent_default, self.stop_propagation, self.debounce, self.throttle, self.keys,
             self.code, self.stop_immediate_propagation, self.form,
         ]
+        while spec and (spec[-1] is None or spec[-1] is False):
+            spec.pop()
+        return spec
 
 
 def event(
@@ -275,8 +281,32 @@ def _kebab(name: str) -> str:
     return "".join(out)
 
 
-def _style_to_str(style: dict[str, Any]) -> str:
-    return ";".join(f"{_kebab(k)}:{v}" for k, v in style.items() if v is not None and v is not False)
+class Style(str):
+    """A ``style`` attribute written as a dict: the CSS text, which is what the HTML,
+    to_vdom and comparisons see, plus ``props`` (kebab-case name -> value), so an
+    update can send only the properties that changed."""
+
+    __slots__ = ("props",)
+    props: dict[str, str]
+
+
+def _style_to_str(style: dict[str, Any]) -> Style:
+    props = {_kebab(k): str(v) for k, v in style.items() if v is not None and v is not False}
+    text = Style(";".join(f"{k}:{v}" for k, v in props.items()))
+    text.props = props
+    return text
+
+
+def style_changes(old: Any, new: Any) -> dict[str, str | None] | None:
+    """The properties to set (and None to remove) to turn style ``old`` into ``new``,
+    when both came from dicts; None when only the whole text can say it."""
+    if type(old) is not Style or type(new) is not Style:
+        return None
+    before, after = old.props, new.props
+    changes: dict[str, str | None] = {k: v for k, v in after.items() if before.get(k) != v}
+    for k in before.keys() - after.keys():
+        changes[k] = None
+    return changes
 
 
 def _event_name(prop: str) -> str | None:

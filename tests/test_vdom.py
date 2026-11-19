@@ -131,13 +131,16 @@ def test_event_specs_and_submit_prevents_default():
     def App():
         return html.form(
             html.input(on_input=event(lambda e: None, debounce=200)),
+            html.button("go", on_click=lambda: None),
             on_submit=lambda e: None,
         )
 
     root = Root(App())
     creates = {op[2]: op[4] for op in root.ops if op[0] == "c"}
-    assert creates["form"] == {"submit": [True, False, None, None, None, None, False, False]}
-    assert creates["input"] == {"input": [False, False, 200, None, None, None, False, False]}
+    # Trailing defaults are left out: a plain handler's spec is empty.
+    assert creates["form"] == {"submit": [True]}
+    assert creates["input"] == {"input": [False, False, 200]}
+    assert creates["button"] == {"click": []}
 
 
 def test_conditional_child_keeps_sibling_identity():
@@ -834,3 +837,21 @@ def test_state_set_while_rendering_reruns_before_the_children_are_diffed():
     assert h.html() == "<ul><li>4</li><li>5</li><li>6</li></ul>"
     h.root._run_effects()
     assert effects == [(4, 5, 6)], "the effect ran once, with the final value"
+
+
+def test_style_dicts_update_only_the_properties_that_changed():
+    setters = {}
+
+    @component
+    def App():
+        style, set_style = use_state({"left": "5px", "top": "10px", "color": "red"})
+        setters["style"] = set_style
+        return html.div("box", style=style)
+
+    h = Harness(App())
+    assert 'style="left:5px;top:10px;color:red"' in h.html()
+    setters["style"]({"left": "6px", "top": "10px", "background_color": "#eee"})
+    assert h.flush() == [["p", 1, "style", {"left": "6px", "background-color": "#eee", "color": None}]]
+    assert 'style="left:6px;top:10px;background-color:#eee"' in h.html()
+    setters["style"]({"left": "6px", "top": "10px", "background_color": "#eee"})
+    assert h.flush() == [], "an equal style sends nothing"

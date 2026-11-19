@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import zlib
 from html import escape
 from html.parser import HTMLParser
 from typing import Any
@@ -35,6 +36,17 @@ class Node:
 
     def inner(self) -> str:
         return "".join(c.html() for c in self.children)
+
+
+def _merge_style(text: Any, changes: dict[str, Any]) -> str:
+    """A style string after a per-property update (["p", id, "style", {name: value}])."""
+    props = dict(part.split(":", 1) for part in str(text or "").split(";") if ":" in part)
+    for name, value in changes.items():
+        if value is None:
+            props.pop(name, None)
+        else:
+            props[name] = value
+    return ";".join(f"{k}:{v}" for k, v in props.items())
 
 
 class FakeDom:
@@ -76,6 +88,8 @@ class FakeDom:
                 node = self.nodes[op[1]]
                 if op[2] == "#text":
                     self._set_text(node, op[3])
+                elif op[2] == "style" and isinstance(op[3], dict):
+                    node.attrs["style"] = _merge_style(node.attrs.get("style"), op[3])
                 elif op[3] is None:
                     node.attrs.pop(op[2], None)
                 else:
@@ -124,10 +138,18 @@ class FakeDom:
     def html(self) -> str:
         return self.root.inner()
 
-    def adopt(self, page: str, ops: list[list[Any]]) -> None:
+    def adopt(self, page: str, ops: list[list[Any]] | dict[str, Any]) -> None:
         """Take over ``page``'s markup with a hydrate message, as client.js does: the
         HTML gives the structure, the operations give node ids, attributes and events.
-        ``page`` is a whole page, an ``embed()`` snippet, or a fragment of markup."""
+        ``page`` is a whole page, an ``embed()`` snippet, or a fragment of markup.
+        ``ops`` is the message's ops, or the whole message, which may be the compact
+        form (``"adopt"``) sent for a kept render."""
+        if isinstance(ops, dict):
+            if "adopt" in ops:
+                self._adopt_compact(page, ops["adopt"])
+                self.apply(ops["ops"])
+                return
+            ops = ops["ops"]
         if any(op[0] == "P" for op in ops):
             raise AssertionError("FakeDom.adopt does not handle portals")
         found = _dom_order(_body(page), self.root)
@@ -153,6 +175,31 @@ class FakeDom:
             elif op[0] == "j":
                 node.js = {"module": op[3], "export": op[4], "props": op[5]}
         self.apply([op for op in ops if op[0] == "m"])
+
+    def _adopt_compact(self, page: str, segments: list[dict[str, Any]]) -> None:
+        """client.js's adoptCompact: check the page's shape against the checksum, then
+        give the nodes their ids; attributes stay as the HTML has them."""
+        if len(segments) != 1:
+            raise AssertionError("FakeDom.adopt does not handle portals")
+        seg = segments[0]
+        found = _dom_order(_body(page), self.root)
+        expected = len(seg["ids"]) + sum(v & 1 for v in seg["ids"])
+        shape = ",".join("#" if n.tag is None else n.tag for n in found)
+        if len(found) != expected or zlib.crc32(shape.encode()) != seg["sig"]:
+            raise AssertionError(f"the HTML does not match the render: {shape[:200]}")
+        node_id = 0
+        i = 0
+        for v in seg["ids"]:
+            holds_text = v & 1
+            node_id += (v - holds_text) // 2
+            self.nodes[node_id] = found[i]
+            i += 1 + holds_text
+        for node_id, props in seg.get("pr", []):
+            self.nodes[node_id].attrs.update(props)
+        for node_id, events in seg.get("ev", []):
+            self.nodes[node_id].events = dict(events)
+        for op in seg.get("js", []):
+            self.nodes[op[1]].js = {"module": op[3], "export": op[4], "props": op[5]}
 
 
 def _body(page: str) -> str:
@@ -186,6 +233,8 @@ class _Builder(HTMLParser):
         if "data-pyreaction-slot" in names:  # a js_component's Python children
             return
         node = Node(tag)
+        # What the HTML says; a full hydrate message replaces it with the op's attrs.
+        node.attrs = {k: "" if v is None else v for k, v in attrs}
         if not self.opaque:
             self.order.append(node)
             self._add(node)

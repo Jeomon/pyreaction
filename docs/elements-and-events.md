@@ -57,6 +57,12 @@ multi-selects.
 Handlers may be `async`. Plain handlers run in a worker thread, one at a time in
 arrival order, so a slow one (a database call) does not freeze other pages.
 
+As in React, one event that bubbles through several elements with handlers (a
+button inside a clickable card) is one message: the handlers run in order, then
+the page renders once. Each sees the state from before the event, so build on an
+earlier handler's change with the function form, `set_n(lambda n: n + 1)`. A
+handler with `debounce`, `throttle` or a form action sends its own message.
+
 Submit events call `preventDefault` by default. Other options:
 
 ```python

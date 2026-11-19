@@ -28,7 +28,7 @@ def test_keys_filter_is_part_of_the_event_spec():
 
     h = Harness(App())
     spec = next(iter(h.root.hosts.values())).events["keydown"].spec()
-    assert spec == [True, False, None, None, ["Enter", "Escape"], None, False, False]
+    assert spec == [True, False, None, None, ["Enter", "Escape"]]
 
 
 def test_js_component_mounts_updates_and_dispatches():

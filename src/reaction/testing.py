@@ -139,6 +139,30 @@ def _matches(node: TestNode, chain: list[list[tuple[str, str, str | None]]]) -> 
     return not rest
 
 
+def _merge_style(text: Any, changes: dict[str, Any]) -> str:
+    """A style string after a per-property update (["p", id, "style", {name: value}])."""
+    props = dict(part.split(":", 1) for part in str(text or "").split(";") if ":" in part)
+    for name, value in changes.items():
+        if value is None:
+            props.pop(name, None)
+        else:
+            props[name] = value
+    return ";".join(f"{k}:{v}" for k, v in props.items())
+
+
+# Bubbling events client.js listens to once at the root, sending the handlers one
+# event reaches in one message (keep in step with DELEGATED there).
+_DELEGATED = frozenset({
+    "click", "dblclick", "auxclick", "contextmenu", "mousedown", "mouseup", "mousemove",
+    "mouseover", "mouseout", "pointerdown", "pointerup", "pointermove", "pointerover",
+    "pointerout", "pointercancel", "keydown", "keyup", "keypress", "input", "change",
+    "beforeinput", "submit", "reset", "focusin", "focusout", "dragstart", "drag", "dragend",
+    "dragenter", "dragover", "dragleave", "drop", "copy", "cut", "paste", "compositionstart",
+    "compositionupdate", "compositionend", "touchend", "touchcancel", "animationstart",
+    "animationend", "animationiteration", "transitionstart", "transitionend", "transitionrun",
+    "transitioncancel",
+})
+
 class _Dom:
     def __init__(self) -> None:
         self.root = TestNode("#root")
@@ -184,6 +208,8 @@ class _Dom:
                 attrs = self.nodes[op[1]].attrs
                 if op[3] is None:
                     attrs.pop(op[2], None)
+                elif op[2] == "style" and isinstance(op[3], dict):
+                    attrs["style"] = _merge_style(attrs.get("style"), op[3])
                 else:
                     attrs[op[2]] = op[3]
             elif kind == "x":
@@ -368,6 +394,19 @@ class Page:
         if not listeners:
             raise LookupError(f"nothing at or above {target!r} listens to {event!r}")
         payload = {"type": event, **(data or {})}
+        # As client.js: a bubbling event's plain handlers go in one message per phase
+        # (capture, then bubble), run before one render; a handler with debounce,
+        # throttle or a form sends its own message.
+        batch: list[int] = []
+        batch_name = ""
+        delegated = event in _DELEGATED
+
+        def send_batch() -> None:
+            if batch:
+                self._seq += 1
+                self.root.dispatch(self._seq, batch[0] if len(batch) == 1 else list(batch), batch_name, payload)
+                batch.clear()
+
         for owner, name in listeners:
             spec = owner.events[name]
             if len(spec) > 7 and spec[7] and "form" not in payload:
@@ -380,10 +419,18 @@ class Page:
             if keys and payload.get("key") not in keys:
                 continue  # filtered out in the browser: not sent, not stopped
             if not (len(spec) > 5 and spec[5]):  # a js() handler runs in the browser only
-                self._seq += 1
-                self.root.dispatch(self._seq, owner.id, name, payload)
-            if spec[1] or (len(spec) > 6 and spec[6]):
+                deferred = any(len(spec) > i and spec[i] for i in (2, 3, 7))
+                if delegated and not deferred:
+                    if name != batch_name:
+                        send_batch()  # the capture phase's message goes before the bubble's
+                        batch_name = name
+                    batch.append(owner.id)
+                else:
+                    self._seq += 1
+                    self.root.dispatch(self._seq, owner.id, name, payload)
+            if (len(spec) > 1 and spec[1]) or (len(spec) > 6 and spec[6]):
                 break
+        send_batch()
         self.settle()
 
     def click(self, target: str | TestNode) -> None:

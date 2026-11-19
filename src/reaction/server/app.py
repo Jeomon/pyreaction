@@ -232,7 +232,7 @@ def _origin_allowed(conn: HTTPConnection, allowed: Sequence[str]) -> bool:
     return urlsplit(origin).netloc == conn.headers.get("host", "")
 
 
-def _parse_event(text: str) -> tuple[int, int, str, dict[str, Any]] | None:
+def _parse_event(text: str) -> tuple[int, int | list[int], str, dict[str, Any]] | None:
     try:
         message = _loads(text)
     except ValueError:
@@ -240,14 +240,20 @@ def _parse_event(text: str) -> tuple[int, int, str, dict[str, Any]] | None:
     if not (isinstance(message, list) and len(message) == 4):
         return None
     seq, node_id, name, data = message
-    if (
-        type(seq) is not int
-        or type(node_id) is not int
-        or not isinstance(name, str)
-        or not isinstance(data, dict)
-    ):
+    if type(seq) is not int or not isinstance(name, str) or not isinstance(data, dict):
+        return None
+    if type(node_id) is list:
+        # One native event that reached several elements with handlers (client.js
+        # delegates from the root): their ids in order, run before one render.
+        if not 0 < len(node_id) <= _MAX_BATCH or any(type(i) is not int for i in node_id):
+            return None
+    elif type(node_id) is not int:
         return None
     return seq, node_id, name, data
+
+
+# Handlers one native event may reach: far more than any page nests.
+_MAX_BATCH = 256
 
 
 _MAX_HEADER = 64 * 1024
@@ -520,6 +526,8 @@ def create_app(
         # The mount operations were for a browser building the page; it adopts the
         # HTML instead. Element commands still have to run once it connects.
         root.ops = [op for op in root.ops if op[0] == "m"]
+        # The browser's page is this tree's HTML: its first message can say less.
+        root._html_matches = True
         loop = asyncio.get_running_loop()
         timer = loop.call_later(handoff_timeout, drop_handoff, token)
         handoffs[token] = _Handoff(root, timer, loop, request.headers.get("cookie"), url, base)

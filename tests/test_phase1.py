@@ -295,3 +295,59 @@ def test_updates_from_worker_threads_arrive_complete_and_in_order():
     digits, count = asyncio.run(main()).split("|")
     assert digits == "0123456789" * 30, "one thread's updates keep their order"
     assert count == "1000", "updates from two threads at once are all applied"
+
+
+def test_one_event_reaching_several_handlers_renders_once():
+    """A batch (one native event, several elements' handlers): they run in order, the
+    page renders once after all of them, and each sees the state from before."""
+    seen = []
+    renders = []
+    setters = {}
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        renders.append(n)
+        setters["n"] = set_n
+
+        def inner():
+            seen.append(("inner", n))
+            set_n(lambda v: v + 1)
+
+        def outer():
+            seen.append(("outer", n))
+            set_n(lambda v: v + 10)
+
+        return html.div(html.button(n, on_click=inner), on_click=outer)
+
+    async def main():
+        sent = []
+        root = Root(App())
+        root.attach(sent.append)
+        await asyncio.sleep(0.05)
+        renders.clear()
+        button = next(node.id for node in root.hosts.values() if node.type == "button")
+        div = next(node.id for node in root.hosts.values() if node.type == "div")
+        root.dispatch(1, [button, div], "click", {})
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if root.ack == 1 and renders:
+                break
+        await asyncio.sleep(0.05)
+        root.close()
+        return sent
+
+    sent = asyncio.run(main())
+    assert seen == [("inner", 0), ("outer", 0)], "both saw the state from before the event"
+    assert renders == [11], "one render, after both handlers"
+    assert [t for m in sent[1:] for t in op_texts(m["ops"])] == ["11"]
+
+
+def test_batched_event_messages_are_checked():
+    from reaction.server.app import _parse_event
+
+    assert _parse_event('[1, [4, 9], "click", {}]') == (1, [4, 9], "click", {})
+    assert _parse_event('[1, 4, "click", {}]') == (1, 4, "click", {})
+    for bad in ('[1, [], "click", {}]', '[1, ["4"], "click", {}]', '[1, [4, 1.5], "click", {}]',
+                '[1, ' + str(list(range(300))) + ', "click", {}]'):
+        assert _parse_event(bad) is None, bad

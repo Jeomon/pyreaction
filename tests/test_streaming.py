@@ -129,7 +129,5 @@ def test_the_live_connection_takes_over_a_streamed_render():
         with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&k={token}") as ws:
             first = json.loads(ws.receive_text())
         assert first["init"] == "hydrate"
-        assert {"#text": "sales: 42", "class": "loaded"}.items() <= next(
-            op[3] for op in first["ops"] if op[0] == "c" and op[2] == "p"
-        ).items()
+        assert "adopt" in first, "the kept render: the browser adopts its HTML as it is"
         assert len(loads) == 1, "the data was not loaded a second time"

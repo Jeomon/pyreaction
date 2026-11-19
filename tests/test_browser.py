@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from reaction import Suspense, component, event, html, js, js_component, use_data, use_state
+from reaction import Suspense, component, event, html, js, js_component, portal, use_data, use_state
 from reaction.testing import serve
 
 pytestmark = pytest.mark.browser
@@ -792,7 +792,8 @@ def test_scroll_listeners_are_passive_unless_they_may_cancel_in_chrome(page):
         assert ["plain", "wheel", True] in listeners and ["plain", "touchmove", True] in listeners
         assert ["cancels", "wheel", False] in listeners, "prevent_default needs an active listener"
         assert ["js", "wheel", False] in listeners, "js() code might call preventDefault"
-        assert ["click", "click", False] in listeners
+        assert ["pyreaction-root", "click", False] in listeners, "clicks are listened to once, at the root"
+        assert not [entry for entry in listeners if entry[0] == "click"], "not on the button itself"
 
 
 def test_js_handlers_with_the_same_code_compile_once_in_chrome(page):
@@ -810,3 +811,108 @@ def test_js_handlers_with_the_same_code_compile_once_in_chrome(page):
         assert page.evaluate("window.__compiles") == 1
         page.click("#li7")
         assert page.get_attribute("#li7", "data-hit") == "1"
+
+
+def test_a_kept_render_is_adopted_from_a_compact_message_in_chrome(page):
+    """The HTML came from the render the socket takes over: the browser gets ids and
+    listeners, sets what HTML cannot (a select's value), and keeps the attributes."""
+    messages = []
+    page.on("websocket", lambda ws: ws.on("framereceived", lambda payload: messages.append(payload)))
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        return html.div(
+            html.select(html.option("a", value="a"), html.option("b", value="b"), value="b", id="pick"),
+            html.input(type="checkbox", checked=True, id="box"),
+            html.textarea(default_value="notes", id="notes"),
+            html.p("", id="empty"),
+            html.ul([html.li(f"row {i}", class_name="row", data_i=i) for i in range(20)]),
+            html.button(f"n={n}", id="inc", on_click=lambda: set_n(n + 1)),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+        assert '"adopt"' in messages[0] and '"#text"' not in messages[0], "the compact message"
+        assert page.evaluate("[pick.value, box.checked, notes.value]") == ["b", True, "notes"]
+        assert page.get_attribute("li:nth-child(3)", "data-i") == "2"
+        page.click("#inc")
+        page.wait_for_function("document.querySelector('#inc').textContent === 'n=1'")
+        assert page.text_content("li:nth-child(20)") == "row 19"
+
+
+def test_html_the_parser_fixes_up_is_rebuilt_not_adopted_in_chrome(page):
+    @component
+    def App():
+        n, set_n = use_state(0)
+        # No <tbody>: the browser's parser adds one, so the DOM is not the render.
+        return html.div(html.table(html.tr(html.td(f"n={n}", id="cell"))),
+                        html.button("+", id="inc", on_click=lambda: set_n(n + 1)))
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.wait_for_function("document.querySelector('#pyreaction-root').dataset.hydration === 'rebuilt'")
+        page.click("#inc")
+        page.wait_for_function("document.querySelector('#cell').textContent === 'n=1'")
+
+
+def test_style_updates_keep_properties_a_script_set_in_chrome(page):
+    @component
+    def App():
+        x, set_x = use_state(0)
+        return html.div(
+            html.div("box", id="box", style={"position": "relative", "left": f"{x}px", "color": "red !important"}),
+            html.button("move", id="move", on_click=lambda: set_x(x + 10)),
+            html.button("fade", id="fade", on_click=js("document.getElementById('box').style.opacity = '0.5'")),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.click("#fade")
+        page.click("#move")
+        page.wait_for_function("document.querySelector('#box').style.left === '10px'")
+        assert page.evaluate("box.style.opacity") == "0.5", "a property set by a script survives the update"
+        assert page.evaluate("box.style.getPropertyPriority('color')") == "important"
+
+
+def test_one_click_through_nested_handlers_is_one_message_in_chrome(page):
+    sent = []
+    page.on("websocket", lambda ws: ws.on("framesent", lambda payload: sent.append(payload)))
+    log = []
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        return html.div(
+            html.div(
+                html.button(f"n={n}", id="inner", on_click=lambda: (log.append("inner"), set_n(lambda v: v + 1))),
+                html.button("stop", id="stop", on_click=event(lambda: log.append("stop"), stop_propagation=True)),
+                html.input(id="search", on_input=event(lambda e: log.append("search " + e.value), debounce=50)),
+                on_click=lambda: (log.append("card"), set_n(lambda v: v + 10)),
+                on_click_capture=lambda: log.append("capture"),
+                id="card",
+            ),
+            portal(html.button("in portal", id="portal-btn", on_click=lambda: log.append("portal"))),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        sent.clear()
+        page.click("#inner")
+        page.wait_for_function("document.querySelector('#inner').textContent === 'n=11'")
+        clicks = [m for m in sent if '"click' in m]
+        assert len(clicks) == 2, f"capture phase, then bubble phase: {clicks}"
+        assert log == ["capture", "inner", "card"]
+        log.clear()
+        page.click("#stop")
+        page.wait_for_timeout(200)
+        assert log == ["capture", "stop"], "stop_propagation kept the click from the card"
+        log.clear()
+        page.fill("#search", "ada")
+        page.wait_for_timeout(300)
+        assert log == ["search ada"], "a debounced handler still sends once, after its delay"
+        log.clear()
+        page.click("#portal-btn")
+        page.wait_for_timeout(200)
+        assert log == ["portal"], "events inside a portal reach its handlers"

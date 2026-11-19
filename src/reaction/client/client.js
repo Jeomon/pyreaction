@@ -64,6 +64,20 @@
       if (el.textContent !== text) el.textContent = text;
       return;
     }
+    if (name === "style" && value !== null && typeof value === "object") {
+      // Only the properties that changed (null: removed); the rest stay, including
+      // any a script set on the element.
+      for (const k in value) {
+        const v = value[k];
+        if (v === null) el.style.removeProperty(k);
+        else {
+          const important = /\s*!important\s*$/i;
+          if (important.test(v)) el.style.setProperty(k, v.replace(important, ""), "important");
+          else el.style.setProperty(k, v);
+        }
+      }
+      return;
+    }
     if (name === "defaultValue" || name === "defaultChecked") {
       // Uncontrolled: only the starting value; the browser keeps what is typed.
       if (el.localName === "select") {
@@ -161,13 +175,89 @@
   // js() handler code, compiled once however many elements share it.
   const compiled = new Map();
 
+  // Bubbling events are listened to once per root (the page, and each portal box), as
+  // React does: one native event that passes several elements with handlers sends one
+  // message naming them all, and the server runs them in order, then renders once.
+  // Events that do not bubble, and wheel/touch (kept passive per element), listen on
+  // the element itself.
+  const DELEGATED = new Set([
+    "click", "dblclick", "auxclick", "contextmenu", "mousedown", "mouseup", "mousemove", "mouseover",
+    "mouseout", "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout", "pointercancel",
+    "keydown", "keyup", "keypress", "input", "change", "beforeinput", "submit", "reset", "focusin",
+    "focusout", "dragstart", "drag", "dragend", "dragenter", "dragover", "dragleave", "drop", "copy",
+    "cut", "paste", "compositionstart", "compositionupdate", "compositionend", "touchend", "touchcancel",
+    "animationstart", "animationend", "animationiteration", "transitionstart", "transitionend",
+    "transitionrun", "transitioncancel",
+  ]);
+  const delegatedNames = new Set(); // "click", "click:capture"... listened to at the roots
+  const roots = new Set([mount]);
+
+  function delegate(name) {
+    if (delegatedNames.has(name)) return;
+    delegatedNames.add(name);
+    for (const root of roots) listenAtRoot(root, name);
+  }
+
+  // A portal box: events inside it bubble to it, not to the page.
+  function addRoot(box) {
+    if (roots.has(box)) return;
+    roots.add(box);
+    for (const name of delegatedNames) listenAtRoot(box, name);
+  }
+
+  function listenAtRoot(root, name) {
+    const [type, phase] = name.split(":");
+    const capture = phase === "capture";
+    root.addEventListener(type, (e) => dispatchFromRoot(e, root, name, capture), capture);
+  }
+
+  const hasFiles = (t) => t && t.localName === "input" && t.type === "file" && t.files && t.files.length;
+
+  function dispatchFromRoot(e, root, name, capture) {
+    // A portal box inside the page is a root inside a root: handle the event once.
+    const mark = "__pr " + name;
+    if (e[mark]) return;
+    e[mark] = true;
+    const path = [];
+    for (let n = e.target; n; n = n.parentNode) {
+      if (n.__ev && n.__ev[name]) path.push(n);
+      if (n === root) break;
+    }
+    if (capture) path.reverse(); // capture handlers run from the outside in
+    const batch = [];
+    for (const el of path) {
+      const record = el.__ev[name];
+      const [preventDefault, stopPropagation, , , keys, , stopImmediate] = record.spec;
+      // Other keys stay entirely in the browser: not sent, default not prevented.
+      if (keys && !keys.includes(e.key)) continue;
+      if (preventDefault) e.preventDefault();
+      if (record.local) record.runLocal(e);
+      else if (record.deferred || hasFiles(e.target)) record.deliver(e); // its own message, later
+      else batch.push(el);
+      if (stopImmediate) {
+        e.stopImmediatePropagation();
+        break;
+      }
+      if (stopPropagation) {
+        e.stopPropagation();
+        break;
+      }
+    }
+    if (!batch.length) return;
+    const s = ++seq;
+    for (const el of batch) lastSent.set(el, s);
+    if (e.target) lastSent.set(e.target, s);
+    remember(s, e);
+    send([s, batch.length === 1 ? batch[0].__id : batch.map((el) => el.__id), name, serialize(e)]);
+  }
+
   function listen(el, name, spec) {
     const events = el.__ev || (el.__ev = {});
     // "click:capture" listens to click on the way down, before the target's handlers.
     const [type, phase] = name.split(":");
     const capture = phase === "capture";
     const prev = events[name];
-    if (prev) el.removeEventListener(type, prev, capture);
+    if (prev && prev.native) el.removeEventListener(type, prev.native, capture);
     if (spec === null) {
       delete events[name];
       return;
@@ -181,27 +271,22 @@
       remember(s, e);
       send([s, el.__id, name, data]);
     };
-    // A js() handler runs here and sends nothing.
     // A js() handler runs here and sends nothing; one function per distinct code.
     let local = null;
     if (code) {
       local = compiled.get(code);
       if (!local) compiled.set(code, (local = new Function("event", "element", code)));
     }
-    const handler = (e) => {
-      // Other keys stay entirely in the browser: not sent, default not prevented.
-      if (keys && !keys.includes(e.key)) return;
-      if (preventDefault) e.preventDefault();
-      if (stopPropagation) e.stopPropagation();
-      if (stopImmediate) e.stopImmediatePropagation();
-      if (local) {
-        try {
-          local.call(el, e, el);
-        } catch (err) {
-          console.error("pyreaction: js() handler failed", err);
-        }
-        return;
+    const runLocal = (e) => {
+      try {
+        local.call(el, e, el);
+      } catch (err) {
+        console.error("pyreaction: js() handler failed", err);
       }
+    };
+    // Sends this element's event in a message of its own: after its debounce or
+    // throttle, with its form's fields, or once its files have uploaded.
+    const deliver = (e) => {
       if (e.target && e.target !== el) lastSent.set(e.target, seq + 1);
       const data = serialize(e);
       if (withForm) {
@@ -214,7 +299,7 @@
         if (form) data.form = Array.from(new FormData(form, el), ([k, v]) => [k, typeof v === "string" ? v : v.name]);
       }
       const t = e.target;
-      if (t && t.localName === "input" && t.type === "file" && t.files && t.files.length) {
+      if (hasFiles(t)) {
         upload(t.files).then((files) => fire({ ...data, files }, e));
       } else if (debounce) {
         clearTimeout(timer);
@@ -235,12 +320,25 @@
         }
       } else fire(data, e);
     };
-    events[name] = handler;
+    const record = { spec, local, runLocal, deliver, deferred: !!(debounce || throttle || withForm), native: null };
+    events[name] = record;
+    if (DELEGATED.has(type)) {
+      delegate(name);
+      return;
+    }
+    record.native = (e) => {
+      if (keys && !keys.includes(e.key)) return;
+      if (preventDefault) e.preventDefault();
+      if (stopPropagation) e.stopPropagation();
+      if (stopImmediate) e.stopImmediatePropagation();
+      if (local) runLocal(e);
+      else deliver(e);
+    };
     // A wheel or touch listener that cannot cancel the event is passive, so the browser
     // scrolls at once instead of waiting for it (as React does). One that prevents the
     // default, or runs js() code that might, stays active.
     const passive = PASSIVE.has(type) && !preventDefault && !code;
-    el.addEventListener(type, handler, passive ? { capture, passive } : capture);
+    el.addEventListener(type, record.native, passive ? { capture, passive } : capture);
   }
 
   // ---- JavaScript components -------------------------------------------------------
@@ -298,6 +396,7 @@
   }
 
   function forget(node) {
+    roots.delete(node); // a portal box: its delegated listeners go with it
     if (node.__id !== undefined) nodes.delete(node.__id);
     if (node.__js) {
       node.__js.gone = true;
@@ -415,6 +514,7 @@
           el.setAttribute("data-pyreaction-portal", "");
           el.style.display = "contents";
           register(op[1], el);
+          addRoot(el);
           (document.querySelector(op[2]) || document.body).appendChild(el);
           break;
         }
@@ -562,6 +662,7 @@
     const kept = new Set();
     for (const { seg, box, inside } of boxes) {
       register(seg[0][1], box);
+      addRoot(box);
       kept.add(box);
       adopt(seg, inside);
     }
@@ -571,6 +672,83 @@
     }
   }
 
+  // CRC-32, as Python's zlib.crc32: the server's checksum of the page's shape.
+  let crcTable = null;
+  function crc32(text) {
+    if (!crcTable) {
+      crcTable = new Int32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        crcTable[n] = c;
+      }
+    }
+    const bytes = new TextEncoder().encode(text);
+    let crc = -1;
+    for (let i = 0; i < bytes.length; i++) crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    return (crc ^ -1) >>> 0;
+  }
+
+  // Hydration when the HTML came from the server's very tree (a kept render): the
+  // message holds only ids in document order, a checksum of the tags, and what the
+  // HTML cannot carry (listeners, live properties, js_component mounts). The DOM is
+  // checked against the checksum first; false sends the caller back for the whole
+  // tree, as hydrate() does. Attributes are left as the HTML set them.
+  function adoptCompact(segments) {
+    const parts = [{ seg: segments[0], box: mount, found: domOrder(mount) }];
+    for (let k = 1; k < segments.length; k++) {
+      const box = document.querySelector(`[data-pyreaction-portal="${k - 1}"]`);
+      if (!box) return false;
+      parts.push({ seg: segments[k], box, found: domOrder(box) });
+    }
+    for (const { seg, found } of parts) {
+      let expected = seg.ids.length;
+      for (const v of seg.ids) expected += v & 1;
+      const shape = found.map((n) => (n.nodeType === 3 ? "#" : n.localName)).join(",");
+      if (found.length !== expected || crc32(shape) !== seg.sig) {
+        console.warn("pyreaction: the page's markup differs from this render (an HTML fix-up?); rebuilding it");
+        mount.dataset.hydration = "rebuilt";
+        return false;
+      }
+    }
+    mount.dataset.hydration = "adopted";
+    nodes = new Map([[0, mount]]);
+    const kept = new Set();
+    for (const { seg, box, found } of parts) {
+      if (seg.box !== undefined) {
+        register(seg.box, box);
+        addRoot(box);
+        kept.add(box);
+      }
+      // Each entry: the step from the last id, doubled; odd for an element holding
+      // its own text, whose text node is next in the DOM and has no id.
+      let id = 0;
+      let i = 0;
+      for (const v of seg.ids) {
+        const holdsText = v & 1;
+        id += (v - holdsText) / 2;
+        register(id, found[i]);
+        i += 1 + holdsText;
+      }
+      for (const [nid, props] of seg.pr || []) {
+        const el = nodes.get(nid);
+        for (const k in props) setProp(el, k, props[k]);
+      }
+      for (const [nid, events] of seg.ev || []) {
+        const el = nodes.get(nid);
+        for (const k in events) listen(el, k, events[k]);
+      }
+      for (const op of seg.js || []) {
+        const el = nodes.get(op[1]);
+        if (el.__js && el.__js.module === op[3]) updateJs(el, op[5]);
+        else mountJs(el, op[3], op[4], op[5], op[6]);
+      }
+    }
+    for (const box of document.querySelectorAll("[data-pyreaction-portal]")) {
+      if (!kept.has(box)) box.remove();
+    }
+    return true;
+  }
   function clearPortals() {
     for (const el of document.querySelectorAll("[data-pyreaction-portal]")) el.remove();
   }
@@ -760,7 +938,10 @@
       }
       ack = data.ack;
       if (data.init === "hydrate") {
-        if (hydrate(data.ops) === false) {
+        // data.adopt: the HTML is this very render, so the message says only what it
+        // cannot; otherwise the full creation ops, checked node by node.
+        const adopted = data.adopt ? adoptCompact(data.adopt) && (apply(data.ops), true) : hydrate(data.ops);
+        if (adopted === false) {
           send([0, 0, "#mismatch", { path: here() }]); // the server answers with the whole tree
           return;
         }
