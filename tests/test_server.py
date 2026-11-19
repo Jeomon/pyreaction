@@ -685,3 +685,45 @@ def test_elements_holding_their_own_text_are_adopted_and_update():
         dom = FakeDom()
         dom.adopt(page, first["ops"])
         assert dom.html() == "<ul><li>a</li><li></li><li>x &lt; y</li><li>0</li></ul>"
+
+
+def test_one_large_message_is_sent_but_a_backlog_behind_it_still_closes():
+    """A single render bigger than max_pending_ops (10,000 new rows) must go out, or
+    the page would reconnect forever; messages piling up behind it still count."""
+
+    async def go():
+        box = _Outbox(limit=100)
+        box.push({"ops": [["c", i, "tr"] for i in range(1_000)], "ack": 0})
+        first = await box.take()
+        assert first is not None and len(first["ops"]) == 1_000, "the big render is sent"
+        box.push({"ops": [["c", i, "tr"] for i in range(1_000)], "ack": 1})
+        for i in range(101):
+            box.push({"ops": [["x", 1, str(i)]], "ack": 2 + i})
+        return await box.take()
+
+    assert asyncio.run(go()) is None, "a backlog behind the head still closes the socket"
+
+
+def test_a_render_not_handed_off_is_closed_after_its_response():
+    from reaction import Navigate, cache_signal
+
+    closed = []
+
+    @component
+    def App():
+        cache_signal().on_abort(lambda: closed.append(True))
+        if use_location().path == "/old":
+            return Navigate("/new")
+        return html.p("page")
+
+    for handoff in (0, 5):
+        closed.clear()
+        with TestClient(create_app(App, handoff_timeout=handoff)) as client:
+            assert client.get("/old", follow_redirects=False).status_code in (302, 303, 307)
+            assert closed, "a redirect's render is closed once the response is sent"
+            closed.clear()
+            assert "<p>page</p>" in client.get("/").text
+            if handoff == 0:
+                assert closed, "with no hand-off, the render is closed after the response"
+            else:
+                assert not closed, "kept for the page's live connection"

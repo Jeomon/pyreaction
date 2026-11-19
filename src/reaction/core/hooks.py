@@ -135,6 +135,8 @@ def _slot(kind: Callable[..., T], *args: Any) -> tuple[T, bool]:
             )
         return slot, False
     slot = kind(node, *args)
+    if not hooks:
+        node.hooks = hooks = []
     hooks.append(slot)
     return slot, True
 
@@ -266,7 +268,10 @@ def use_effect(fn: Callable[[], Any], deps: Sequence[Any] | None = None) -> None
         slot.before = (slot.fn, slot.deps)
         slot.fn = fn
         slot.deps = None if deps is None else tuple(deps)
-        slot.node.pending_effects.append(slot)
+        pending = slot.node.pending_effects
+        if not pending:
+            slot.node.pending_effects = pending = []
+        pending.append(slot)
 
 
 def use_layout_effect(fn: Callable[[], Any], deps: Sequence[Any] | None = None) -> None:

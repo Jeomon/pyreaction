@@ -128,6 +128,8 @@ def render_portals(root: Root, boundaries: dict[Any, int] | None = None) -> str:
     page's tree first, then each portal's own nested portals), which is how the
     browser pairs them up to adopt them.
     """
+    if not root.portals:
+        return ""  # no walk of the whole tree for nothing (most pages have none)
     queue: list[HostNode] = []
 
     def collect(host: HostNode) -> None:

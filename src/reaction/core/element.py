@@ -586,7 +586,7 @@ class _TagFactory:
                 return Form(*children, **props)
             key, ref, attrs, events = _split_props(props)
             _check_raw(attrs, children)
-            el = Element(self.tag, key, attrs, events, children, ref=ref)
+            el = Element(self.tag, key, attrs, events, children, (), None, ref)
         return _hoist(el) if self.tag in HOISTED else el
 
     def __repr__(self) -> str:
@@ -783,7 +783,7 @@ class Component:
         functools.update_wrapper(self, fn)
 
     def __call__(self, *args: Any, key: Any = None, **kwargs: Any) -> Element:
-        return Element(self, key, args=args, kwargs=kwargs)
+        return Element(self, key, None, None, (), args, kwargs)
 
     def __repr__(self) -> str:
         return f"<component {self.__name__}>"

@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 
 import orjson
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.middleware import Middleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import HTTPConnection, Request
@@ -97,10 +98,14 @@ def _as_factory(app: Component | Element | Callable[[], Element]) -> Callable[[]
 _STREAM_SPLIT = "<!--pyreaction-stream-->"
 
 # Replaces the content between a boundary's <!--pr-s:N--> markers with its chunk.
+# The markers are found by one walk of the page, kept by name in __prM; a boundary
+# whose markers came inside an earlier chunk (or were removed with one) walks again.
 _SWAP = (
-    "<script>function __prSwap(n){var t=document.getElementById('pr-c'+n),"
-    "w=document.createTreeWalker(document.body,128),s,e,c;"
-    "while(c=w.nextNode()){if(c.data==='pr-s:'+n)s=c;else if(c.data==='/pr-s:'+n){e=c;break}}"
+    "<script>function __prSwap(n){var t=document.getElementById('pr-c'+n),m=window.__prM,s,e,c,w;"
+    "function find(){m=window.__prM={};w=document.createTreeWalker(document.body,128);"
+    "while(c=w.nextNode())if(/^\\/?pr-s:/.test(c.data))m[c.data]=c}"
+    "s=m&&m['pr-s:'+n];e=m&&m['/pr-s:'+n];"
+    "if(!s||!e||!s.isConnected||!e.isConnected){find();s=m['pr-s:'+n];e=m['/pr-s:'+n]}"
     "if(!t||!s||!e)return;while(s.nextSibling&&s.nextSibling!==e)s.nextSibling.remove();"
     "e.parentNode.insertBefore(t.content,e);t.remove()}</script>\n"
 )
@@ -351,7 +356,12 @@ class _Uploads:
 
 class _Outbox:
     """Messages waiting for a slow socket are merged into one, up to a limit of
-    operations; past it the connection is closed and the browser starts over."""
+    operations; past it the connection is closed and the browser starts over.
+
+    The message at the head of the queue does not count: it goes next, however big.
+    The limit is for a backlog building up behind it, not for one large render (10,000
+    new rows are 130,000 operations), which would otherwise close the socket, and
+    again on every reconnect, since the reconnect's whole tree is as large."""
 
     def __init__(self, limit: int) -> None:
         self.limit = limit
@@ -363,7 +373,7 @@ class _Outbox:
     def push(self, message: dict[str, Any]) -> None:
         self.pending.append(message)
         self.size += len(message["ops"])
-        if self.size > self.limit:
+        if self.size - len(self.pending[0]["ops"]) > self.limit:
             self.overflow = True
         self.ready.set()
 
@@ -522,7 +532,12 @@ def create_app(
 
     def hand_off(token: str, root: Root, request: Request, url: str, base: str) -> None:
         while len(handoffs) >= max_handoffs:
-            drop_handoff(next(iter(handoffs)))
+            # The oldest waiting render makes way (a browser that never connected: a
+            # bot, a link preview). Closing a large tree takes milliseconds, so it
+            # happens after this response, not on its path.
+            evicted = handoffs.pop(next(iter(handoffs)))
+            evicted.timer.cancel()
+            asyncio.get_running_loop().call_soon(evicted.root.close)
         # The mount operations were for a browser building the page; it adopts the
         # HTML instead. Element commands still have to run once it connects.
         root.ops = [op for op in root.ops if op[0] == "m"]
@@ -571,7 +586,10 @@ def create_app(
             if root.redirect is not None:
                 code = root.status if 300 <= root.status < 400 else 307
                 target = root.redirect if root.redirect_as_is else root.location.href(root.redirect)
-                return RedirectResponse(target, status_code=code, headers=root.headers)
+                handed_off = True  # closed once the response is sent
+                return RedirectResponse(
+                    target, status_code=code, headers=root.headers, background=BackgroundTask(root.close)
+                )
             boundaries: dict[Any, int] = {}
             body = render_to_string(root, boundaries if stream else None)
             portals = render_portals(root, boundaries if stream else None)
@@ -607,7 +625,11 @@ def create_app(
                 response = HTMLResponse(parts[0] + parts[1], status_code=status, headers=root.headers)
                 if token:
                     hand_off(token, root, request, url, base)
-                    handed_off = True
+                else:
+                    # Unmounting a large tree takes milliseconds: after the response is
+                    # sent, so the first byte does not wait for it.
+                    response.background = BackgroundTask(root.close)
+                handed_off = True
                 return response
             handed_off = True  # _stream_page keeps or closes it from here
             return StreamingResponse(
@@ -1222,7 +1244,11 @@ def prerender(
     Call it outside an event loop (in async code, run it in a thread).
     """
     asgi = create_app(app, stream=False, **{"handoff_timeout": 0, **options})
-    script = re.compile(r'<script src="[^"]*/client\.js(\?[^"]*)?"[^>]*></script>\n?')
+    # The client script, and its preload in <head>: a static page has neither.
+    script = re.compile(
+        r'<script src="[^"]*/client\.js(\?[^"]*)?"[^>]*></script>\n?'
+        r'|<link rel="preload" as="script" href="[^"]*/client\.js(\?[^"]*)?">\n?'
+    )
 
     async def render_all() -> dict[str, str]:
         pages: dict[str, str] = {}

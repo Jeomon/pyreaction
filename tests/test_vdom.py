@@ -855,3 +855,25 @@ def test_style_dicts_update_only_the_properties_that_changed():
     assert 'style="left:6px;top:10px;background-color:#eee"' in h.html()
     setters["style"]({"left": "6px", "top": "10px", "background_color": "#eee"})
     assert h.flush() == [], "an equal style sends nothing"
+
+
+def test_mounted_portals_are_counted_so_pages_without_them_skip_the_walk():
+    from reaction import portal
+    from reaction.core.ssr import render_portals
+
+    setters = {}
+
+    @component
+    def App():
+        shown, set_shown = use_state(True)
+        setters["shown"] = set_shown
+        modal = portal(html.div("modal", portal(html.p("nested")))) if shown else None
+        return html.div(html.p("page"), modal)
+
+    root = Root(App())  # not the Harness: its fake DOM has no portal boxes
+    assert root.portals == 2
+    assert "modal" in render_portals(root) and "nested" in render_portals(root)
+    setters["shown"](False)
+    root.flush()
+    assert root.portals == 0, "removing the outer portal drops the nested one too"
+    assert render_portals(root) == ""

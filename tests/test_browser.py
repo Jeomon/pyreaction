@@ -916,3 +916,59 @@ def test_one_click_through_nested_handlers_is_one_message_in_chrome(page):
         page.click("#portal-btn")
         page.wait_for_timeout(200)
         assert log == ["portal"], "events inside a portal reach its handlers"
+
+
+def test_many_and_nested_streamed_boundaries_swap_in_chrome(page):
+    """__prSwap finds markers from one cached walk; a boundary whose markers arrived
+    inside an earlier chunk (nested) is found by walking again."""
+    @component
+    def Slow(delay, text, inner=None):
+        async def load():
+            await asyncio.sleep(delay)
+            return text
+
+        value = use_data(load)
+        return html.div(html.p(value, class_name="loaded"), inner)
+
+    @component
+    def App():
+        nested = Suspense(Slow(0.4, "inner done"), fallback=html.p("inner loading"))
+        return html.main(
+            html.ul([html.li(f"row {i}") for i in range(2000)]),
+            [Suspense(Slow(0.05 + i * 0.01, f"part {i}"), fallback=html.p(f"loading {i}"), key=i) for i in range(8)],
+            Suspense(Slow(0.2, "outer done", nested), fallback=html.p("outer loading")),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        texts = page.eval_on_selector_all(".loaded", "els => els.map(e => e.textContent)")
+        assert sorted(texts) == sorted([f"part {i}" for i in range(8)] + ["outer done", "inner done"])
+        assert "loading" not in page.text_content("main")
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+
+
+def test_rows_removed_and_created_again_still_take_clicks_in_chrome(page):
+    """Removed rows' ids are dropped later, when the browser is idle; rows created
+    after them (new ids) and a row clicked right after a removal still work."""
+    picked = []
+
+    @component
+    def App():
+        rows, set_rows = use_state(list(range(500)))
+        return html.div(
+            html.button("clear", id="clear", on_click=lambda: set_rows([])),
+            html.button("fill", id="fill", on_click=lambda: set_rows(list(range(1000, 1500)))),
+            html.ul([html.li(f"row {i}", id=f"r{i}", on_click=lambda i=i: picked.append(i), key=i) for i in rows]),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.click("#clear")
+        page.wait_for_function("document.querySelectorAll('li').length === 0")
+        page.click("#fill")
+        page.wait_for_function("document.querySelectorAll('li').length === 500")
+        page.click("#r1499")
+        page.wait_for_timeout(300)  # past the idle cleanup of the removed rows
+        page.click("#r1000")
+        page.wait_for_timeout(200)
+        assert picked == [1499, 1000]

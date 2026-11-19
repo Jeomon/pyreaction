@@ -44,7 +44,8 @@ def test_shell_arrives_before_the_data_and_chunks_follow():
     assert "<h1>Dashboard</h1>" in first
     assert "Loading sales..." in first and "Loading users..." in first
     assert "<!--pr-s:1-->" in first and "<!--/pr-s:1-->" in first
-    assert "client.js" not in first, "the client script comes last, once the page is complete"
+    assert "<script src=" not in first, "the client script runs last, once the page is complete"
+    assert '<link rel="preload" as="script"' in first, "but the browser starts fetching it with the shell"
 
     whole = "".join(text for _, text in chunks)
     assert '<template id="pr-c1"><div style="display:contents"><p class="loaded">sales: 42</p></div></template>' in whole

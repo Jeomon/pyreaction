@@ -46,6 +46,7 @@ import zlib
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from operator import is_
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -109,6 +110,7 @@ def _gc_paused() -> Iterator[None]:
 class TextNode:
     __slots__ = ("id", "text", "key", "parent")
     type = str
+    memo = False
 
     def __init__(self, id: int, text: str, key: Any, parent: Any) -> None:
         self.id = id
@@ -122,6 +124,7 @@ class HostNode:
         "id", "type", "key", "parent", "element", "attrs", "events", "children", "dom", "depth", "ns",
         "ref_cleanup", "text", "reshaped",
     )
+    memo = False
 
     def __init__(self, id: int, element: Element, key: Any, parent: Any) -> None:
         self.id = id
@@ -132,8 +135,8 @@ class HostNode:
         self.attrs = element.attrs
         self.events = element.events
         self.ref_cleanup: Callable[[], Any] | None = None
-        self.children: list[Any] = []
-        self.dom: list[int] = []
+        self.children: Any = ()  # a list once it has child nodes
+        self.dom: Any = ()
         self.depth = parent.depth + 1 if parent is not None else 0
         self.ns = _namespace(self.type, parent)
         # Its only child as text, kept here instead of as a TextNode (None: it has children).
@@ -167,6 +170,7 @@ class ComponentNode:
         "type", "key", "parent", "root", "element", "depth", "children", "hooks",
         "hook_index", "pending_effects", "dirty", "mounted", "value", "subscribers",
         "subscriptions", "catch", "suspend", "waiting", "hook_count", "strict", "profile", "view_transition",
+        "memo",
     )
 
     def __init__(self, root: Root, element: Element, key: Any, parent: Any) -> None:
@@ -176,10 +180,12 @@ class ComponentNode:
         self.root = root
         self.element = element
         self.depth = parent.depth + 1
+        # A memo component: a parent's render may skip it when its props are the same.
+        self.memo = type(element.type) is Component and element.type.memo
         self.children: list[Any] = []
-        self.hooks: list[Any] = []
+        self.hooks: Any = ()  # a list from the first hook on
         self.hook_index = 0
-        self.pending_effects: list[EffectSlot] = []
+        self.pending_effects: Any = ()
         self.dirty = False
         self.mounted = True
         self.value: Any = element.kwargs.get("value") if isinstance(element.type, Context) else None
@@ -517,20 +523,30 @@ def _stable_positions(seq: list[int]) -> set[int]:
     return keep
 
 
+_NO_PROP: Any = object()
+
+
 def _same_props(new: Element, old: Element) -> bool:
     """Whether a memo component can skip rendering: every prop ``same`` as before.
 
-    The identity test before ``same`` saves a call for the common case of a value
-    passed through unchanged; this runs once per memo child on every parent render."""
-    if len(new.args) != len(old.args) or new.kwargs.keys() != old.kwargs.keys():
-        return False
-    for a, b in zip(new.args, old.args):
-        if a is not b and not same(a, b):
+    Props passed through unchanged are the same objects, so one identity pass in C
+    (``map(is_, ...)``) settles most calls; ``same`` runs only when it fails."""
+    new_args, old_args = new.args, old.args
+    if new_args is not old_args:
+        if len(new_args) != len(old_args):
             return False
-    old_kwargs = old.kwargs
-    for name, value in new.kwargs.items():
-        before = old_kwargs[name]
-        if value is not before and not same(value, before):
+        if not all(map(is_, new_args, old_args)):
+            for a, b in zip(new_args, old_args):
+                if a is not b and not same(a, b):
+                    return False
+    new_kwargs, old_kwargs = new.kwargs, old.kwargs
+    if new_kwargs is old_kwargs:  # both the shared empty dict: positional props only
+        return True
+    if len(new_kwargs) != len(old_kwargs):
+        return False
+    for name, value in new_kwargs.items():
+        before = old_kwargs.get(name, _NO_PROP)
+        if value is not before and (before is _NO_PROP or not same(value, before)):
             return False
     return True
 
@@ -552,8 +568,16 @@ def _only_text(item: Element) -> str | None:
         return str(child)
     return None
 
+# Keys of unkeyed children in a top-level child list, made once: ("#", index).
+# Keyed children there use their key itself (a tuple key is wrapped as ("$", key)),
+# and children of nested lists keep tuple keys starting with ints or a tuple, so
+# the three kinds never collide.
+_POSITIONS = tuple(("#", i) for i in range(256))
+
+
 def _flatten_items(
-    items: Iterable[Any], prefix: tuple[Any, ...], out: list[tuple[Any, Any]], unkeyed: list[int] | None = None
+    items: Iterable[Any], prefix: tuple[Any, ...], out: list[tuple[Any, Any]], unkeyed: list[int] | None = None,
+    in_list: bool = False,
 ) -> None:
     """Children as (key, item) pairs. Keys are scoped to the list they came from, and
     None/False holes keep their index, so a conditional child never shifts its siblings.
@@ -562,29 +586,37 @@ def _flatten_items(
     counted into ``unkeyed``, for the debug warning."""
     # Exact types first (the common cases, and cheaper than isinstance); text always
     # comes out as a plain str, so later steps can test ``type(item) is str``.
-    key: tuple[Any, ...]
+    top = not prefix
+    positions = _POSITIONS
     for i, item in enumerate(items):
         if item is None or item is True or item is False:
             continue
         kind = type(item)
+        if top:
+            pos = positions[i] if i < 256 else ("#", i)
+        else:
+            pos = (*prefix, i)
         if kind is Element or (kind is not str and isinstance(item, Element)):
-            if item.key is not None:
-                key = (prefix, "$", item.key)
-            else:
-                key = (*prefix, i)
-                if prefix and unkeyed is not None:
-                    unkeyed.append(i)
-            out.append((key, item))
+            k = item.key
+            if k is not None:
+                if top:
+                    out.append((k if type(k) is not tuple else ("$", k), item))
+                else:
+                    out.append(((prefix, "$", k), item))
+                continue
+            if (prefix or in_list) and unkeyed is not None:
+                unkeyed.append(i)
+            out.append((pos, item))
         elif kind is str:
-            out.append(((*prefix, i), item))
+            out.append((pos, item))
         elif isinstance(item, str):
-            out.append(((*prefix, i), str(item)))
+            out.append((pos, str(item)))
         elif isinstance(item, (int, float)):
-            out.append(((*prefix, i), str(item)))
+            out.append((pos, str(item)))
         elif isinstance(item, (list, tuple)) or inspect.isgenerator(item):
             _flatten_items(item, (*prefix, i), out, unkeyed)
         else:
-            out.append(((*prefix, i), str(item)))
+            out.append((pos, str(item)))
 
 
 class Root:
@@ -649,6 +681,9 @@ class Root:
         # Mounted ViewTransition components: while there are none, a dirty component
         # need not look up through its ancestors for one.
         self._view_transitions = 0
+        # Mounted portals: while there are none, the page's HTML needs no portal boxes
+        # and render_portals need not walk the tree looking for them.
+        self.portals = 0
         self._transition_types: list[str] = []
         # Components that called browser() before the page was live, and how to make
         # the Suspense boundaries showing their fallbacks show them once it is.
@@ -1757,7 +1792,12 @@ class Root:
     def _reconcile(self, parent: Any, old: list[Any], items: Iterable[Any]) -> list[Any]:
         pairs: list[tuple[Any, Any]] = []
         unkeyed: list[int] | None = [] if self.debug else None
-        _flatten_items(items, (), pairs, unkeyed)
+        # A lone list (html.ul([...])) is the child list itself, as React's
+        # props.children is the array: its children take the cheap top-level keys.
+        if type(items) is tuple and len(items) == 1 and type(items[0]) is list:
+            _flatten_items(items[0], (), pairs, unkeyed, True)
+        else:
+            _flatten_items(items, (), pairs, unkeyed)
         if unkeyed and len(unkeyed) > 1:
             self._warn_unkeyed(parent)
         result: list[Any] = []
@@ -1767,7 +1807,7 @@ class Root:
             seen: set[Any] = set()
             for i, (key, item) in enumerate(pairs):
                 if key in seen:
-                    logger.warning("Duplicate key %r under %s", key[-1], getattr(parent, "name", parent.type))
+                    logger.warning("Duplicate key %r under %s", key, getattr(parent, "name", parent.type))
                     key = (key, i)
                 seen.add(key)
                 result.append(self._mount(item, key, parent))
@@ -1790,9 +1830,14 @@ class Root:
             item_type = str if type(item) is str else item.type
             if prev.key != key or not (prev.type is item_type or prev.type == item_type):
                 break
-            update(prev, item)
-            result.append(prev)
+            # A memo child with the same props, tested here rather than in _update:
+            # one call fewer for each of a long list's unchanged rows.
+            if prev.memo and not prev.dirty and (prev.element is item or _same_props(item, prev.element)):
+                prev.element = item
+            else:
+                update(prev, item)
             start += 1
+        result = old[:start]
         end_old, end_new = n_old, n_new
         while end_old > start and end_new > start:
             key, item = pairs[end_new - 1]
@@ -1802,11 +1847,12 @@ class Root:
                 break
             end_old -= 1
             end_new -= 1
-        # A different length, a new node, or an old one in another place reshapes the list.
-        reshaped = n_old != n_new
-        leftovers: Iterable[Any] = ()
+        # A new node, or an old one in another place, reshapes the list: its host's DOM
+        # order is synced. Removals alone need no sync: their "r" ops are the change.
+        reshaped = False
+        leftovers: list[Any] = []
         if start < end_new:
-            by_key = {old[i].key: old[i] for i in range(start, end_old)}
+            by_index = {old[i].key: i for i in range(start, end_old)}
             # The ends' keys are the old children's there, so they cannot repeat each
             # other; only a key between them can repeat one of theirs.
             seen = set()
@@ -1814,34 +1860,52 @@ class Root:
                 seen.update(pairs[i][0] for i in range(start))
             if end_new < n_new:
                 seen.update(pairs[i][0] for i in range(end_new, n_new))
+            last = -1
             for i in range(start, end_new):
                 key, item = pairs[i]
                 if key in seen:
-                    logger.warning("Duplicate key %r under %s", key[-1], getattr(parent, "name", parent.type))
+                    logger.warning("Duplicate key %r under %s", key, getattr(parent, "name", parent.type))
                     key = (key, i)
                 seen.add(key)
-                prev = by_key.pop(key, None)
+                j = by_index.pop(key, -1)
+                prev = old[j] if j >= 0 else None
                 item_type = str if type(item) is str else item.type
                 if prev is not None and (prev.type is item_type or prev.type == item_type):
                     update(prev, item)
-                    if not reshaped and old[i] is not prev:
-                        reshaped = True
+                    if j < last:
+                        reshaped = True  # moved
+                    last = j
                     result.append(prev)
                 else:
                     if prev is not None:
                         self._unmount(prev, emit=True)
                     reshaped = True
                     result.append(self._mount(item, key, parent))
-            leftovers = by_key.values()
+            leftovers = [old[j] for j in by_index.values()]
         elif start < end_old:
             leftovers = old[start:end_old]  # only removals between the ends
         shift = n_old - n_new
         for i in range(end_new, n_new):
             prev = old[i + shift]
-            update(prev, pairs[i][1])
+            item = pairs[i][1]
+            if prev.memo and not prev.dirty and (prev.element is item or _same_props(item, prev.element)):
+                prev.element = item
+            else:
+                update(prev, item)
             result.append(prev)
-        for leftover in leftovers:
-            self._unmount(leftover, emit=True)
+        if leftovers:
+            host = parent if type(parent) is HostNode else self._host_of(parent)
+            if not reshaped and not host.reshaped:
+                # Only removals: drop their DOM ids from the host's order, no sync.
+                if host is parent and not result:
+                    host.dom = []
+                    gone = None
+                else:
+                    gone = set(self._dom_ids(leftovers))
+                if gone:
+                    host.dom = [node_id for node_id in host.dom if node_id not in gone]
+            for leftover in leftovers:
+                self._unmount(leftover, emit=True)
         if reshaped:
             self._mark_reshaped(parent)
         return result
@@ -1856,6 +1920,7 @@ class Root:
             self.hosts[host.id] = host
             if item.type == PORTAL:
                 host.ns = None
+                self.portals += 1
                 self.ops.append(["P", host.id, item.attrs["target"]])
             else:
                 self.ops.append(self._js_create(host))
@@ -1954,8 +2019,8 @@ class Root:
                 # It had child nodes: they go, and its own text takes their place.
                 for child in node.children:
                     self._unmount(child, emit=True)
-                node.children = []
-                node.dom = []
+                node.children = ()
+                node.dom = ()
                 ops.append(["p", node.id, TEXT, text])
             elif text != node.text:
                 ops.append(["p", node.id, TEXT, text])
@@ -1994,11 +2059,12 @@ class Root:
                     effects = [(h, h.fn, h.deps) for h in node.hooks if isinstance(h, EffectSlot)]
                     kind.fn(*item.args, **item.kwargs)
                     # Undo what that render did to the hooks, so the real one decides.
-                    del node.hooks[hooks:]
+                    if hooks < len(node.hooks):
+                        del node.hooks[hooks:]
                     for slot, fn, deps in effects:
                         slot.fn, slot.deps = fn, deps
                     node.hook_index = 0
-                    node.pending_effects.clear()
+                    node.pending_effects = ()
                 out = kind.fn(*item.args, **item.kwargs)
                 self._check_hook_count(node)
                 reruns = 0
@@ -2013,14 +2079,14 @@ class Root:
                     node.dirty = False
                     for slot in node.pending_effects:
                         slot.fn, slot.deps = slot.before
-                    node.pending_effects.clear()
+                    node.pending_effects = ()
                     node.hook_index = 0
                     out = kind.fn(*item.args, **item.kwargs)
                     self._check_hook_count(node)
             except Suspended as waiting:
                 # Waiting for data: show the nearest Suspense fallback meanwhile. The
                 # hook re-renders this component when the data arrives.
-                node.pending_effects.clear()
+                node.pending_effects = ()
                 boundary = self._boundary_for(node, "suspend")
                 if isinstance(waiting, BrowserOnly):
                     # Left to the browser: rendered (empty) here, again once live.
@@ -2036,7 +2102,7 @@ class Root:
                     return
                 out = None
             except Exception as exc:
-                node.pending_effects.clear()
+                node.pending_effects = ()
                 self._render_failed(node, exc)
                 if node.children:
                     return  # keep showing the last good output
@@ -2059,7 +2125,7 @@ class Root:
         if node.pending_effects:
             # Queued after the children's, so children's effects run first, as in React.
             self._effects.extend(node.pending_effects)
-            node.pending_effects.clear()
+            node.pending_effects = ()
 
     def _add_profile(self, node: ComponentNode, phase: str, seconds: float, start: float) -> None:
         entry = self._profiles.get(node)
@@ -2197,50 +2263,75 @@ class Root:
         return ["c", host.id, host.type]
 
     def _unmount(self, node: Any, emit: bool) -> None:
-        if isinstance(node, TextNode):
+        kind = type(node)
+        if kind is TextNode:
             if emit:
                 self.ops.append(["r", node.id])
             return
-        if isinstance(node, HostNode):
+        if kind is HostNode:
             # A portal's content lives elsewhere in the page, so removing an
             # ancestor does not take it along: it is always removed itself.
             if emit or node.type == PORTAL:
                 self.ops.append(["r", node.id])
-            del self.hosts[node.id]
-            node.reshaped = False  # gone: nothing to sync, even if it was waiting for it
-            self._release_ref(node)
-            for child in node.children:
-                self._unmount(child, emit=False)
-            node.children = []  # no parent <-> child cycle left for the garbage collector
+            self._drop_host(node)
             return
+        self._unmount_component(node, emit)
+
+    def _drop_host(self, node: HostNode) -> None:
+        """A removed host and what is under it: no "r" ops (its own removal took them),
+        except for portals, whose DOM lives elsewhere. Exact type tests and no call
+        per text node or ref-less host: this runs for every node of a removed tree."""
+        del self.hosts[node.id]
+        node.reshaped = False
+        if node.type == PORTAL:
+            self.portals -= 1
+        if node.element.ref is not None:
+            self._release_ref(node)
+        children = node.children
+        if children:
+            node.children = []  # no parent <-> child cycle left for the garbage collector
+            for child in children:
+                kind = type(child)
+                if kind is HostNode:
+                    if child.type == PORTAL:
+                        self.ops.append(["r", child.id])
+                    self._drop_host(child)
+                elif kind is not TextNode:
+                    self._unmount_component(child, False)
+
+    def _unmount_component(self, node: ComponentNode, emit: bool) -> None:
         node.mounted = False
         if node.view_transition:
             node.view_transition = False
             self._view_transitions -= 1
         node.dirty = False
-        for child in node.children:
-            self._unmount(child, emit)
-        for slot in node.hooks:
-            if isinstance(slot, EffectSlot):
-                self._cleanup(slot)
-            elif hasattr(slot, "dispose"):
-                # Subscriptions and background work a hook started.
-                try:
-                    slot.dispose()
-                except Exception as exc:
-                    self.report(exc, f"unmounting {node.name}")
-        for provider in node.subscriptions or ():
-            if provider.subscribers is not None:
-                provider.subscribers.discard(node)
-        self._location_subs.discard(node)
-        if self._head.pop(node, None) is not None:
+        children = node.children
+        if children:
+            node.children = []
+            for child in children:
+                self._unmount(child, emit)
+        hooks = node.hooks
+        if hooks:
+            node.hooks = []
+            for slot in hooks:
+                if type(slot) is EffectSlot:
+                    if slot.cleanup is not None:
+                        self._cleanup(slot)
+                elif hasattr(slot, "dispose"):
+                    # Subscriptions and background work a hook started.
+                    try:
+                        slot.dispose()
+                    except Exception as exc:
+                        self.report(exc, f"unmounting {node.name}")
+        if node.subscriptions is not None:
+            for provider in node.subscriptions:
+                if provider.subscribers is not None:
+                    provider.subscribers.discard(node)
+            node.subscriptions = None
+        if self._location_subs:
+            self._location_subs.discard(node)
+        if self._head and self._head.pop(node, None) is not None:
             self._head_dirty = True
-        # Hook slots hold closures over this node, and children point back at it:
-        # dropping them lets reference counting free the subtree at once, instead of
-        # leaving hundreds of thousands of objects for the cycle collector.
-        node.children = []
-        node.hooks = []
-        node.subscriptions = None
         node.subscribers = None
 
     # ---- tree helpers ----------------------------------------------------------

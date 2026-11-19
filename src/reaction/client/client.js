@@ -395,9 +395,21 @@
     nodes.set(id, node);
   }
 
+  // Removed subtrees' ids are dropped once the browser is idle, as React detaches
+  // deleted fibers after the commit: the update that removed them paints first, and
+  // the server never names a removed node again.
+  const graveyard = [];
+  const later = typeof requestIdleCallback === "function"
+    ? (f) => requestIdleCallback(f, { timeout: 200 })
+    : (f) => setTimeout(f, 50);
+  function bury() {
+    for (const node of graveyard.splice(0)) forget(node);
+  }
+
   function forget(node) {
     roots.delete(node); // a portal box: its delegated listeners go with it
-    if (node.__id !== undefined) nodes.delete(node.__id);
+    // Only its own entry: a new session (or a rebuild) may reuse the id by now.
+    if (node.__id !== undefined && nodes.get(node.__id) === node) nodes.delete(node.__id);
     if (node.__js) {
       node.__js.gone = true;
       const handle = node.__js.handle;
@@ -520,9 +532,13 @@
         }
         case "A": {
           const parent = nodes.get(op[1]);
-          const frag = document.createDocumentFragment();
-          for (const id of op[2]) frag.appendChild(nodes.get(id));
-          inside(parent).appendChild(frag);
+          const box = inside(parent);
+          if (box.isConnected) {
+            // On the page: one insertion, so the page is laid out once.
+            const frag = document.createDocumentFragment();
+            for (const id of op[2]) frag.appendChild(nodes.get(id));
+            box.appendChild(frag);
+          } else for (const id of op[2]) box.appendChild(nodes.get(id)); // a new element: nothing to lay out yet
           // A <select> can only take its value once its options exist.
           selectValue(parent);
           break;
@@ -537,7 +553,12 @@
           const node = nodes.get(op[1]);
           if (node) {
             node.remove();
-            forget(node);
+            nodes.delete(op[1]);
+            if (node.__js) forget(node); // a module's own unmount runs at once
+            else {
+              graveyard.push(node);
+              if (graveyard.length === 1) later(bury);
+            }
           }
           break;
         }
