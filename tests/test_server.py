@@ -330,3 +330,38 @@ def test_a_page_that_floods_events_is_disconnected_and_resumes():
     finally:
         vdom.Root.attach = attach
         vdom.Root.dispatch = dispatch
+
+
+# ---- settings from PYREACTION_* environment variables -------------------------------------------
+
+
+def test_environment_variables_set_options_not_passed_in_code(monkeypatch):
+    from reaction.server.settings import UNSET, resolve
+
+    monkeypatch.setenv("PYREACTION_DEBUG", "yes")
+    monkeypatch.setenv("PYREACTION_ALLOWED_ORIGINS", "https://a.example, https://b.example")
+    monkeypatch.setenv("PYREACTION_MAX_PENDING_EVENTS", "20")
+    monkeypatch.setenv("PYREACTION_RESUME_TIMEOUT", "2.5")
+    assert resolve("debug", UNSET) is True
+    assert resolve("debug", False) is False, "code wins over the environment"
+    assert resolve("allowed_origins", UNSET) == ["https://a.example", "https://b.example"]
+    assert resolve("max_pending_events", UNSET) == 20
+    assert resolve("resume_timeout", UNSET) == 2.5
+    assert resolve("stream", UNSET) is True, "unset variables take the default"
+    monkeypatch.setenv("PYREACTION_MAX_UPLOAD_SIZE", "lots")
+    with pytest.raises(ValueError, match="PYREACTION_MAX_UPLOAD_SIZE='lots'"):
+        resolve("max_upload_size", UNSET)
+
+
+def test_environment_settings_reach_the_page(monkeypatch):
+    @component
+    def App():
+        return html.p("hi")
+
+    monkeypatch.setenv("PYREACTION_RECONNECT_MAX", "3000")
+    monkeypatch.setenv("PYREACTION_RECONNECT_ATTEMPTS", "12")
+    with TestClient(create_app(App)) as client:
+        page = client.get("/").text
+    assert 'data-reconnect-max="3000" data-reconnect-attempts="12"' in page
+    with TestClient(create_app(App, reconnect_attempts=4)) as client:
+        assert 'data-reconnect-attempts="4"' in client.get("/").text

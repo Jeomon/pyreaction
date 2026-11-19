@@ -18,11 +18,11 @@ from .. import __version__
 TEMPLATES = Path(__file__).parent / "templates"
 
 
-def _local_source() -> Path | None:
-    """The folder pyreaction was installed from, when it was a local path rather than an index.
+def _install_source() -> tuple[str, str] | None:
+    """Where pyreaction was installed from, when not from an index: ("path", folder)
+    for a local folder, ("git", url) for a Git repository.
 
-    A project made by such an install points at the same folder, since the package
-    may not be on PyPI in that version.
+    A new project points at the same place, since that version may not be on PyPI.
     """
     try:
         raw = metadata.distribution("pyreaction").read_text("direct_url.json")
@@ -30,11 +30,15 @@ def _local_source() -> Path | None:
         return None
     if not raw:
         return None
-    url = json.loads(raw).get("url", "")
+    info = json.loads(raw)
+    url = info.get("url", "")
+    vcs = info.get("vcs_info")
+    if vcs and vcs.get("vcs") == "git" and not url.startswith("file://"):
+        return "git", url
     if not url.startswith("file://"):
         return None
     path = Path(unquote(urlparse(url).path))
-    return path if (path / "pyproject.toml").is_file() else None
+    return ("path", path.as_posix()) if (path / "pyproject.toml").is_file() else None
 
 
 def _render_template(src: Path, dest: Path, values: dict[str, str]) -> list[Path]:
@@ -76,11 +80,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         return 1
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", dest.name).strip("-._") or "app"
 
-    source = _local_source()
-    if source is not None:
-        sources = f'\n[tool.uv.sources]\npyreaction = {{ path = "{source.as_posix()}", editable = true }}\n'
-    else:
+    source = _install_source()
+    if source is None:
         sources = ""
+    elif source[0] == "git":
+        sources = f'\n[tool.uv.sources]\npyreaction = {{ git = "{source[1]}" }}\n'
+    else:
+        sources = f'\n[tool.uv.sources]\npyreaction = {{ path = "{source[1]}", editable = true }}\n'
     values = {"name": name, "dependency": f"pyreaction>={__version__}", "sources": sources}
 
     dest.mkdir(parents=True, exist_ok=True)
@@ -89,7 +95,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     for f in files:
         print(f"  {f.as_posix()}")
     if source is not None:
-        print(f"  (pyreaction comes from your local copy at {source})")
+        where = "your local copy at" if source[0] == "path" else "the Git repository"
+        print(f"  (pyreaction comes from {where} {source[1]})")
 
     if not args.no_git and shutil.which("git") and not _inside_git_repo(dest):
         subprocess.run(["git", "init", "-q"], cwd=dest, check=False)

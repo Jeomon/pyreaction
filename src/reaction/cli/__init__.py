@@ -7,6 +7,7 @@ does: ``reaction --port 8000`` is ``reaction run --port 8000``.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .. import __version__
@@ -41,8 +42,15 @@ def build_parser() -> argparse.ArgumentParser:
         ("run", cmd_run, "serve the project for production (the default)"),
     ):
         p = sub.add_parser(name, help=text)
-        p.add_argument("--host", default="127.0.0.1")
-        p.add_argument("--port", type=int, default=8000)
+        # Containers and hosting platforms set these; PORT is the common convention.
+        p.add_argument(
+            "--host", default=os.environ.get("PYREACTION_HOST", "127.0.0.1"),
+            help="address to listen on (default: $PYREACTION_HOST, else 127.0.0.1)",
+        )
+        p.add_argument(
+            "--port", type=int, default=int(os.environ.get("PYREACTION_PORT") or os.environ.get("PORT") or 8000),
+            help="port to listen on (default: $PYREACTION_PORT, then $PORT, else 8000)",
+        )
         if name == "run":
             p.add_argument("--log-level", default="info")
         p.set_defaults(func=func)

@@ -1,11 +1,12 @@
 # pyreaction
 
-React-style UI components in pure Python. Components run on the server; the
-browser gets server-rendered HTML for the first paint, then small DOM patches
-over a WebSocket. No JavaScript to write and no build step.
+**React-style UI components in pure Python.** Components run on the server; the
+browser gets server-rendered HTML for the first paint, then small DOM patches over
+a WebSocket. No JavaScript to write, no build step, no Node.
 
-It is installed as `pyreaction` and imported as `reaction`; the command is
-`reaction` (`pyreaction` works too, so `uvx pyreaction ...` does).
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![Typed](https://img.shields.io/badge/typing-mypy%20checked-informational)
+![Status](https://img.shields.io/badge/status-pre--release%200.1-orange)
 
 ```python
 from reaction import component, html, run, use_state
@@ -18,13 +19,84 @@ def Counter():
 run(Counter)  # http://127.0.0.1:8000
 ```
 
-## Start a project
+The package is `pyreaction`, the import is `reaction`, and the command is
+`reaction` (`pyreaction` works too).
+
+## Features
+
+- **The React model in Python**: components, `use_state`, `use_effect`, context,
+  keys, error boundaries, Suspense, portals, refs, the rules of hooks, `StrictMode`,
+  and React 19's forms, actions, `use_optimistic` and `ViewTransition`.
+- **Server-rendered first**: every URL returns real HTML with its data in it
+  (good for search engines and slow devices), streamed as Suspense boundaries
+  resolve; the live page adopts that HTML instead of redrawing it.
+- **Small updates**: the server diffs the tree and sends only DOM operations, such
+  as "set the text of node 12".
+- **Resilient connections**: pages reconnect by themselves and resume with their
+  state; typing is never undone by a slow round trip.
+- **Fits your stack**: run it alone, mount it in FastAPI (with `Depends` support),
+  put it in front of Django or Flask, or drop components into Jinja templates.
+- **Escape hatches**: wrap any JavaScript or React widget, run code in the browser
+  with `js()`, call element methods from Python, read any event property on demand.
+- **Testable**: a fast fake browser for unit tests, and a live server helper for
+  Playwright.
+- **Typed**: the HTML tags and their attributes are typed, so editors autocomplete them.
+
+## Contents
+
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Guide](#guide): [elements](#elements), [events](#events), [hooks](#hooks),
+  [data](#data), [forms and pending state](#forms-and-pending-state),
+  [routing](#routing), [the page head](#the-page-head), [refs](#acting-on-elements),
+  [portals](#portals-and-hidden-content), [shared state](#shared-state),
+  [errors](#errors), [file uploads](#file-uploads),
+  [JavaScript components](#javascript-components)
+- [Integrations](#integrations): [FastAPI](#fastapi), [Django and Flask](#django-flask-and-other-frameworks),
+  [Jinja templates](#jinja-templates), [static prerendering](#static-prerendering)
+- [Testing](#testing)
+- [Configuration](#configuration)
+- [Deployment](#deployment)
+- [Security](#security)
+- [How it works](#how-it-works)
+- [Development](#development)
+- [License](#license)
+
+## Installation
+
+Requires Python 3.11 or newer. pyreaction is not on PyPI yet; install it from
+the Git repository:
 
 ```sh
-uvx pyreaction init my-app     # creates the project, runs uv sync and git init
+uv add "pyreaction @ git+https://github.com/Jeomon/pyreaction"
+# or
+pip install "pyreaction @ git+https://github.com/Jeomon/pyreaction"
+```
+
+Optional extras, added the same way (`"pyreaction[redis,jinja] @ git+..."`):
+
+| Extra | For |
+| --- | --- |
+| `fast` | faster JSON encoding with orjson |
+| `redis` | stores shared between worker processes (`RedisBackend`) |
+| `wsgi` | putting pages in front of a WSGI app such as Flask (`wrap`) |
+| `jinja` | the `{% component %}` template tag (`jinja_components`) |
+| `browser` | Playwright, for tests in a real browser |
+
+## Quick start
+
+### A single file
+
+Save the counter above as `app.py` and run `python app.py`. `run()` starts
+uvicorn; pass `host=`, `port=` and any [configuration option](#configuration).
+
+### A project
+
+```sh
+uvx --from git+https://github.com/Jeomon/pyreaction reaction init my-app
 cd my-app
-uv run dev                     # http://127.0.0.1:8000, restarts on every save
-uv run pro                     # production
+uv run dev        # http://127.0.0.1:8000, restarts on every save
+uv run pro        # production server
 ```
 
 ```
@@ -35,38 +107,19 @@ my-app/
   public/            served at /static; style.css is linked from the page
 ```
 
-`dev` and `pro` are commands the project declares in its `[project.scripts]`
-(add your own there). They are the same as `uv run reaction dev` and
-`uv run reaction` (or `reaction run`), which work in any project.
+`init` creates the project, runs `uv sync` and `git init` (`--no-install`,
+`--no-git` skip them). `dev` and `pro` are commands the project declares in
+`[project.scripts]`; they are the same as `uv run reaction dev` and
+`uv run reaction run`, which work in any project.
 
-When you save a `.py` file, `dev` restarts the server and open pages reconnect
-and redraw by themselves; component state starts over. Changes to files in
-`public/` show on the next refresh. `dev` also turns on debug mode (errors shown
-in the page, warnings for lists without keys). `pro` serves without reloading or
-debug output; `uv run pro --host 0.0.0.0 --port 8000` listens publicly.
+`dev` restarts the server when a `.py` file changes, and open pages reconnect and
+redraw by themselves (component state starts over). It also turns on debug mode:
+errors appear in the page with their traceback, and lists without keys are
+reported. `pro` serves without reloading or debug output.
 
-```toml
-[tool.pyreaction]
-app = "app:App"              # module:attribute of the root component
-title = "my-app"
-static = "public"
-stylesheets = ["style.css"]  # files in the static folder to link
-head = ""                    # extra raw HTML for <head>
-max_upload_size = 10485760   # bytes per uploaded file (default 10 MiB)
-allowed_origins = []         # extra origins allowed to open the WebSocket
-stream = true                # send Suspense content as it loads (see Data)
-resume_timeout = 30          # seconds a dropped page's state is kept for a reconnect
-```
+## Guide
 
-`init` takes `--no-install` and `--no-git`.
-
-## Add to an existing project
-
-```sh
-uv add pyreaction            # or: uv add "pyreaction[fast]" for orjson encoding
-```
-
-## Elements
+### Elements
 
 ```python
 html.div(
@@ -78,65 +131,68 @@ html.div(
 )
 ```
 
-- `class_name` becomes `class`, `html_for` becomes `for`, and underscores become dashes (`aria_label`, `data_id`).
-- `style` takes a dict with snake_case or camelCase keys.
-- `True` sets an attribute, while `False` or `None` leaves it out.
-- `value` and `checked` are set as live DOM properties, so inputs can be controlled. `default_value` and `default_checked` make an uncontrolled input instead: they set only the starting value, and the browser keeps what is typed (read it on submit from `e.form`, or through a `ref`).
-- `fragment(*children)` groups children without a wrapper, and a component may also return a list.
-- `h("div", {"class_name": "x"}, child)` is the call form, for tags chosen at runtime.
-- SVG and MathML work like any other tag (`html.svg(html.circle(r=5))`); the standard tags are typed, so editors autocomplete them. Any other name makes a custom element: `html.my_widget` is `<my-widget>`.
+- `class_name` becomes `class`, `html_for` becomes `for`, and underscores become
+  dashes (`aria_label`, `data_id`). `style` takes a dict with snake_case or
+  camelCase keys.
+- `True` sets an attribute; `False` or `None` leaves it out.
+- `value` and `checked` are live DOM properties, so inputs can be controlled.
+  `default_value` and `default_checked` make an uncontrolled input that only
+  starts with that value (read it on submit from `e.form`, or through a `ref`).
+- `fragment(*children)` groups children without a wrapper; a component may also
+  return a list. `h("div", {"class_name": "x"}, child)` is the call form, for tags
+  chosen at runtime.
+- SVG and MathML work like any other tag (`html.svg(html.circle(r=5))`). Any other
+  name makes a custom element: `html.my_widget` is `<my-widget>`.
 
-### Raw HTML
+**Raw HTML**, for Markdown or CMS content:
 
 ```python
 html.article(dangerously_set_inner_html=markdown_to_html(text))   # inserted as is
 html.article(parse_html(markdown_to_html(text)))                  # parsed into elements
 ```
 
-`dangerously_set_inner_html` inserts the string as markup: only use it for HTML
-you trust, since it can carry scripts. `parse_html` turns HTML into ordinary
-elements that later renders patch like any others, and by default removes what
+`dangerously_set_inner_html` inserts the string as markup, so use it only for
+HTML you trust. `parse_html` turns HTML into ordinary elements and removes what
 could run code (`<script>`, `<iframe>`, `on*` attributes, `javascript:` links).
 
-## Events
+`image("png", data, alt=...)` shows image bytes held in memory, such as a
+matplotlib chart, as an `<img>` with a `data:` URL (`"svg"` takes SVG text).
+Keep such images small and serve large ones as files.
+
+### Events
 
 `on_click`, `on_change` (fires on every edit, as in React), `on_submit`,
 `on_key_down` and so on. Pass the function itself (`on_click=vote`), not its
-result (`on_click=vote()`, which runs while rendering). A handler takes no
-argument, or one `Event`; parameters with defaults are left alone, so
-`on_click=lambda r=r: vote(r.id)` in a loop works. The event has
-`e.value`, `e.checked`, `e.key`, `e.target.name`, `e.target.dataset`,
-`e.target.selectionStart`. On a submit, `e.form` holds the fields:
-`e.form["email"]`, and `e.form.getlist("tags")` for checkbox groups and
+result. A handler takes no argument or one `Event`; parameters with defaults are
+left alone, so `on_click=lambda r=r: vote(r.id)` works in a loop.
+
+The event has `e.value`, `e.checked`, `e.key`, `e.target.name`,
+`e.target.dataset` and `e.target.selectionStart`. On a submit, `e.form` holds the
+fields: `e.form["email"]`, and `e.form.getlist("tags")` for checkbox groups and
 multi-selects.
 
-Handlers may be `async`. Plain handlers run in a worker thread, one at a time
-in arrival order, so a slow one (a database call) does not freeze other pages
-(`create_app(threaded=False)` runs them on the event loop instead).
+Handlers may be `async`. Plain handlers run in a worker thread, one at a time in
+arrival order, so a slow one (a database call) does not freeze other pages.
 
-Submit events call `preventDefault` by default. For other options:
+Submit events call `preventDefault` by default. Other options:
 
 ```python
 from reaction import event, js
+
 html.input(on_input=event(search, debounce=300))          # skipped events never reach the server
 html.a("Open", href="#", on_click=event(open_, prevent_default=True))
 html.textarea(on_key_down=event(send, keys=["Enter"], prevent_default=True))
 html.input(on_focus=js("element.select()"))               # runs in the browser, no round trip
 ```
 
-`keys` limits a keyboard event to those `KeyboardEvent.key` values. Other keys
-stay in the browser: they are not sent, and their default is not prevented, so
-the example above blocks only Enter and the textarea still takes other typing.
-`event()` also takes `throttle` and `stop_propagation` /
-`stop_immediate_propagation`. `js()` code sees `event` and `element`; it is sent
-to the page as written, so never build it from user input.
+`keys` limits a keyboard event to those `KeyboardEvent.key` values; other keys
+stay in the browser and keep their default, so the textarea above still takes
+typing. `event()` also takes `throttle`, `stop_propagation` and
+`stop_immediate_propagation`. `js()` code sees `event` and `element`. A `_capture`
+suffix (`on_click_capture`) listens on the way down, like React's `onClickCapture`.
 
-A `_capture` suffix (`on_click_capture`) listens on the way down, before the
-target's own handlers, as React's `onClickCapture`.
-
-An event carries the common fields (value, checked, key, mouse position...). For
-anything else, ask the browser while the event is recent (the last 50 events, for
-a minute):
+For anything an event did not send, ask the browser while the event is recent
+(the last 50 events, for up to a minute):
 
 ```python
 async def dropped(e):
@@ -148,98 +204,51 @@ def clicked(e):                                           # a plain handler wait
     shift = e.read("shiftKey").result()
 ```
 
-Values come back as JSON (a file as its name, type and size; a list as its items).
-The browser has finished with the event by then, so `preventDefault` and the like
-are set with `event(...)` options, not called afterwards.
+Values come back as JSON (a file as its name, type and size; a list as its
+items). The browser has finished with the event by then, so `preventDefault` and
+the like are set with `event(...)` options, not called afterwards.
 
-`image("png", data, alt=...)` shows image bytes you have in memory, such as a
-matplotlib chart, as an `<img>` with a `data:` URL (`"svg"` takes SVG text). Keep
-such images small; serve large ones as files.
-
-### File uploads
-
-```python
-def save(e):
-    for f in e.files:          # UploadedFile: .name, .type, .size, .data, .text(), .file, .save(path), .error
-        if not f.error:
-            f.save(Path("uploads") / f.name)
-
-html.input(type="file", multiple=True, on_change=save)
-```
-
-Files travel over the page's WebSocket in 256 KiB chunks ahead of the event, so
-no extra endpoint or dependency is needed. The server keeps a file in memory up
-to 1 MiB and on disk past that; `.save()` and `.file` copy it without loading it
-whole. A file over `max_upload_size` (10 MiB by default) is refused in the
-browser and arrives with `.error` set and no data.
-
-## Hooks
+### Hooks
 
 | Hook | |
 | --- | --- |
 | `use_state(initial)` | `value, set_value`; the setter takes a value or `lambda prev: ...` |
 | `use_reducer(reducer, initial)` | `state, dispatch` |
-| `use_effect(fn, deps)` | runs after the update reaches the browser; return a cleanup, or make it `async` (cancelled on cleanup). Plain effects run in a worker thread. `deps=None` runs after every render, `[]` once, a list when a value in it changes |
-| `use_layout_effect(fn, deps)` | the same as `use_effect`, for code written for React (nothing paints on the server; measure elements with `ref.current.call("getBoundingClientRect")`) |
+| `use_effect(fn, deps)` | runs after the update reaches the browser; return a cleanup, or make it `async` (cancelled on cleanup). `deps=None` runs after every render, `[]` once, a list when a value in it changes |
+| `use_layout_effect(fn, deps)` | the same as `use_effect`, for code written for React |
 | `use_memo(fn, deps)` / `use_callback(fn, deps)` | cached until `deps` change |
-| `use_ref(initial)` | `ref.current` survives re-renders; pass it as `ref=` to an element to act on it. `ref=` also takes a function, called with the element (it may return a cleanup) and with `None` when removed. `create_ref()` makes one outside a component |
-| `create_context(default)` / `use_context(ctx)` | provide with `ctx(*children, value=...)`, or `ctx.Provider(...)` as in older React |
+| `use_ref(initial)` | `ref.current` survives re-renders; pass it as `ref=` to an element to act on it |
+| `create_context(default)` / `use_context(ctx)` | provide with `ctx(*children, value=...)` |
+| `use(ctx_or_task)` | a context (allowed inside `if`), or the result of an `asyncio` task |
 | `use_async(fn, deps)` / `use_data(fn, deps)` | load data without blocking; see [Data](#data) |
-| `use(ctx_or_task)` | a context (allowed inside `if`), or the result of an `asyncio` task, suspending until it is done |
-| `use_deferred_value(value)` | `value` one render behind, so a slow part of the page updates after the fast part |
-| `use_transition()` / `start_transition(fn)` / `use_action_state(action, initial)` | pending state for slow work; see [Pending state](#pending-state-and-forms) |
-| `use_optimistic(state, update)` | show a change at once, until the action behind it is done |
-| `use_location()` | the page URL: `.path`, `.search`, `.query` (a dict); re-renders when it changes |
-| `use_navigate()` | `navigate("/users/7")`, `navigate(url, replace=True)`, or `navigate(url, reload=True)` for a full load |
-| `use_title(text)` | sets the page title, in the first HTML too |
-| `use_status(code)` | the HTTP status of the first response, e.g. 404 or 410 |
-| `use_request()` | the Starlette `Request`, then `WebSocket`, serving the page: `.headers`, `.cookies`, `.client` |
-| `use_id()` | an id that is the same in the server's HTML and the live page, for `label`/`aria-*` pairs |
-| `use_linked_inputs(attrs_list, on_change, cast)` | inputs that show one value: typing in one updates the others (a slider and a number box) |
+| `use_transition()` / `use_action_state(action, initial)` / `use_optimistic(state, update)` | pending and optimistic state; see [Forms](#forms-and-pending-state) |
+| `use_deferred_value(value)` | `value` one render behind, so a slow part updates after the fast part |
+| `use_location()` / `use_navigate()` | the page URL (`.path`, `.search`, `.query`), and `navigate(url, replace=, reload=)` |
+| `use_title(text)` / `use_status(code)` | the page title, and the first response's HTTP status (e.g. 404) |
+| `use_request()` | the Starlette `Request`, then `WebSocket`, serving the page: `.headers`, `.cookies`, `.client`, `.scope` |
+| `use_id()` | an id that matches between the server's HTML and the live page |
 | `use_store(store)` / `use_sync_external_store(subscribe, get)` | state shared between pages; see [Shared state](#shared-state) |
 | `use_effect_event(fn)` | a stable function that always calls the latest `fn` |
 | `use_imperative_handle(ref, create, deps)` | expose an API to a parent holding `ref` |
+| `use_linked_inputs(attrs_list, on_change, cast)` | inputs that show one value (a slider and a number box) |
 | `use_debug_value(value)` | logs the value when it changes, in debug mode |
 
-`@memo` instead of `@component` skips re-rendering while the arguments are unchanged.
-A function of your own whose name starts with `use_` and calls hooks is a custom
-hook: it shares logic, and each component calling it gets its own state
-(`examples/lunch_roulette.py` has `use_countdown`).
+`@memo` instead of `@component` skips re-rendering while the arguments are
+unchanged. A function of your own whose name starts with `use_` and calls hooks
+is a custom hook.
 
-The rules of hooks are checked as in React. Hooks are matched to their slots by
-call order, so each render must call the same hooks: one inside an `if` raises
-"Rendered fewer (or more) hooks than during the previous render". A hook called
-outside rendering (in a handler or effect) raises "Invalid hook call". A
-component that sets state every time it renders stops after 50 renders with "Too
-many re-renders" instead of looping forever; the error goes to the nearest
-`ErrorBoundary`.
+The rules of hooks are enforced as in React: a hook inside an `if` raises
+"Rendered fewer (or more) hooks than during the previous render", a hook outside
+rendering raises "Invalid hook call", and a component that sets state on every
+render stops after 50 renders with "Too many re-renders".
 
-`StrictMode(*children)` helps find impure components and effects missing a
-cleanup: in debug mode (`reaction dev`) its children render twice and each
-effect is set up, cleaned up and set up again when it first runs, as in React's
-development builds. Outside debug mode it does nothing.
+Also available, as in React: `StrictMode` (double rendering in debug mode),
+`Profiler`, `ViewTransition` with `add_transition_type`, `lazy`, `forward_ref`,
+`Children.*`, `clone_element`, `is_valid_element`, `flush_sync` and
+`request_form_reset`. Updates in the same event-loop tick are batched into one
+render, and setters are safe to call from other threads.
 
-`Profiler(*children, id=..., on_render=fn)` calls `fn(id, phase, actual_ms,
-start, commit)` after each render pass that rendered its subtree.
-`ViewTransition(*children, name=None)` applies updates that change its children
-inside the browser's `document.startViewTransition`, so they animate (cross-fade
-by default, styled with `::view-transition-old(name)`). `add_transition_type("back")`
-in the handler names the change, for CSS such as
-`html:active-view-transition-type(back)`.
-
-`lazy(load)` makes a component that calls `load()` on its first render to get
-the real one (an `async` loader suspends meanwhile). `forward_ref(fn)` is the same
-as `component(fn)`, for code ported from React: any component can already take
-`ref=` and pass it on.
-
-For components that work on their children, as in React: `Children.map`,
-`Children.for_each`, `Children.count`, `Children.to_array` and `Children.only`,
-`clone_element(el, *children, **props)` and `is_valid_element(x)`.
-
-Updates made in the same event-loop tick are batched into one render and one
-message. Setters are safe to call from other threads.
-
-## Data
+### Data
 
 ```python
 @component
@@ -253,32 +262,22 @@ def Team(team_id):
 ```
 
 `use_async(fn, deps)` calls `fn` (a plain function in a worker thread, or an
-`async def`) again whenever `deps` change, and returns `.loading`, `.value`,
-`.error` and `.reload()`. `use_data(fn, deps)` returns the value itself; while it
-loads, the nearest `Suspense(*children, fallback=...)` shows its fallback, and an
-error goes to the nearest `ErrorBoundary`.
+`async def`) whenever `deps` change and returns `.loading`, `.value`, `.error`
+and `.reload()`. `use_data(fn, deps)` returns the value itself: while it loads,
+the nearest `Suspense(*children, fallback=...)` shows its fallback, and an error
+goes to the nearest `ErrorBoundary`.
 
-The server waits for this data (up to `data_timeout`, 5 seconds by default)
-before sending a page's first HTML, so the page arrives with the data in it,
-for search engines and without a loading flash.
-
-Data inside a `Suspense` boundary does not hold the page back: the HTML goes out
-at once with the fallback, and the boundary's content follows in the same
-response when its data arrives, swapped in by a small inline script before the
-page goes live. `create_app(stream=False)` waits for all of it instead.
+The server waits for data (up to `data_timeout`, 5 seconds by default) before
+sending a page's first HTML, so the page arrives complete. Data inside a
+`Suspense` boundary does not hold the page back: the HTML goes out with the
+fallback, and the content follows in the same response when ready.
 
 `@cache` memoises a function for one page, as React's `cache` does for one
-request: several components asking for `get_user(7)` load it once. An `async`
-function returns a task to read with `use(get_user(7))`; it is cancelled when the
-page closes, and `cache_signal()` gives the work a signal that says so
-(`.aborted`, `.on_abort(fn)`, `await .wait()`).
+request; `cache_signal()` says when the page has closed. `browser()` at the top
+of a component leaves it to the browser: the first HTML shows the nearest
+`Suspense` fallback, and the component renders once the page is live.
 
-`browser()` at the top of a component leaves it to the browser: the page's
-first HTML (and `prerender`, `embed`) shows the nearest `Suspense` fallback, and
-the component renders once the page is live. Use it for parts that depend on the
-browser or are too costly to render for every request.
-
-## Pending state and forms
+### Forms and pending state
 
 Every event is a round trip, so slow actions should say they are working:
 
@@ -296,35 +295,24 @@ def Contact():
 
 `Form(*children, action=...)` runs `action(fields)` in the background, gives
 components inside it `use_form_status()` (`.pending`, `.data`), and clears the
-fields on success (`reset=False` keeps them).
+fields on success (`reset=False` keeps them). `html.form(..., action=fn)` is the
+same, as React 19 writes it, and `html.button("Draft", form_action=fn)` submits
+its form to another action.
 
-`html.form(..., action=fn)` is the same as `Form`, as React 19 writes it, and
-`html.button("Save draft", form_action=fn)` submits its form to `fn` instead (with
-the button's own `name`/`value`, after the browser checks required fields).
-
-`use_transition()` returns `pending, start`: `start(fn, *args)` runs `fn` in the
-background with `pending` True meanwhile; `start_transition(fn)` does the same
-from any handler, without the flag. `use_action_state(action, initial)` returns
-`state, run, pending`, where `run(payload)` sets the state to
-`action(state, payload)`; pass `run` to `on_submit` to get the form's fields.
+`use_transition()` returns `pending, start`; `start(fn, *args)` runs `fn` in the
+background with `pending` true meanwhile. `use_action_state(action, initial)`
+returns `state, run, pending`. `use_optimistic` shows a change at once, until the
+action behind it finishes:
 
 ```python
 shown, add = use_optimistic(messages, lambda cur, text: cur + [text + " (sending)"])
 
 def send(fields):
-    add(fields["text"])            # shown at once
-    set_messages(api.post(fields["text"]))   # the real list replaces it when done
+    add(fields["text"])                         # shown at once
+    set_messages(api.post(fields["text"]))      # the real list replaces it when done
 ```
 
-`use_optimistic` changes what is shown until the action that called `add` (the
-handler, transition or form action) finishes; if it fails, the change goes away.
-
-`flush_sync(lambda: set_status("saving"))` renders and sends an update right away,
-so the page shows it while the rest of a slow handler runs.
-`request_form_reset(form_ref)` resets a form with uncontrolled inputs, once the
-current action is done.
-
-## Routing
+### Routing
 
 ```python
 from reaction import Link, Navigate, Router
@@ -339,33 +327,27 @@ def App():
     )
 ```
 
-`Router` renders the first matching route, passing the `{params}` as keyword
-arguments (`User(id="7")`); `{name:path}` matches across slashes. When nothing
-matches it renders `fallback` and the page's first response has status 404.
-`Navigate(to)` redirects: an HTTP 307 on first load, a URL change once live.
-`Link` changes the URL without reloading the page, and Ctrl/Cmd-click still
-opens a new tab. Back and Forward work, and every URL also renders on the
-server when loaded directly.
+`Router` renders the first matching route and passes the `{params}` as keyword
+arguments (`User(id="7")`). When nothing matches it renders `fallback` and the
+first response has status 404. `Navigate(to)` redirects: an HTTP 307 on first
+load, a URL change once live. `Link` changes the URL without a reload, Back and
+Forward work, and every URL also renders on the server when loaded directly.
 
-## The page's head
+### The page head
 
 ```python
 html.title(post.title)                                   # anywhere in the tree
 html.meta(name="description", content=post.summary)
 html.link(rel="canonical", href=url)
 preload("/fonts/inter.woff2", as_="font", cross_origin="anonymous")
-preconnect("https://api.example.com")
 ```
 
 As in React 19, `<title>`, `<meta>` and `<link>` written anywhere go into
-`<head>`, in the first HTML too, and leave it when they unmount (a `<title>`
-inside `<svg>` and tags with `itemprop` stay where they are). `Head(...)` and
+`<head>`, in the first HTML too, and leave it when they unmount. `Head(...)` and
 `use_title` do the same. The resource hints `prefetch_dns`, `preconnect`,
-`preload`, `preload_module`, `preinit` (a stylesheet or script, applied now) and
-`preinit_module` add each resource once, from a render or a handler; the page
-keeps tags it already has, so a script is not run twice.
+`preload`, `preload_module`, `preinit` and `preinit_module` add each resource once.
 
-## Acting on elements
+### Acting on elements
 
 ```python
 box = use_ref()
@@ -378,25 +360,23 @@ async def measure():
 ```
 
 `ref.current` has `focus()`, `blur()`, `click()`, `select()`,
-`scroll_into_view(behavior=, block=)`, `call(method, *args)` for any other
-element method, and `get(name)` / `set(name, value)` for properties. Each
-returns the browser's answer: `await` it in an `async` handler, or call
-`.result()` in a plain one. It is None once the element is removed.
+`scroll_into_view(behavior=, block=)`, `call(method, *args)`, and
+`get(name)` / `set(name, value)`. Each returns the browser's answer: `await` it in
+an `async` handler, or call `.result()` in a plain one.
 
-## Portals and hidden content
+### Portals and hidden content
 
 ```python
 portal(html.div("Saved!", class_name="toast"), target="body")   # rendered at the end of <body>
 Activity(Settings(), mode="hidden" if tab != "settings" else "visible")
 ```
 
-`portal` renders children elsewhere in the page (for modals and toasts that must
+`portal` renders children elsewhere in the page (modals and toasts that must
 escape `overflow: hidden`), with state, context and events working as if they
-were in place. They are in the server's HTML too, at the end of `<body>` (moved
-into their `target` by a one-line script), and the live page adopts them.
-`Activity` hides children without unmounting them, so their state survives.
+were in place, in the server's HTML too. `Activity` hides children without
+unmounting them, so their state survives.
 
-## Shared state
+### Shared state
 
 ```python
 online = Store(0)          # one per process, shared by every open page
@@ -408,21 +388,18 @@ def Badge():
 online.update(lambda n: n + 1)   # from any thread: every Badge re-renders
 ```
 
-A plain `Store` holds a value in one process. To share it between worker
-processes or machines, give it a name and a backend:
+To share a store between worker processes or machines, name it and give it a
+backend:
 
 ```python
 votes = Store({"yes": 0, "no": 0}, name="votes", backend=RedisBackend("redis://localhost:6379/0"))
 ```
 
 A write in any process re-renders the readers in all of them. The value must be
-JSON, `update` is atomic across processes (its function may run again if another
-write got in first), and a process that starts later loads the current value.
-It needs `pip install "pyreaction[redis]"`; Valkey works too, and any other
+JSON, and `update` is atomic across processes. Valkey works too, and any other
 broker can implement the `StoreBackend` protocol (`load`, `write`, `listen`).
-`use_sync_external_store(subscribe, get_snapshot)` connects any other source.
 
-## Errors
+### Errors
 
 ```python
 ErrorBoundary(
@@ -432,17 +409,29 @@ ErrorBoundary(
 )
 ```
 
-An error while rendering a child shows the nearest boundary's fallback, in the
-server's HTML as well. Without a boundary, the component keeps its last good
-output, or renders nothing the first time. Errors in handlers and effects are
-logged and not caught by boundaries, as in React.
+An error while rendering shows the nearest boundary's fallback, in the server's
+HTML as well. Without a boundary, the component keeps its last good output.
+Errors in handlers and effects are logged and not caught by boundaries, as in
+React. `create_app(on_error=fn)` calls `fn(exc, where, connection)` for every
+uncaught error, for reporting to a service such as Sentry.
 
-`create_app(on_error=fn)` calls `fn(exc, where, connection)` for every error not
-caught by a boundary, to send them to a monitoring service. With `debug=True`,
-which `reaction dev` sets, they also show in the browser with their traceback,
-as does a warning when the server's HTML did not match the live render.
+### File uploads
 
-## JavaScript components
+```python
+def save(e):
+    for f in e.files:          # UploadedFile: .name, .type, .size, .data, .text(), .file, .save(path), .error
+        if not f.error:
+            f.save(Path("uploads") / f.name)
+
+html.input(type="file", multiple=True, on_change=save)
+```
+
+Files travel over the page's WebSocket in 256 KiB chunks, with no extra endpoint.
+The server keeps a file in memory up to 1 MiB and on disk past that. A file over
+`max_upload_size` (10 MiB by default) is refused in the browser and arrives with
+`.error` set and no data.
+
+### JavaScript components
 
 For what Python cannot draw in the browser (charts, maps, editors), wrap a
 JavaScript module:
@@ -464,104 +453,20 @@ export function mount(element, props, emit, slot) {
 }
 ```
 
-Props must be JSON values and are passed whole to `update` when any changes;
-`on_<name>` props are Python callbacks that `emit("<name>", data)` calls. The
-module URL can be a file in your static folder or a CDN address. `fallback`
-shows until the module has loaded, in the server's HTML too. Positional
-children are rendered by pyreaction into `slot`, which the module places where
-they belong; they stay live Python components. `ref=` works too.
+Props must be JSON values and are passed whole to `update` when any changes.
+`on_<name>` props are Python callbacks that `emit("<name>", data)` calls.
+`fallback` shows until the module loads, in the server's HTML too. Positional
+children are rendered by pyreaction into `slot`, which the module places; they
+stay live Python components.
 
-React components wrap the same way: `examples/static/react_slider.js` renders a
-React component with `createRoot` inside `mount`, passes props through in
-`update`, and calls `root.unmount()` in `unmount`. See `examples/widgets.py`.
+React components wrap the same way: `examples/static/react_slider.js` renders one
+with `createRoot` inside `mount`. A small module can also be written inline with
+`js_component_from_string(code)`; the browser imports it from a `data:` URL, so it
+can import other modules by full URL only.
 
-A small module can be written inline instead of in a file:
+## Integrations
 
-```python
-Clock = js_component_from_string("""
-  export default function mount(element, props) {
-    const tick = () => (element.textContent = new Date().toLocaleTimeString());
-    tick();
-    const timer = setInterval(tick, 1000);
-    return { unmount() { clearInterval(timer); } };
-  }
-""")
-```
-
-The browser imports it from a `data:` URL, so it can import other modules by full
-URL only, and a Content-Security-Policy must allow `data:` scripts.
-
-## Testing
-
-```python
-from reaction.testing import render
-
-def test_todo():
-    with render(Todo()) as page:
-        page.type("input[name=item]", "milk")
-        page.click("button.primary")
-        assert [li.text for li in page.find_all("#list li")] == ["milk"]
-```
-
-`render` mounts a component on a real event loop with a small fake browser, so
-handlers, effects, data loading and forms run exactly as on a live page; each
-action waits until the page has settled. `find`/`find_all` take CSS selectors
-(tags, `#id`, `.class`, `[attr=value]`, descendants) and `text=`; actions are
-`click`, `type`, `check`, `key`, `submit`, `navigate` and `dispatch`. Errors
-raised by your components fail the test (`raise_errors=False` collects them in
-`page.errors`). `on_call=` answers element calls such as `getBoundingClientRect`.
-
-`to_vdom(element)`, or `to_vdom(page.root)` for a page's current state, returns
-the rendered tree as plain dicts, with components rendered away: handy for
-snapshot tests and debugging. It uses reactpy's key names:
-
-```python
-{"tagName": "", "children": [
-    {"tagName": "button", "attributes": {"class": "primary"},
-     "eventHandlers": {"click": {"preventDefault": True}}, "children": ["Save"]}]}
-```
-
-Tags may also have `key`, `dangerouslySetInnerHTML`, `importSource` (for a
-`js_component`) and `portal`. Event handlers are listed by DOM event (`input` for
-`on_change`) with the options that are set.
-
-For a real browser, `serve` runs the app on a free local port in a background
-thread; the page marks `<html data-pyreaction-ready>` once it is live:
-
-```python
-from reaction.testing import serve
-
-def test_counter(page):                      # Playwright's page (pytest-playwright)
-    with serve(Counter) as server:           # create_app options go here too
-        page.goto(server.url)
-        page.wait_for_selector(server.READY)
-        page.click("button")
-```
-
-`serve(asgi_app, asgi=True)` serves an app you built yourself. Install the
-browser driver with `pip install "pyreaction[browser]"`.
-
-## Authentication
-
-A WebSocket cannot set cookies, and JavaScript must not be able to read a
-session cookie. So log in and out with ordinary HTTP routes that set an
-`HttpOnly` cookie, and read it in components with `use_request().cookies`:
-
-```python
-run(App, routes=[Route("/login", login, methods=["POST"]), Route("/logout", logout, methods=["POST"])])
-```
-
-The login form is a plain `<form method="post" action="/login">`. After logging
-in or out from Python code, `navigate(url, reload=True)` loads the page afresh
-so the next connection carries the new cookie. `examples/login.py` is a
-complete version.
-
-## Serving
-
-`run(App, host=, port=, ...)` starts uvicorn; other options go to `create_app`.
-`create_app(App, ...)` returns the ASGI app (a Starlette app) for any ASGI server.
-
-### With FastAPI
+### FastAPI
 
 `mount` serves the pages inside a FastAPI (or Starlette) app, next to its API:
 
@@ -578,41 +483,23 @@ mount(api, App)                                # pages at /, the API keeps /api 
 mount(api, App, "/ui", static_dir="public")    # or pages under /ui
 ```
 
-Run it as usual: `uvicorn main:api`. At `"/"` the pages answer every URL the
-host's routes do not, whatever order they are defined in. Under a path, the
-components see paths inside it (`use_location().path` is `/users/7` for
-`/ui/users/7`), and links, redirects, static files, resource hints and
-JavaScript modules get the prefix. `api.mount("/ui", create_app(App))` does
-the same as `mount(api, App, "/ui")`.
+Run it as usual (`uvicorn main:api`). At `"/"` the pages answer every URL the
+API does not. Under a path, components see paths inside it, and links,
+redirects, static files and JavaScript modules get the prefix. Components reach
+the FastAPI app through `use_request()`: `request.app.state`, the lifespan
+state, `request.session` and `request.user` all work. `raise HTTPException(...)`
+in a component sets the first response's status and headers, and the nearest
+`ErrorBoundary` shows it.
 
-Components reach the FastAPI app through `use_request()`: `request.app` is the
-FastAPI app (`request.app.state`), `request.state` holds what the lifespan
-yielded, and `request.session` and `request.cookies` work with FastAPI's
-middleware. Components cannot use FastAPI's `Depends` themselves; share database
-pools and settings through `app.state` or the lifespan, or make the page a
-`@page` route (below), whose function can. `examples/fastapi_app.py` is a
-complete app.
-
-`raise HTTPException(...)` in a component works as in a route: the first
-response gets its status and headers (a 3xx with a `Location` header redirects),
-and the nearest `ErrorBoundary` shows its fallback with the exception
-(`e.status_code`, `e.detail`). Once the page is live, only the boundary changes.
-
-If the FastAPI app already serves `/static`, pages mounted at `/` cannot use that
-path for their own files; pyreaction logs a warning on the first request. Pass
-`static_path="/assets"`, or mount the pages under a path.
-
-#### Pages with `Depends`
-
-`page` turns a FastAPI route into a pyreaction page, so its function can use
-`Depends`, path and query parameters and `Cookie` like any route:
+**Pages with `Depends`.** `page` turns a FastAPI route into a pyreaction page, so
+its function can use `Depends`, path and query parameters and `Cookie`:
 
 ```python
 from fastapi import Depends
 from starlette.requests import HTTPConnection
 from reaction import page
 
-def current_user(conn: HTTPConnection):        # HTTPConnection, not Request (see below)
+def current_user(conn: HTTPConnection):        # HTTPConnection, not Request
     ...
 
 @page(api, "/orders/{order_id}", title="Order")
@@ -621,29 +508,17 @@ def order(order_id: int, user=Depends(current_user), db=Depends(get_db)):
 ```
 
 FastAPI resolves the parameters when the page loads and again when its live
-connection opens, so both renders get the same values; an `HTTPException` from a
-dependency or the function gives that status. A dependency with `yield` (a
-database session) stays open while the page is live. The function may be
-`async`; a plain one runs in a worker thread.
+connection opens; a dependency with `yield` stays open while the page is live.
+Type dependencies as `HTTPConnection`: the live connection is a WebSocket, where a
+`Request` dependency fails, and browsers cannot add headers to a WebSocket, so
+authenticate with cookies. Each `@page` shows one route; for an app with its own
+routing, use `mount`. `examples/fastapi_app.py` is a complete app.
 
-The live connection is a WebSocket, so there is no `Request` there: write
-dependencies that read cookies, headers or `.state` with `HTTPConnection`, which
-FastAPI fills in for both (a dependency typed `Request` fails on the WebSocket).
-Browsers cannot add headers to a WebSocket, so log in with cookies, not an
-`Authorization` header.
+Checked against FastAPI 0.165, including routers, OpenAPI, `--root-path`, CORS,
+TrustedHost, GZip, HTTP middleware, `AuthenticationMiddleware`, `fastapi run`
+and `uvicorn --workers N`.
 
-Each `@page` shows one route: links to other URLs load them afresh, while a new
-query string on the same path stays live. For a whole app with its own routing,
-use `mount`. Pages are left out of the OpenAPI schema, and `@page` does not serve
-static files (mount them on the FastAPI app).
-
-Checked against FastAPI 0.165: routers and OpenAPI, a proxy root path
-(`fastapi run --root-path`), CORS, TrustedHost, GZip and `@api.middleware("http")`
-(streamed pages stay streamed), `request.user` from Starlette's
-`AuthenticationMiddleware`, several apps in one FastAPI app, Jinja pages with
-`embed()`, `fastapi run` and `uvicorn --workers N`.
-
-### With Django, Flask and other frameworks
+### Django, Flask and other frameworks
 
 `wrap` puts pyreaction pages in front of another web app and returns an ASGI app
 to run with uvicorn:
@@ -654,22 +529,23 @@ from django.core.asgi import get_asgi_application
 from reaction import wrap
 application = wrap(get_asgi_application(), Dashboard, "/dashboard")
 
-# Flask: a WSGI app, run through a2wsgi (pip install "pyreaction[wsgi]")
-app = wrap(flask_app, Dashboard, "/dashboard")          # uvicorn main:app
+# Flask: a WSGI app (needs the `wsgi` extra), then `uvicorn main:app`
+app = wrap(flask_app, Dashboard, "/dashboard")
 ```
 
-Requests under the path go to pyreaction (pages, script, WebSocket and
-`static_dir`); everything else reaches the framework unchanged. With `"/"` the
-framework answers first, and a GET it answers with 404 becomes a pyreaction page.
-Components read the request through `use_request()` (`.cookies`, `.headers`),
-not the framework's own request object: `flask.request` and Django's
-`request.user` are not available in components; read the session cookie, or
-expose what they need through an API route. Flask runs under uvicorn here, not
-its own server or gunicorn's sync workers. To put a component inside a Django or
-Flask template, wrap it under a path and add `embed(Widget, mount_path="/widget")`
-to the template (`|safe` / `mark_safe`). Checked with Django 6.1 and Flask 3.1.
+Requests under the path go to pyreaction; everything else reaches the framework
+unchanged. With `"/"`, the framework answers first and a GET it answers with 404
+becomes a pyreaction page. Components read the request through `use_request()`
+(cookies, headers); `flask.request` and Django's `request.user` are not available
+in components. Checked with Django 6.1 and Flask 3.1.
 
-### A `{% component %}` tag for Jinja templates
+To put a component inside a page the framework renders, wrap it under a path and
+add `embed(Widget, mount_path="/widget", location=request.path)` to the template
+(`|safe` in Jinja, `mark_safe` in Django).
+
+### Jinja templates
+
+`jinja_components` adds a `{% component %}` tag (needs the `jinja` extra):
 
 ```python
 from reaction import jinja_components
@@ -678,8 +554,7 @@ from reaction import jinja_components
 api.mount("/components", jinja_components(templates.env, [Counter, Chart], secret=SECRET))
 
 # Flask
-components = jinja_components(flask_app.jinja_env, [Counter, Chart], secret=SECRET)
-app = wrap(flask_app, components, "/components")
+app = wrap(flask_app, jinja_components(flask_app.jinja_env, [Counter, Chart], secret=SECRET), "/components")
 ```
 
 ```jinja
@@ -687,58 +562,122 @@ app = wrap(flask_app, components, "/components")
 {% component "myapp.widgets.Chart", values=[1, 2, 3], title=page_title %}
 ```
 
-The tag writes the component's server-rendered HTML and its script; it goes live
-when the page connects. Only the listed components can be named, by import path
-(`module.Name`), and props must be JSON values. The component and its props
-travel in the WebSocket URL, signed with `secret`, so a visitor cannot pick
-another component or change the props. Give every worker process the same
-`secret`; the default is random, which works for one process only. The location
-the component sees is the template context's `request` path. Needs Jinja:
-`pip install "pyreaction[jinja]"`.
+The tag writes the server-rendered HTML and the script. Only the listed
+components can be named, by import path, and props must be JSON values. The
+component and its props travel signed with `secret`, so a visitor cannot change
+them; give every worker process the same `secret`.
 
-Options: `title`, `head`, `lang`, `static_dir`, `static_path`, `stylesheets`,
-`routes` (extra Starlette routes), `data_timeout`, `stream`, `max_upload_size`,
-`max_pending_events` (1000 by default: a page sending more events than its handlers
-have started is disconnected, then reconnects and resumes),
-`allowed_origins`, `on_error`, `threaded`, `reconnect_max` (ms),
-`resume_timeout` (s) and `debug`.
-
-To put an app inside a page your own server renders (Jinja, Django), mount it
-as above and add `embed(App, mount_path="/ui", location=request.url.path)` to
-the page, unescaped (`| safe` in Jinja).
+### Static prerendering
 
 `prerender(App, ["/", "/about"], "dist")` renders pages ahead of time for a
-static host, as React's `prerender`: each waits for all its data, gets its
-title and head tags, and is written as `dist/index.html`, `dist/about/index.html`.
-The pages are plain HTML without the client script; `live=True` keeps it, for
-pages served in front of the running app. Options go to `create_app`.
-`render_to_static_markup(element)` renders HTML that never goes live (an email,
-a snippet), without the markers the live page uses to adopt it.
+static host, as React's `prerender` does: each waits for its data and is written
+as `dist/index.html`, `dist/about/index.html`. `live=True` keeps the client
+script, for pages served in front of the running app. `render_to_string` and
+`render_to_static_markup` render an element to HTML (an email, a snippet), and
+`to_vdom` returns the rendered tree as plain dicts.
 
-Each page view is a live session on the server. If the connection drops, the
-page dims and reconnects (with growing, randomised delays). The server keeps the
-dropped session for `resume_timeout` seconds (30 by default; 0 turns this off),
-so a reconnect within that time continues where it left off: component state is
-kept, and clicks made while offline are sent and applied. After that, or when
-the reconnect reaches another worker process, or after a deploy or restart, the
-page renders afresh at the same URL and component state starts over.
+## Testing
 
-WebSockets are accepted only from the page's own origin, so other websites
-cannot drive a visitor's session. Behind a proxy that rewrites the `Host`
-header, list the public origin in `allowed_origins`.
+```python
+from reaction.testing import render
 
-Any number of worker processes can serve the app: the page load and its
-WebSocket need not reach the same one. To resume sessions after a dropped
-connection with several workers, route reconnects to the same worker (sticky
-sessions); otherwise they start afresh. Share stores between workers with a
-`RedisBackend`.
+def test_todo():
+    with render(Todo()) as page:
+        page.type("input[name=item]", "milk")
+        page.click("button.primary")
+        assert [li.text for li in page.find_all("#list li")] == ["milk"]
+```
 
-### Deploying
+`render` mounts a component on a real event loop with a small fake browser, so
+handlers, effects, data loading and forms run as on a live page; each action
+waits until the page has settled. `find` and `find_all` take CSS selectors and
+`text=`; actions are `click`, `type`, `check`, `key`, `submit`, `navigate` and
+`dispatch`. Errors raised by components fail the test (`raise_errors=False`
+collects them in `page.errors`). `to_vdom(page.root)` gives the page as plain
+dicts, for snapshot tests.
 
-The page keeps a WebSocket open, and the browser sends a small message every 25
-seconds so proxies do not close it as idle.
+For a real browser, `serve` runs the app on a free local port, and `poll` waits
+for a condition that the page reaches in its own time:
 
-Nginx must pass the WebSocket upgrade through and allow long connections:
+```python
+from reaction.testing import poll, serve
+
+def test_counter(page):                      # Playwright's page (pytest-playwright)
+    with serve(Counter) as server:           # create_app options go here too
+        page.goto(server.url)
+        page.wait_for_selector(server.READY)
+        page.click("button")
+        poll(lambda: page.text_content("button") == "Clicked 1 times")
+```
+
+`poll(check, timeout=5)` returns the first truthy result of `check`, retrying
+`AssertionError`s until the timeout. `serve(asgi_app, asgi=True)` serves an app
+you built yourself.
+
+## Configuration
+
+Options are passed to `create_app` (and so to `run`, `mount`, `page`, `wrap` and
+`serve`), set in a project's `[tool.pyreaction]` table, or read from environment
+variables. Code wins over `[tool.pyreaction]`, which wins over the environment.
+
+| Option | Default | Environment variable | |
+| --- | --- | --- | --- |
+| `title` | `"pyreaction"` | | the page title before `use_title` sets one |
+| `head` | `""` | | extra raw HTML for `<head>` |
+| `lang` | `"en"` | | the `<html lang>` attribute |
+| `static_dir` / `static_path` | none / `"/static"` | | a folder served at a path |
+| `stylesheets` | `()` | | files in the static folder linked from the page |
+| `routes` | `()` | | extra Starlette routes, matched before the pages |
+| `on_error` | none | | `fn(exc, where, connection)` for uncaught errors |
+| `debug` | `False` | `PYREACTION_DEBUG` | errors and warnings shown in the page |
+| `allowed_origins` | `()` | `PYREACTION_ALLOWED_ORIGINS` (comma-separated) | extra origins allowed to open the WebSocket |
+| `max_upload_size` | 10 MiB | `PYREACTION_MAX_UPLOAD_SIZE` | bytes per uploaded file |
+| `max_pending_events` | `1000` | `PYREACTION_MAX_PENDING_EVENTS` | events a page may queue before it is disconnected |
+| `max_pending_ops` | `100000` | `PYREACTION_MAX_PENDING_OPS` | updates a slow browser may fall behind before it starts over |
+| `data_timeout` | `5.0` | `PYREACTION_DATA_TIMEOUT` | seconds the first HTML waits for data |
+| `stream` | `True` | `PYREACTION_STREAM` | stream Suspense content into the first response |
+| `threaded` | `True` | `PYREACTION_THREADED` | run plain handlers and effects in worker threads |
+| `reconnect_max` | `8000` | `PYREACTION_RECONNECT_MAX` | longest delay between reconnect attempts, in ms |
+| `reconnect_attempts` | `0` (no limit) | `PYREACTION_RECONNECT_ATTEMPTS` | failed attempts in a row before the page gives up |
+| `resume_timeout` | `30.0` | `PYREACTION_RESUME_TIMEOUT` | seconds a dropped page's state is kept for a reconnect |
+
+A project's settings:
+
+```toml
+[tool.pyreaction]
+app = "app:App"              # module:attribute of the root component
+title = "my-app"
+static = "public"            # served at /static
+stylesheets = ["style.css"]
+resume_timeout = 60          # any option from the table above
+```
+
+`reaction run` and `reaction dev` listen on `--host` and `--port`, which default
+to `PYREACTION_HOST` (else `127.0.0.1`) and `PYREACTION_PORT`, then `PORT`
+(else `8000`). Boolean variables accept `1`/`true`/`yes`/`on` and
+`0`/`false`/`no`/`off`; an invalid value stops the app at startup.
+
+## Deployment
+
+**Running.** `uv run pro` (or `reaction run --host 0.0.0.0`) serves a project
+with uvicorn; any ASGI server can serve `create_app(App)`. In a container, set
+`PORT` and the `PYREACTION_*` variables instead of editing code.
+
+**Sessions and workers.** Each open page is a live session on the server. If the
+connection drops, the page dims and reconnects with growing, randomised delays.
+The server keeps the dropped session for `resume_timeout` seconds, so a reconnect
+within that time continues with its state; after that, or on another worker
+process, or after a deploy, the page renders afresh at the same URL. Any number
+of workers can serve the app. To resume sessions across workers, route reconnects
+to the same worker (sticky sessions), and share stores with `RedisBackend`.
+
+With `reconnect_attempts` set, a page that cannot reconnect stops after that many
+attempts and shows "Connection to the server was lost." with a Reload button
+(styled through `#pyreaction-lost`; `<html data-pyreaction-lost>` is set).
+
+**Proxies.** The browser sends a small message every 25 seconds so proxies do not
+close the WebSocket as idle. Nginx must pass the upgrade through and allow long
+connections:
 
 ```nginx
 location / {
@@ -751,36 +690,50 @@ location / {
 }
 ```
 
-On Google Cloud Run a WebSocket counts as a request, so it is closed at the
-service's request timeout (5 minutes by default, 60 at most); raise it to 60
-minutes. The page reconnects by itself when that happens and, on the same
-instance, keeps its state.
+A proxy that rewrites the `Host` header needs the public origin in
+`allowed_origins`. On Google Cloud Run a WebSocket counts as a request and is
+closed at the service's request timeout (5 minutes by default); raise it to 60
+minutes. The page reconnects by itself when that happens.
+
+## Security
+
+- **Origins.** WebSockets are accepted only from the page's own origin (plus
+  `allowed_origins`), so other websites cannot drive a visitor's session.
+- **Authentication.** A WebSocket cannot set cookies, and JavaScript must not read
+  a session cookie. Log in and out with ordinary HTTP routes that set an
+  `HttpOnly` cookie, read it with `use_request().cookies`, and use
+  `navigate(url, reload=True)` afterwards so the next connection carries it.
+  `examples/login.py` is a complete version.
+- **Markup and code.** Text is always escaped. `dangerously_set_inner_html`
+  inserts HTML as is; `parse_html` removes scripts and event attributes. `js()`
+  code and `js_component_from_string` modules are sent as written: never build
+  them from user input.
+- **Limits.** Uploads are capped by `max_upload_size`, queued events per page by
+  `max_pending_events`, and pending updates to a slow browser by
+  `max_pending_ops`.
+- **Templates.** `jinja_components` signs the component and props it puts in the
+  page; tampered links render nothing.
+- **Content-Security-Policy.** The page uses inline style and small inline
+  scripts for streaming, and `js_component_from_string` needs `data:` scripts;
+  allow them in a policy that restricts `script-src`.
 
 ## How it works
 
-1. A GET renders the component tree at the requested URL, waits for its data, and returns its HTML, keeping nothing in memory. Content waiting in a `Suspense` boundary is streamed into the same response when it is ready.
-2. `client.js` (about 590 lines, no dependencies) opens a WebSocket for the same URL. The server renders again and sends the tree in document order; when it matches the page, the browser adopts the existing nodes in place, and otherwise rebuilds them (for a render that reads the clock or a random number). This is how React hydrates server HTML.
-3. A state change re-renders only the dirty components, shallowest first. The reconciler matches children by key and sends operations such as "set text of node 12" or "move node 40 before node 9". Moves are kept to the minimum using a longest-increasing-subsequence pass.
-4. Events from one page run one at a time, in order, each seeing the page as the previous one left it; plain handlers and effects run in worker threads.
-5. While you type, the browser ignores server values older than your latest keystroke, so a slow round trip never undoes typing.
-6. If the browser falls behind, pending updates merge into one message; past 100,000 pending operations the connection is closed and the browser starts over.
+1. A GET renders the component tree at the requested URL, waits for its data, and
+   returns the HTML, keeping nothing in memory. Content waiting in a `Suspense`
+   boundary is streamed into the same response when ready.
+2. `client.js`, a single script with no dependencies, opens a WebSocket for the
+   same URL. The server renders again and sends the tree; when it matches the
+   page, the browser adopts the existing nodes in place, as React hydrates.
+3. A state change re-renders only the affected components. The diff in
+   `core/vdom.py` matches children by key and sends operations such as "set the
+   text of node 12" or "move node 40 before node 9", keeping moves to a minimum.
+4. Events from one page run one at a time, in order; plain handlers and effects
+   run in worker threads, so a slow one does not block other pages.
+5. While you type, the browser ignores server values older than your latest
+   keystroke, so a slow round trip never undoes typing.
 
 The operation format is documented at the top of `src/reaction/core/vdom.py`.
-
-## Layout
-
-```
-src/reaction/
-  core/       elements, hooks, components, the reconciler and HTML rendering (no web dependencies)
-  server/     the Starlette app, run() and embed()
-  client/     client.js, the index.html page template and its style.css
-  cli/        the reaction command: scaffold.py (init), serve.py (dev, run)
-              and templates/, what init copies
-  testing.py  render() and the fake browser for tests, serve() for real browsers
-```
-
-`index.html` uses `$name` placeholders (`$title`, `$head`, `$body`, ...). The
-contents of `style.css` are inlined into the page so they cost no extra request.
 
 ## Development
 
@@ -788,9 +741,23 @@ contents of `style.css` are inlined into the page so they cost no extra request.
 uv sync
 uv run pytest          # browser tests use the installed Chrome, or: uv run playwright install chromium
 uv run mypy
-uv run python examples/todo.py       # also: pages.py, widgets.py, login.py, lunch_roulette.py
+uv run python examples/todo.py       # also: pages.py, widgets.py, login.py, lunch_roulette.py, fastapi_app.py
 uv run python benchmarks/bench.py
 ```
 
-The browser tests (`tests/test_browser.py`) skip when no browser is available, and
-the shared-store tests run against an in-process fake Redis server.
+The browser tests skip when no browser is available; the shared-store tests use
+an in-process fake Redis server. The test suite also runs on Python 3.11.
+
+```
+src/reaction/
+  core/       elements, hooks, components, the virtual DOM (vdom.py) and HTML rendering
+  server/     the ASGI app and integrations: run, mount, page, wrap, embed, jinja_components, prerender
+  client/     client.js, the page template (index.html) and its style.css
+  cli/        the reaction command: init, dev and run, and the project template
+  testing.py  render() with a fake browser, serve() and poll() for real browsers
+```
+
+## License
+
+No license has been chosen yet, so all rights are reserved by the author. The
+project is not yet published; until a license is added, do not redistribute it.

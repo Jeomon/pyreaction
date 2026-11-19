@@ -20,6 +20,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from ..server.settings import ENV_OPTIONS
+
 PROJECT_ENV = "PYREACTION_PROJECT"
 
 
@@ -43,9 +45,10 @@ def find_project(start: Path) -> tuple[Path, dict[str, Any]]:
 def load_app(root: Path, config: dict[str, Any], debug: bool = False) -> Any:
     """Import the project's root component and build the ASGI app for it.
 
-    ``debug`` shows errors in the browser; ``reaction dev`` turns it on.
+    ``debug`` shows errors in the browser; ``reaction dev`` turns it on, and
+    ``reaction run`` leaves it to ``PYREACTION_DEBUG``.
     """
-    from ..server.app import DEFAULT_MAX_UPLOAD, create_app
+    from ..server.app import create_app
 
     target = config.get("app", "app:App")
     module_name, _, attr = target.partition(":")
@@ -61,6 +64,10 @@ def load_app(root: Path, config: dict[str, Any], debug: bool = False) -> Any:
     static_dir = root / static if static else None
     if static_dir is not None and not static_dir.is_dir():
         static_dir = None
+    # Settings left out of [tool.pyreaction] come from PYREACTION_* variables, then defaults.
+    tuning = {name: config[name] for name in ENV_OPTIONS if name in config and name != "debug"}
+    if debug:
+        tuning["debug"] = True
     return create_app(
         component,
         title=config.get("title", "pyreaction"),
@@ -68,11 +75,7 @@ def load_app(root: Path, config: dict[str, Any], debug: bool = False) -> Any:
         lang=config.get("lang", "en"),
         static_dir=static_dir,
         stylesheets=config.get("stylesheets", []) if static_dir is not None else [],
-        allowed_origins=config.get("allowed_origins", []),
-        stream=config.get("stream", True),
-        resume_timeout=config.get("resume_timeout", 30.0),
-        max_upload_size=config.get("max_upload_size", DEFAULT_MAX_UPLOAD),
-        debug=debug,
+        **tuning,
     )
 
 

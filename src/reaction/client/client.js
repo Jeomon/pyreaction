@@ -645,6 +645,8 @@
   // Reconnect delays grow to RECONNECT_MAX ms, with jitter so a restarted server is
   // not hit by every page at the same moment.
   const RECONNECT_MAX = Number(script.dataset.reconnectMax || 8000);
+  // Failed attempts in a row before giving up; 0 retries for as long as the page is open.
+  const RECONNECT_ATTEMPTS = Number(script.dataset.reconnectAttempts || 0);
   // A message every HEARTBEAT ms keeps proxies from closing an idle connection.
   const HEARTBEAT = 25000;
   let heartbeat = null;
@@ -719,9 +721,30 @@
       clearInterval(heartbeat);
       document.documentElement.setAttribute("data-pyreaction-offline", "");
       document.documentElement.removeAttribute("data-pyreaction-ready");
+      if (RECONNECT_ATTEMPTS && retry >= RECONNECT_ATTEMPTS) {
+        connectionLost();
+        return;
+      }
       const delay = Math.min(250 * 2 ** retry++, RECONNECT_MAX);
       setTimeout(connect, delay / 2 + Math.random() * (delay / 2));
     };
+  }
+
+  // Out of attempts: say so, and offer a reload (which starts a fresh session).
+  function connectionLost() {
+    document.documentElement.setAttribute("data-pyreaction-lost", "");
+    if (document.getElementById("pyreaction-lost")) return;
+    const box = document.createElement("div");
+    box.id = "pyreaction-lost";
+    box.setAttribute("role", "alert");
+    const text = document.createElement("span");
+    text.textContent = "Connection to the server was lost.";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Reload";
+    button.onclick = () => location.reload();
+    box.append(text, button);
+    document.body.append(box);
   }
 
   connect();

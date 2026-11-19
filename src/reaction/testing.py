@@ -25,7 +25,7 @@ from typing import Any
 from .core.element import Element
 from .core.vdom import Root
 
-__all__ = ["LiveServer", "Page", "TestNode", "render", "serve"]
+__all__ = ["LiveServer", "Page", "TestNode", "poll", "render", "serve"]
 
 VOID = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
@@ -473,6 +473,40 @@ class LiveServer:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+
+def poll(check: Callable[[], Any], timeout: float = 5.0, interval: float = 0.02) -> Any:
+    """Call ``check`` until it returns something truthy, and return that; for tests
+    against a live server, where the page updates in its own time::
+
+        poll(lambda: page.text_content("#count") == "3")
+        rows = poll(lambda: db.fetch_rows())               # waits for a non-empty result
+
+        def saved():
+            assert store.get("draft") == "hello"           # assertions retry too
+        poll(saved)
+
+    An ``AssertionError`` from ``check`` counts as "not yet". After ``timeout``
+    seconds the last one is raised, or an ``AssertionError`` saying the condition
+    was never met. Other exceptions are raised at once.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        failure: AssertionError | None = None
+        try:
+            result = check()
+        except AssertionError as exc:
+            failure = exc
+        else:
+            if result:
+                return result
+        if time.monotonic() >= deadline:
+            if failure is not None:
+                raise failure
+            raise AssertionError(f"{getattr(check, '__name__', 'check')} was not true within {timeout}s (last: {result!r})")
+        time.sleep(interval)
 
 
 def serve(app: Any, **options: Any) -> LiveServer:

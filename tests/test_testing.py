@@ -126,3 +126,36 @@ def test_effects_run_and_clean_up_on_close():
     assert log == ["on"]
     page.close()
     assert log == ["on", "off"]
+
+
+# ---- poll() ----------------------------------------------------------------------------------
+
+
+def test_poll_waits_for_a_truthy_result_and_retries_assertions():
+    import threading
+    import time
+
+    from reaction.testing import poll
+
+    box = []
+    threading.Timer(0.1, lambda: box.append("done")).start()
+    assert poll(lambda: list(box)) == ["done"]
+
+    started = time.monotonic()
+
+    def later():
+        assert time.monotonic() - started > 0.05, "too soon"
+        return 7
+
+    assert poll(later) == 7
+
+    with pytest.raises(AssertionError, match="was not true within 0.1s \\(last: 0\\)"):
+        poll(lambda: 0, timeout=0.1)
+
+    def never():
+        assert False, "still waiting"
+
+    with pytest.raises(AssertionError, match="still waiting"):
+        poll(never, timeout=0.1)
+    with pytest.raises(ZeroDivisionError):
+        poll(lambda: 1 / 0)

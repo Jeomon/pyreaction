@@ -37,6 +37,7 @@ from starlette.websockets import WebSocket
 from ..core.element import Component, Element
 from ..core.vdom import Root, UploadedFile
 from ..core.ssr import render_children, render_portals, render_to_string
+from .settings import UNSET, resolve
 
 try:
     import orjson
@@ -215,7 +216,6 @@ def _parse_event(text: str) -> tuple[int, int, str, dict[str, Any]] | None:
     return seq, node_id, name, data
 
 
-DEFAULT_MAX_UPLOAD = 10 * 1024 * 1024
 _MAX_HEADER = 64 * 1024
 # The browser sends files in chunks of this size; frames stay far below servers'
 # WebSocket message limits (uvicorn: 16 MiB) whatever max_upload_size is.
@@ -352,19 +352,20 @@ def create_app(
     static_dir: str | Path | None = None,
     static_path: str = "/static",
     stylesheets: Sequence[str] = (),
-    allowed_origins: Sequence[str] = (),
-    max_pending_ops: int = 100_000,
-    max_pending_events: int = 1000,
-    max_upload_size: int = DEFAULT_MAX_UPLOAD,
+    allowed_origins: Sequence[str] = UNSET,
+    max_pending_ops: int = UNSET,
+    max_pending_events: int = UNSET,
+    max_upload_size: int = UNSET,
     prefix: str = "/_pyreaction",
-    data_timeout: float = 5.0,
-    stream: bool = True,
+    data_timeout: float = UNSET,
+    stream: bool = UNSET,
     routes: Sequence[Any] = (),
     on_error: Callable[[BaseException, str, Any], None] | None = None,
-    threaded: bool = True,
-    reconnect_max: int = 8000,
-    resume_timeout: float = 30.0,
-    debug: bool = False,
+    threaded: bool = UNSET,
+    reconnect_max: int = UNSET,
+    reconnect_attempts: int = UNSET,
+    resume_timeout: float = UNSET,
+    debug: bool = UNSET,
 ) -> Starlette:
     """An ASGI app serving ``app`` on every GET path.
 
@@ -393,8 +394,28 @@ def create_app(
     at most ``reconnect_max`` milliseconds. The server keeps the dropped page's
     components for ``resume_timeout`` seconds (0: not at all), so a reconnect within
     that time continues with their state; later, or on another worker process or
-    after a restart, the page renders afresh. ``debug`` shows errors in the browser.
+    after a restart, the page renders afresh. With ``reconnect_attempts`` (0: no
+    limit) the page stops retrying after that many failed attempts in a row and
+    says the connection was lost, with a button to reload. ``debug`` shows errors
+    in the browser.
+
+    The options ``debug``, ``allowed_origins`` (comma-separated), ``max_upload_size``,
+    ``max_pending_events``, ``max_pending_ops``, ``data_timeout``, ``stream``,
+    ``threaded``, ``reconnect_max``, ``reconnect_attempts`` and ``resume_timeout``
+    not passed here are read from ``PYREACTION_<OPTION>`` environment variables
+    (``PYREACTION_DEBUG=1``), else take their defaults.
     """
+    debug = resolve("debug", debug)
+    allowed_origins = resolve("allowed_origins", allowed_origins)
+    max_upload_size = resolve("max_upload_size", max_upload_size)
+    max_pending_events = resolve("max_pending_events", max_pending_events)
+    max_pending_ops = resolve("max_pending_ops", max_pending_ops)
+    data_timeout = resolve("data_timeout", data_timeout)
+    stream = resolve("stream", stream)
+    threaded = resolve("threaded", threaded)
+    reconnect_max = resolve("reconnect_max", reconnect_max)
+    reconnect_attempts = resolve("reconnect_attempts", reconnect_attempts)
+    resume_timeout = resolve("resume_timeout", resume_timeout)
     make = _as_factory(app)
 
     def new_root(url: str, connection: Any, base: str = "") -> Root:
@@ -467,6 +488,7 @@ def create_app(
                 app_base=escape(base),
                 page=escape(request.scope.get(_PAGE_PATH, "")),
                 reconnect_max=int(reconnect_max),
+                reconnect_attempts=int(reconnect_attempts),
             ).split(_STREAM_SPLIT)
             waiting = {n for node, n in boundaries.items() if node.waiting}
             if not waiting:

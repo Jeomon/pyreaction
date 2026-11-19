@@ -652,3 +652,46 @@ def test_js_component_from_string_in_chrome(page):
         page.click("#js-btn")
         page.wait_for_function("document.querySelector('#js-btn').textContent === 'clicks: 2'")
         assert page.text_content("#py") == "python sees 2"
+
+
+def test_page_gives_up_after_reconnect_attempts_in_chrome(page):
+    @component
+    def App():
+        return html.p("hello", id="hello")
+
+    sockets = []
+
+    def opened(ws):
+        sockets.append(ws.url)
+
+    page.on("websocket", opened)
+    server = serve(App, reconnect_attempts=2)
+    try:
+        open_page(page, server)
+        assert page.query_selector("#pyreaction-lost") is None
+    finally:
+        server.close()  # the page loses its connection and cannot get it back
+    page.wait_for_selector("#pyreaction-lost", timeout=10000)
+    assert page.text_content("#pyreaction-lost span") == "Connection to the server was lost."
+    assert page.text_content("#pyreaction-lost button") == "Reload"
+    assert page.evaluate("document.documentElement.hasAttribute('data-pyreaction-lost')")
+    # The first connection, then two failed attempts, then no more.
+    attempts = len(sockets)
+    page.wait_for_timeout(2000)
+    page.remove_listener("websocket", opened)
+    assert attempts == 3 and len(sockets) == attempts, sockets
+
+
+def test_page_keeps_retrying_without_a_limit_in_chrome(page):
+    @component
+    def App():
+        return html.p("hello", id="hello")
+
+    server = serve(App)
+    try:
+        open_page(page, server)
+    finally:
+        server.close()
+    page.wait_for_selector("html[data-pyreaction-offline]", state="attached", timeout=10000)
+    page.wait_for_timeout(2000)
+    assert page.query_selector("#pyreaction-lost") is None, "the default retries for as long as the page is open"
