@@ -147,6 +147,38 @@ class _MountableApp(Starlette):
         await self.middleware_stack(scope, receive, send)
 
 
+def _warn_if_static_shadowed(scope: Any, ours: Any, static_path: str) -> None:
+    """Warn when the app this one is mounted in has a route (often its own /static)
+    that answers this app's static URLs first, so its stylesheets would 404."""
+    from starlette.routing import Match
+
+    host = scope.get("app")
+    routes = getattr(getattr(host, "router", None), "routes", None)
+    if host is None or host is ours or not routes:
+        return
+    base = scope.get("root_path", "").rstrip("/")
+    host_root = scope.get("app_root_path", "").rstrip("/")
+    probe = {
+        "type": "http", "method": "GET", "headers": [], "root_path": host_root,
+        "path": f"{base}{static_path}/__probe__", "query_string": b"",
+    }
+    for route in routes:
+        if getattr(route, "app", None) is ours:
+            return  # reached our own mount first
+        try:
+            match, _ = route.matches(probe)
+        except Exception:
+            continue
+        if match == Match.FULL:
+            logger.warning(
+                "The app's route %r answers %s%s/... before pyreaction does, so its static files "
+                "(stylesheets, scripts) are not served. Pass another static_path, e.g. "
+                "mount(app, App, static_path=\"/assets\"), or mount the pages under a path.",
+                getattr(route, "path", route), base, static_path,
+            )
+            return
+
+
 def _origin_allowed(conn: HTTPConnection, allowed: Sequence[str]) -> bool:
     """Browsers send Origin on every WebSocket; only the page's own site may connect.
 
@@ -379,7 +411,15 @@ def create_app(
         if entry is not None:
             discard(entry[0])
 
+    checked_static = False
+    this_app: list[Any] = [None]  # set below, once the app exists
+
     async def page(request: Request) -> Response:
+        nonlocal checked_static
+        if not checked_static:
+            checked_static = True
+            if static_dir is not None:
+                _warn_if_static_shadowed(request.scope, this_app[0], static_path)
         base, path = _app_path(request.scope)
         url = path + (f"?{request.url.query}" if request.url.query else "")
         root = new_root(url, request, base)
@@ -391,7 +431,9 @@ def create_app(
             if not await root.settle(data_timeout, suspense=not stream):
                 logger.warning("Rendering %s before its data loaded (data_timeout=%ss)", url, data_timeout)
             if root.redirect is not None:
-                return RedirectResponse(root.location.href(root.redirect), status_code=307)
+                code = root.status if 300 <= root.status < 400 else 307
+                target = root.redirect if root.redirect_as_is else root.location.href(root.redirect)
+                return RedirectResponse(target, status_code=code, headers=root.headers)
             boundaries: dict[Any, int] = {}
             body = render_to_string(root, boundaries if stream else None)
             portals = render_portals(root, boundaries if stream else None)
@@ -417,12 +459,13 @@ def create_app(
             ).split(_STREAM_SPLIT)
             waiting = {n for node, n in boundaries.items() if node.waiting}
             if not waiting:
-                return HTMLResponse(parts[0] + parts[1], status_code=status)
+                return HTMLResponse(parts[0] + parts[1], status_code=status, headers=root.headers)
             handed_off = True
             return StreamingResponse(
                 _stream_page(root, parts, boundaries, waiting, deadline),
                 media_type="text/html",
                 status_code=status,
+                headers=root.headers,
             )
         finally:
             if not handed_off:
@@ -520,7 +563,8 @@ def create_app(
     if static_dir is not None:
         table.append(Mount(static_path, StaticFiles(directory=static_dir), name="static"))
     table += [Route("/", page), Route("/{path:path}", page)]
-    return _MountableApp(debug=debug, routes=table)
+    this_app[0] = _MountableApp(debug=debug, routes=table)
+    return this_app[0]
 
 
 def mount(

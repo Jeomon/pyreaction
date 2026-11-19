@@ -525,7 +525,12 @@ class Root:
         self.title: str | None = None
         # For the server's first response: the HTTP status, or a URL to redirect to.
         self.status = 200
+        # More headers for the first response (from an HTTPException's headers).
+        self.headers: dict[str, str] = {}
         self.redirect: str | None = None
+        # Navigate's paths are inside the app (the mount prefix goes first); an
+        # HTTPException's Location is sent as written.
+        self.redirect_as_is = False
         self.ack = 0
         self._title_dirty = False
         # Tags each Head component puts into <head>, in the order they rendered.
@@ -769,6 +774,22 @@ class Root:
     def _render_failed(self, node: ComponentNode, exc: BaseException) -> None:
         """An error while rendering ``node``: to the nearest error boundary, else logged."""
         boundary = self._boundary_for(node, "catch")
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int) and hasattr(exc, "detail"):
+            # An HTTPException (FastAPI's or Starlette's): an expected answer, not a
+            # crash. It sets the first response's status, headers and redirect.
+            if self._sink is None:
+                headers = dict(getattr(exc, "headers", None) or {})
+                location = headers.pop("Location", None) or headers.pop("location", None)
+                self.status = status
+                self.headers.update(headers)
+                if 300 <= status < 400 and location:
+                    self.redirect = location
+                    self.redirect_as_is = True  # a site URL, as FastAPI means it
+            logger.info("%s raised HTTP %d: %s", node.name, status, getattr(exc, "detail", ""))
+            if boundary is not None:
+                boundary.catch(exc)  # type: ignore[misc]
+            return
         if boundary is None:
             self.report(exc, f"rendering {node.name}")
         else:

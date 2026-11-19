@@ -149,3 +149,132 @@ def test_create_app_on_its_own_is_unchanged():
     client = TestClient(create_app(App))
     assert 'data-base=""' in client.get("/").text
     assert client.get("/old", follow_redirects=False).headers["location"] == "/users/1"
+
+
+# ---- HTTPException in components ------------------------------------------------------
+
+
+def test_http_exception_sets_status_headers_and_the_boundary_shows_it():
+    from fastapi import HTTPException
+
+    from reaction import ErrorBoundary
+
+    @component
+    def Guarded():
+        if "user" not in use_request().cookies:
+            raise HTTPException(401, "sign in first", headers={"WWW-Authenticate": "Cookie"})
+        return html.p("secret")
+
+    @component
+    def Shop():
+        return html.main(
+            html.h1("Shop"),
+            ErrorBoundary(Guarded(), fallback=lambda e, reset: html.p(f"{e.status_code}: {e.detail}", id="err")),
+        )
+
+    api = FastAPI()
+    mount(api, Shop, "/shop")
+    mount(api, Guarded, "/bare")
+    client = TestClient(api)
+
+    page = client.get("/shop/")
+    assert page.status_code == 401 and page.headers["www-authenticate"] == "Cookie"
+    assert "<h1>Shop</h1>" in page.text and 'id="err">401: sign in first<' in page.text
+    assert client.get("/bare/").status_code == 401, "without a boundary too"
+    assert "secret" in TestClient(api, cookies={"user": "ada"}).get("/bare/").text
+
+
+def test_http_exception_redirect_is_sent_as_written():
+    from fastapi import HTTPException
+
+    @component
+    def ToLogin():
+        raise HTTPException(303, headers={"Location": "/login"})
+
+    @component
+    def Old():
+        return Navigate("/new")
+
+    api = FastAPI()
+    mount(api, ToLogin, "/a")
+    mount(api, Old, "/b")
+    client = TestClient(api)
+    to_login = client.get("/a/", follow_redirects=False)
+    assert (to_login.status_code, to_login.headers["location"]) == (303, "/login"), "a site URL"
+    old = client.get("/b/", follow_redirects=False)
+    assert (old.status_code, old.headers["location"]) == (307, "/b/new"), "Navigate stays inside the app"
+
+
+def test_http_exception_once_live_goes_to_the_boundary_only():
+    from fastapi import HTTPException
+
+    from reaction import ErrorBoundary, use_state
+
+    @component
+    def Item():
+        n, set_n = use_state(0)
+        if n:
+            raise HTTPException(404, "gone")
+        return html.button("open", on_click=lambda: set_n(1))
+
+    @component
+    def Page():
+        return ErrorBoundary(Item(), fallback=lambda e, reset: html.p(f"{e.status_code} {e.detail}"))
+
+    api = FastAPI()
+    mount(api, Page)
+    client = TestClient(api)
+    with client.websocket_connect("/_pyreaction/ws?p=/") as ws:
+        first = json.loads(ws.receive_text())
+        dom = FakeDom()
+        dom.apply(first["ops"])
+        button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
+        ws.send_text(json.dumps([1, button, "click", {}]))
+        while "404 gone" not in dom.html():
+            dom.apply(json.loads(ws.receive_text())["ops"])
+        assert dom.html() == "<p>404 gone</p>"
+
+
+# ---- static files shadowed by the host ----------------------------------------------------
+
+
+def test_warns_when_the_host_serves_the_same_static_path(tmp_path, caplog):
+    from fastapi.staticfiles import StaticFiles
+
+    (tmp_path / "mine").mkdir()
+    (tmp_path / "pub").mkdir()
+    (tmp_path / "pub" / "app.css").write_text("y")
+
+    def build(**options):
+        api = FastAPI()
+        api.mount("/static", StaticFiles(directory=tmp_path / "mine"))
+        mount(api, App, static_dir=tmp_path / "pub", **options)
+        return TestClient(api)
+
+    logging.disable(logging.NOTSET)
+    with caplog.at_level(logging.WARNING, logger="reaction"):
+        client = build()
+        client.get("/")
+        client.get("/again")
+    warnings = [r.getMessage() for r in caplog.records if "answers /static/" in r.getMessage()]
+    assert len(warnings) == 1 and 'static_path="/assets"' in warnings[0]
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="reaction"):
+        fixed = build(static_path="/assets")
+        assert fixed.get("/assets/app.css").text == "y"
+    assert not [r for r in caplog.records if "answers" in r.getMessage()]
+
+
+def test_no_warning_when_mounted_under_a_path(tmp_path, caplog):
+    from fastapi.staticfiles import StaticFiles
+
+    (tmp_path / "mine").mkdir()
+    (tmp_path / "pub").mkdir()
+    api = FastAPI()
+    api.mount("/static", StaticFiles(directory=tmp_path / "mine"))
+    mount(api, App, "/ui", static_dir=tmp_path / "pub")
+    logging.disable(logging.NOTSET)
+    with caplog.at_level(logging.WARNING, logger="reaction"):
+        TestClient(api).get("/ui/")
+    assert not [r for r in caplog.records if "answers" in r.getMessage()]

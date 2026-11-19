@@ -539,6 +539,21 @@ middleware. FastAPI's `Depends` does not apply to components; share database
 pools and settings through `app.state` or the lifespan. `examples/fastapi_app.py`
 is a complete app.
 
+`raise HTTPException(...)` in a component works as in a route: the first
+response gets its status and headers (a 3xx with a `Location` header redirects),
+and the nearest `ErrorBoundary` shows its fallback with the exception
+(`e.status_code`, `e.detail`). Once the page is live, only the boundary changes.
+
+If the FastAPI app already serves `/static`, pages mounted at `/` cannot use that
+path for their own files; pyreaction logs a warning on the first request. Pass
+`static_path="/assets"`, or mount the pages under a path.
+
+Checked against FastAPI 0.165: routers and OpenAPI, a proxy root path
+(`fastapi run --root-path`), CORS, TrustedHost, GZip and `@api.middleware("http")`
+(streamed pages stay streamed), `request.user` from Starlette's
+`AuthenticationMiddleware`, several apps in one FastAPI app, Jinja pages with
+`embed()`, `fastapi run` and `uvicorn --workers N`.
+
 Options: `title`, `head`, `lang`, `static_dir`, `static_path`, `stylesheets`,
 `routes` (extra Starlette routes), `data_timeout`, `stream`, `max_upload_size`,
 `allowed_origins`, `on_error`, `threaded`, `reconnect_max` (ms),
