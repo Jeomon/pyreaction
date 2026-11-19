@@ -1,4 +1,5 @@
-"""The reconciler: keeps the mounted tree and turns re-renders into DOM operations.
+"""The virtual DOM: the reconciler keeps the mounted tree and turns re-renders into
+DOM operations; :func:`to_vdom` shows the tree as plain dicts.
 
 Each DOM node the browser holds has an integer id. A render produces a flat list
 of operations on those ids, so an update costs what changed, not what exists:
@@ -44,7 +45,7 @@ from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qs
 
-from .element import FRAGMENT, PORTAL, Component, Element, JsComponent
+from .element import FRAGMENT, PORTAL, RAW_HTML, RAW_MARK, Component, Element, JsComponent
 from .hooks import ACTIVE_ROOT, BROWSER_ONLY, CURRENT, CURRENT_ACTION, BrowserOnly, Context, EffectSlot, Suspended, same
 
 logger = logging.getLogger("reaction")
@@ -1758,3 +1759,87 @@ class Root:
         while not isinstance(parent, HostNode):
             parent = parent.parent
         return parent
+
+# ---- the tree as plain dicts ---------------------------------------------------------
+#
+# pyreaction keeps its virtual DOM here, on the server, and sends the browser only
+# changes. to_vdom turns the tree into JSON-ready data, using reactpy's key names:
+# {"tagName": "button", "attributes": {...}, "eventHandlers": {...}, "children": [...]}
+
+
+def to_vdom(target: Root | Element) -> dict[str, Any]:
+    """The rendered tree of ``target`` as plain dicts and strings.
+
+    ``target`` is an element (mounted just for this, as for the page's first HTML)
+    or a live :class:`Root` (its current state, e.g. ``page.root`` in a test).
+    Components are rendered: only tags and text remain. The result is a fragment,
+    ``{"tagName": "", "children": [...]}``, whose children are what the page shows.
+
+    Each tag is ``{"tagName": "div"}`` plus, when present:
+
+    - ``"key"``: the element's key
+    - ``"attributes"``: as written to the page (``class``, ``for``, ``data-id``,
+      ``style`` as text); ``value`` and ``checked`` as given
+    - ``"eventHandlers"``: one entry per DOM event (``"click"``; ``"input"`` for
+      ``on_change``; ``"click:capture"`` for ``on_click_capture``), listing the
+      options that are set (``preventDefault``, ``debounce``, ``keys``...); a
+      :func:`~reaction.js` handler has ``"code"``
+    - ``"dangerouslySetInnerHTML"``: ``{"__html": "..."}`` for raw HTML
+    - ``"importSource"``: ``{"source": url, "export": name}`` for a
+      :func:`~reaction.js_component`, whose props are its attributes
+    - ``"portal"``: the target selector, for a :func:`~reaction.portal` (shown where
+      it is written, though the browser puts it elsewhere)
+    """
+    root = target if isinstance(target, Root) else Root(target)
+    try:
+        return {"tagName": "", "children": _children(root.container.children)}
+    finally:
+        if root is not target:
+            root.close()
+
+
+def _children(nodes: list[Any]) -> list[Any]:
+    out: list[Any] = []
+    for node in nodes:
+        if isinstance(node, ComponentNode):
+            out.extend(_children(node.children))  # a component adds no tag of its own
+        elif isinstance(node, TextNode):
+            if node.text:
+                out.append(node.text)
+        else:
+            out.append(_host(node))
+    return out
+
+
+_SPEC_NAMES = (
+    "preventDefault", "stopPropagation", "debounce", "throttle", "keys", "code",
+    "stopImmediatePropagation", "form",
+)
+
+
+def _host(node: HostNode) -> dict[str, Any]:
+    if node.type == PORTAL:
+        out: dict[str, Any] = {"tagName": "", "portal": node.attrs.get("target", "body")}
+    elif isinstance(node.type, JsComponent):
+        js = node.type
+        out = {"tagName": js.tag, "importSource": {"source": js.module, "export": js.export}}
+        if node.attrs:
+            out["attributes"] = dict(node.attrs)
+    else:
+        out = {"tagName": node.type}
+        attrs = {k: v for k, v in node.attrs.items() if k not in (RAW_HTML, RAW_MARK)}
+        if attrs:
+            out["attributes"] = attrs
+        if RAW_HTML in node.attrs:
+            out["dangerouslySetInnerHTML"] = {"__html": node.attrs[RAW_HTML]}
+    if node.element.key is not None:
+        out["key"] = node.element.key
+    if node.events:
+        out["eventHandlers"] = {
+            name: {k: v for k, v in zip(_SPEC_NAMES, handler.spec()) if v not in (None, False)}
+            for name, handler in node.events.items()
+        }
+    children = _children(node.children)
+    if children:
+        out["children"] = children
+    return out

@@ -427,7 +427,7 @@ def test_rendering_pauses_the_gc_and_restores_it():
     import gc
 
     from reaction import Root, component, html, use_state
-    from reaction.core.reconciler import _gc_paused
+    from reaction.core.vdom import _gc_paused
 
     seen = []
 

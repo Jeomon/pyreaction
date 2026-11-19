@@ -472,6 +472,20 @@ action waits until the page has settled. `find`/`find_all` take CSS selectors
 raised by your components fail the test (`raise_errors=False` collects them in
 `page.errors`). `on_call=` answers element calls such as `getBoundingClientRect`.
 
+`to_vdom(element)`, or `to_vdom(page.root)` for a page's current state, returns
+the rendered tree as plain dicts, with components rendered away: handy for
+snapshot tests and debugging. It uses reactpy's key names:
+
+```python
+{"tagName": "", "children": [
+    {"tagName": "button", "attributes": {"class": "primary"},
+     "eventHandlers": {"click": {"preventDefault": True}}, "children": ["Save"]}]}
+```
+
+Tags may also have `key`, `dangerouslySetInnerHTML`, `importSource` (for a
+`js_component`) and `portal`. Event handlers are listed by DOM event (`input` for
+`on_change`) with the options that are set.
+
 For a real browser, `serve` runs the app on a free local port in a background
 thread; the page marks `<html data-pyreaction-ready>` once it is live:
 
@@ -657,7 +671,7 @@ instance, keeps its state.
 5. While you type, the browser ignores server values older than your latest keystroke, so a slow round trip never undoes typing.
 6. If the browser falls behind, pending updates merge into one message; past 100,000 pending operations the connection is closed and the browser starts over.
 
-The operation format is documented at the top of `src/reaction/core/reconciler.py`.
+The operation format is documented at the top of `src/reaction/core/vdom.py`.
 
 ## Layout
 

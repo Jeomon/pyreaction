@@ -9,7 +9,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
-    from .reconciler import ComponentNode
+    from .vdom import ComponentNode
 
 logger = logging.getLogger("reaction")
 
@@ -685,7 +685,7 @@ def use_action_state(
 
 
 def _action_runner(holder: Ref[Any], fn: Ref[Any], set_state: Any, start: Any) -> Callable[..., None]:
-    from .reconciler import Event
+    from .vdom import Event
 
     # *args, not a default: as an event handler it must receive the event.
     def run(*args: Any) -> None:

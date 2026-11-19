@@ -110,7 +110,7 @@ class FakeDom:
 def tree_html(root: Any) -> str:
     """The mounted tree in FakeDom's format, built straight from the reconciler's nodes."""
     from reaction.core.element import JsComponent
-    from reaction.core.reconciler import ComponentNode, TextNode
+    from reaction.core.vdom import ComponentNode, TextNode
 
     def nodes(children: list[Any]) -> str:
         out = []

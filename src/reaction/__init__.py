@@ -73,7 +73,7 @@ from .core.hooks import (
     use_optimistic,
 )
 from .core.parse import parse_html
-from .core.reconciler import ElementHandle, Event, FormFields, Location, Reply, Root, UploadedFile
+from .core.vdom import ElementHandle, Event, FormFields, Location, Reply, Root, UploadedFile, to_vdom
 from .core.router import Link, Navigate, Router
 from .core.ssr import render_to_static_markup, render_to_string
 from .core.resources import preconnect, prefetch_dns, preinit, preinit_module, preload, preload_module
@@ -149,6 +149,7 @@ __all__ = [
     "portal",
     "render_to_static_markup",
     "render_to_string",
+    "to_vdom",
     "run",
     "use_action_state",
     "use_async",

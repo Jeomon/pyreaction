@@ -13,7 +13,7 @@ from html import escape
 from typing import Any
 
 from .element import PORTAL, RAW_HTML, Element, JsComponent
-from .reconciler import ComponentNode, HostNode, Root, TextNode
+from .vdom import ComponentNode, HostNode, Root, TextNode
 
 __all__ = ["render_children", "render_head", "render_portals", "render_to_static_markup", "render_to_string"]
 

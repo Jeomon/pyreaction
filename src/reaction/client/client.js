@@ -1,5 +1,5 @@
 // pyreaction browser client: applies DOM operations from the server and sends events back.
-// No build step and no dependencies. The op format is documented in core/reconciler.py.
+// No build step and no dependencies. The op format is documented in core/vdom.py.
 (() => {
   "use strict";
 

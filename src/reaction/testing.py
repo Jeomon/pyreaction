@@ -23,7 +23,7 @@ from html import escape
 from typing import Any
 
 from .core.element import Element
-from .core.reconciler import Root
+from .core.vdom import Root
 
 __all__ = ["LiveServer", "Page", "TestNode", "render", "serve"]
 

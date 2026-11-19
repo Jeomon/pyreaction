@@ -32,7 +32,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket
 
 from ..core.element import Component, Element
-from ..core.reconciler import Root, UploadedFile
+from ..core.vdom import Root, UploadedFile
 from ..core.ssr import render_children, render_portals, render_to_string
 
 try:
