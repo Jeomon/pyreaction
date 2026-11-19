@@ -39,17 +39,7 @@ from ..core.vdom import Root, UploadedFile
 from ..core.ssr import render_children, render_portals, render_to_string
 from .settings import UNSET, resolve
 
-try:
-    import orjson
-
-    def _dumps(data: Any) -> str:
-        return orjson.dumps(data).decode()
-
-except ImportError:  # pragma: no cover - depends on the optional extra
-    _encoder = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False)
-
-    def _dumps(data: Any) -> str:
-        return _encoder.encode(data)
+from .encoding import dumps as _dumps
 
 __all__ = ["create_app", "embed", "jinja_components", "mount", "page", "prerender", "run", "wrap"]
 
@@ -63,6 +53,8 @@ STYLE = (CLIENT_DIR / "style.css").read_text(encoding="utf-8")
 
 # Close code for "the browser is not keeping up": it reconnects with a fresh session.
 TRY_AGAIN_LATER = 1013
+# Close code for an update the server could not send: the page reconnects and renders afresh.
+INTERNAL_ERROR = 1011
 POLICY_VIOLATION = 1008
 
 
@@ -531,9 +523,23 @@ def create_app(
         resumed = parked.pop(ws.query_params.get("s", ""), None)
         sid = secrets.token_urlsafe(18)
 
+        broken = False
+
         async def writer() -> None:
+            nonlocal broken
             while (message := await outbox.take()) is not None:
-                await ws.send_text(_dumps(message))
+                try:
+                    text = _dumps(message)
+                except Exception as exc:
+                    # Without this the page would wait for an update that never comes.
+                    broken = True
+                    if root is not None:
+                        root.report(exc, "sending an update to the browser")
+                    else:
+                        logger.error("Could not send an update to the browser", exc_info=exc)
+                    await ws.close(code=INTERNAL_ERROR)
+                    return
+                await ws.send_text(text)
             logger.warning("Closing a WebSocket that fell %d operations behind", outbox.size)
             await ws.close(code=TRY_AGAIN_LATER)
 
@@ -588,7 +594,9 @@ def create_app(
             if uploads is not None:
                 uploads.close()  # files half-sent on this connection
             if root is not None:
-                if resume_timeout > 0 and root._sink is not None:
+                # A session whose update could not be sent is not resumed: it would
+                # send the same update again.
+                if resume_timeout > 0 and root._sink is not None and not broken:
                     root.detach()
                     timer = asyncio.get_running_loop().call_later(resume_timeout, expire, sid)
                     parked[sid] = (root, timer)

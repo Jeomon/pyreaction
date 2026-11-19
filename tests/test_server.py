@@ -365,3 +365,93 @@ def test_environment_settings_reach_the_page(monkeypatch):
     assert 'data-reconnect-max="3000" data-reconnect-attempts="12"' in page
     with TestClient(create_app(App, reconnect_attempts=4)) as client:
         assert 'data-reconnect-attempts="4"' in client.get("/").text
+
+
+# ---- encoding updates for the browser -----------------------------------------------------------
+
+
+def test_both_encoders_send_the_same_text_for_awkward_values(caplog):
+    import dataclasses
+    import datetime
+    import decimal
+    import enum
+    import math
+
+    from reaction.server import encoding
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    @dataclasses.dataclass
+    class Point:
+        x: int
+        y: int
+
+    data = {
+        "text": "héllo ✓ 😀", "nums": [1, 0.5, 1e16, 2**70, math.nan, -math.inf],
+        "keys": {1: "a", 2.5: "b", False: "c", None: "d"},
+        "when": [datetime.date(2026, 1, 2), datetime.datetime(2026, 1, 2, 3, 4, 5), datetime.time(6, 7)],
+        "enum": Color.RED, "point": Point(1, 2), "tags": {"x"}, "tuple": (1, 2),
+        "decimal": decimal.Decimal("1.50"),
+    }
+    expected = (
+        '{"text":"héllo ✓ 😀","nums":[1,0.5,1e+16,1180591620717411303424,null,null],'
+        '"keys":{"1":"a","2.5":"b","false":"c","null":"d"},'
+        '"when":["2026-01-02","2026-01-02T03:04:05","06:07:00"],'
+        '"enum":"red","point":{"x":1,"y":2},"tags":["x"],"tuple":[1,2],"decimal":"1.50"}'
+    )
+    assert encoding._dumps_std(data) == expected
+    assert encoding.dumps(data) == expected, "orjson (when installed) gives the same text"
+    assert "Sent a Decimal to the browser as text" in caplog.text
+    loop = []
+    loop.append(loop)
+    with pytest.raises(ValueError, match="Circular"):
+        encoding.dumps({"loop": loop})
+
+
+def update_after_click(app_component, **options):
+    """What a click sends back, or how the connection closed."""
+    with TestClient(create_app(app_component, **options)) as client:
+        with client.websocket_connect("/_pyreaction/ws?p=/") as ws:
+            first = json.loads(ws.receive_text())
+            button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
+            ws.send_text(json.dumps([1, button, "click", {}]))
+            try:
+                return json.loads(ws.receive_text())
+            except WebSocketDisconnect as closed:
+                return closed.code
+
+
+def test_props_that_are_not_json_still_reach_the_page():
+    import datetime
+
+    from reaction import js_component
+
+    Chart = js_component("/static/chart.js")
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        chart = Chart(labels={1: "Jan"}, since=datetime.date(2026, 1, 1), big=2**70) if n else None
+        return html.div(html.button(f"n={n}", on_click=lambda: set_n(n + 1)), chart)
+
+    message = update_after_click(App)
+    mounted = next(op for op in message["ops"] if op[0] == "j")
+    assert mounted[5] == {"labels": {"1": "Jan"}, "since": "2026-01-01", "big": 2**70}
+
+
+def test_an_update_that_cannot_be_sent_closes_the_page_and_reports_it():
+    from reaction import js_component
+
+    Chart = js_component("/static/chart.js")
+    loop = []
+    loop.append(loop)
+    errors = []
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        return html.div(html.button(f"n={n}", on_click=lambda: set_n(n + 1)), Chart(data=loop) if n else None)
+
+    assert update_after_click(App, on_error=lambda exc, where, conn: errors.append((type(exc), where))) == 1011
+    assert errors == [(ValueError, "sending an update to the browser")]
