@@ -7,13 +7,67 @@ import inspect
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from .element import Element, component, html
+from .element import Element, component, event, html
 from .hooks import BROWSER_ONLY, CURRENT, Ref, create_context, use_context, use_ref, use_state, use_transition
 
 __all__ = [
-    "Activity", "Form", "FormStatus", "Head", "Profiler", "StrictMode", "Suspense", "ViewTransition",
+    "Activity", "Form", "FormStatus", "Head", "Profiler", "StrictMode", "Suspense", "ViewTransition", "VirtualList",
     "image", "use_form_status", "use_linked_inputs",
 ]
+
+
+@component
+def VirtualList(
+    items: Sequence[Any],
+    render: Callable[[Any, int], Any],
+    *,
+    row_height: int,
+    height: int = 400,
+    overscan: int = 5,
+    key: Callable[[Any], Any] | None = None,
+    throttle: int = 30,
+    **props: Any,
+) -> Element:
+    """A long list that renders only the rows in view (plus ``overscan`` on each
+    side), so 100,000 items cost what 30 do::
+
+        VirtualList(users, lambda user, i: UserRow(user), row_height=36, height=600,
+                    key=lambda user: user.id)
+
+    ``render(item, index)`` draws one row inside a box ``row_height`` pixels tall;
+    rows must fit that height. The list is a scrolling box ``height`` pixels tall;
+    other props (``class_name``, ``style``, ``aria_label``...) go on it. Scrolling is
+    reported to the server at most every ``throttle`` ms, and the list re-renders
+    only when the first visible row changes. Rows scrolled out are unmounted, so
+    keep their state above the list. ``key(item)`` gives rows stable keys (default:
+    the index), which matters when items are inserted or removed.
+    """
+    row_height = max(1, int(row_height))
+    count = len(items)
+    first_row, set_first_row = use_state(0)
+    visible = height // row_height + 1
+    first = max(0, min(first_row, count - visible) - overscan)
+    last = min(count, first_row + visible + overscan)
+
+    def scrolled(e: Any) -> None:
+        set_first_row(max(0, int(e.target.scrollTop or 0) // row_height))
+
+    rows = [
+        html.div(
+            render(items[i], i),
+            key=key(items[i]) if key is not None else i,
+            style={"position": "absolute", "top": f"{i * row_height}px", "left": 0, "right": 0,
+                   "height": f"{row_height}px", "overflow": "hidden"},
+        )
+        for i in range(first, last)
+    ]
+    style = {"height": f"{height}px", "overflow_y": "auto", "position": "relative", **props.pop("style", {})}
+    return html.div(
+        html.div(rows, style={"position": "relative", "height": f"{count * row_height}px"}),
+        style=style,
+        on_scroll=event(scrolled, throttle=throttle),
+        **props,
+    )
 
 
 def image(format: str, value: str | bytes, **attrs: Any) -> Element:

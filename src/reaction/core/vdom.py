@@ -4,7 +4,8 @@ DOM operations; :func:`to_vdom` shows the tree as plain dicts.
 Each DOM node the browser holds has an integer id. A render produces a flat list
 of operations on those ids, so an update costs what changed, not what exists:
 
-    ["c", id, tag, attrs, events]   create an element (events: {name: spec})
+    ["c", id, tag, attrs, events, ns]   create an element (events: {name: spec}; trailing
+                                    empty attrs and events, and ns when None, are left out)
     ["t", id, text]                 create a text node
     ["A", parent, [ids]]            append children to a new element
     ["a", parent, id, before]       insert or move a child before ``before`` (null: at the end)
@@ -45,6 +46,7 @@ from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qs
 
+from ._compiled import python_class
 from .element import FRAGMENT, PORTAL, RAW_HTML, RAW_MARK, Component, Element, JsComponent
 from .hooks import ACTIVE_ROOT, BROWSER_ONLY, CURRENT, CURRENT_ACTION, BrowserOnly, Context, EffectSlot, Suspended, same
 
@@ -182,6 +184,7 @@ class ComponentNode:
         return getattr(self.type, "__name__", str(self.type))
 
 
+@python_class
 class Event(dict):
     """Event data from the browser. Keys read as attributes: ``e.value``, ``e.target.checked``.
 
@@ -519,10 +522,14 @@ def _flatten_items(
 
     Elements without a key inside a list (not the element's direct arguments) are
     counted into ``unkeyed``, for the debug warning."""
+    # Exact types first (the common cases, and cheaper than isinstance); text always
+    # comes out as a plain str, so later steps can test ``type(item) is str``.
+    key: tuple[Any, ...]
     for i, item in enumerate(items):
         if item is None or item is True or item is False:
             continue
-        if isinstance(item, Element):
+        kind = type(item)
+        if kind is Element or (kind is not str and isinstance(item, Element)):
             if item.key is not None:
                 key = (prefix, "$", item.key)
             else:
@@ -530,8 +537,10 @@ def _flatten_items(
                 if prefix and unkeyed is not None:
                     unkeyed.append(i)
             out.append((key, item))
-        elif isinstance(item, str):
+        elif kind is str:
             out.append(((*prefix, i), item))
+        elif isinstance(item, str):
+            out.append(((*prefix, i), str(item)))
         elif isinstance(item, (int, float)):
             out.append(((*prefix, i), str(item)))
         elif isinstance(item, (list, tuple)) or inspect.isgenerator(item):
@@ -630,7 +639,7 @@ class Root:
         self._flushing = False
         self._sink: Callable[[dict[str, Any]], None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: int | None = None
+        self._loop_thread: int | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         # Work started by background(): what settle() waits for.
         self._pending: set[asyncio.Task[Any]] = set()
@@ -658,7 +667,7 @@ class Root:
         page: the components keep their state.
         """
         self._loop = asyncio.get_running_loop()
-        self._thread = threading.get_ident()
+        self._loop_thread = threading.get_ident()
         if self._queue is None:
             self._queue = asyncio.Queue()
             self.spawn(self._work())
@@ -758,7 +767,7 @@ class Root:
 
     def call(self, fn: Callable[[], None]) -> None:
         """Run ``fn`` on this root's event loop; state setters go through here."""
-        if self._loop is not None and threading.get_ident() != self._thread:
+        if self._loop is not None and threading.get_ident() != self._loop_thread:
             seq = getattr(_handling, "seq", None)
             if seq is None:
                 self._loop.call_soon_threadsafe(fn)
@@ -905,7 +914,7 @@ class Root:
         """Render and send pending updates at once (flush_sync). From a worker
         thread, waits until the loop has done it; the thread's own updates, posted
         to the loop before, are included."""
-        if self._loop is None or threading.get_ident() == self._thread:
+        if self._loop is None or threading.get_ident() == self._loop_thread:
             self.flush()
             return
         done: concurrent.futures.Future[None] = concurrent.futures.Future()
@@ -1286,7 +1295,7 @@ class Root:
             self.request_flush()
 
         self.call(apply)
-        return Reply(future, self._thread)
+        return Reply(future, self._loop_thread)
 
     def _answer(self, data: dict[str, Any]) -> None:
         future = self._replies.pop(data.get("r"), None)  # type: ignore[arg-type]
@@ -1468,7 +1477,7 @@ class Root:
                 key = (key, len(result))
             seen.add(key)
             prev = by_key.pop(key, None)
-            item_type = str if isinstance(item, str) else item.type
+            item_type = str if type(item) is str else item.type
             # Tag names are compared by value: strings built at runtime are not interned.
             if prev is not None and (prev.type is item_type or prev.type == item_type):
                 self._update(prev, item)
@@ -1487,7 +1496,7 @@ class Root:
         return result
 
     def _mount(self, item: Any, key: Any, parent: Any) -> Any:
-        if isinstance(item, str):
+        if type(item) is str:
             node_id = next(self._ids)
             self.ops.append(["t", node_id, item])
             return TextNode(node_id, item, key, parent)
@@ -1505,7 +1514,7 @@ class Root:
                 self.ops.append(["A", host.id, host.dom])
             self._attach_ref(host, item.ref)
             return host
-        if isinstance(item.type, str) and item.type != FRAGMENT:
+        if type(item.type) is str and item.type != FRAGMENT:
             host = HostNode(next(self._ids), item, key, parent)
             self.hosts[host.id] = host
             self.ops.append(self._create_op(host))
@@ -1775,10 +1784,15 @@ class Root:
 
     @staticmethod
     def _create_op(host: HostNode) -> list[Any]:
-        op = ["c", host.id, host.type, host.attrs, {n: h.spec() for n, h in host.events.items()}]
+        # Trailing fields left empty are left out: most elements have no events,
+        # many no attributes, and 10,000 rows of `{},{}` add up.
         if host.ns is not None:
-            op.append(host.ns)
-        return op
+            return ["c", host.id, host.type, host.attrs, {n: h.spec() for n, h in host.events.items()}, host.ns]
+        if host.events:
+            return ["c", host.id, host.type, host.attrs, {n: h.spec() for n, h in host.events.items()}]
+        if host.attrs:
+            return ["c", host.id, host.type, host.attrs]
+        return ["c", host.id, host.type]
 
     def _unmount(self, node: Any, emit: bool) -> None:
         if isinstance(node, TextNode):
@@ -1834,9 +1848,10 @@ class Root:
         stack = list(reversed(children))
         while stack:
             node = stack.pop()
-            if isinstance(node, ComponentNode):
+            kind = type(node)
+            if kind is ComponentNode:
                 stack.extend(reversed(node.children))
-            elif isinstance(node, HostNode) and node.type == PORTAL:
+            elif kind is HostNode and node.type == PORTAL:
                 if portals is not None:
                     portals.append(node)
             else:

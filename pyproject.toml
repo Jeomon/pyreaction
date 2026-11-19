@@ -54,6 +54,7 @@ dev = [
     "playwright>=1.50",
     "pytest>=8",
     "redis>=5",
+    "setuptools>=70",  # for scripts/compile.py (mypyc)
 ]
 
 [build-system]

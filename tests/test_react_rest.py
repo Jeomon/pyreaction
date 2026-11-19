@@ -468,3 +468,39 @@ def test_linked_inputs_share_one_value():
         page.type("#b", "")
         assert 'value=""' in page.html()
     assert seen == [40], "cast to int; the empty value is ignored"
+
+
+# ---- VirtualList -------------------------------------------------------------------------------
+
+
+def test_virtual_list_renders_only_the_rows_in_view():
+    from reaction import VirtualList
+
+    items = [f"item {i}" for i in range(100_000)]
+
+    @component
+    def App():
+        return VirtualList(items, lambda item, i: html.span(item, class_name="row"), row_height=20, height=200,
+                           overscan=2, key=lambda item: item, class_name="list")
+
+    with render(App()) as page:
+        rows = [r.text for r in page.find_all(".row")]
+        assert rows[0] == "item 0" and len(rows) == 13, "10 in view + 1 partial + 2 below"
+        box = page.find(".list")
+        assert "height:200px" in box.attrs["style"] and "overflow-y:auto" in box.attrs["style"]
+        page.dispatch(box, "scroll", {"target": {"scrollTop": 50_000 * 20}})
+        rows = [r.text for r in page.find_all(".row")]
+        assert rows[0] == "item 49998" and rows[-1] == "item 50012" and len(rows) == 15
+        page.dispatch(box, "scroll", {"target": {"scrollTop": 99_999 * 20}})
+        assert page.find_all(".row")[-1].text == "item 99999", "the end of the list"
+        page.dispatch(box, "scroll", {"target": {"scrollTop": 0}})
+        assert page.find_all(".row")[0].text == "item 0"
+
+
+def test_virtual_list_with_few_items_and_none():
+    from reaction import VirtualList
+
+    with render(VirtualList(["a", "b"], lambda item, i: html.b(item), row_height=30)) as page:
+        assert [b.text for b in page.find_all("b")] == ["a", "b"]
+    with render(VirtualList([], lambda item, i: html.b(item), row_height=30)) as page:
+        assert page.find_all("b") == []

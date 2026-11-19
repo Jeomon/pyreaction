@@ -154,7 +154,8 @@ class _Dom:
                 node = TestNode(op[2])
                 node.id = op[1]
                 if kind == "c":
-                    node.attrs, node.events = dict(op[3]), dict(op[4])
+                    node.attrs = dict(op[3]) if len(op) > 3 else {}
+                    node.events = dict(op[4]) if len(op) > 4 else {}
                 else:
                     node.js = {"module": op[3], "export": op[4], "props": op[5]}
                 self.nodes[op[1]] = node

@@ -356,12 +356,12 @@ def test_store_updates_every_session():
         a.root.close()  # unsubscribes
         online.set(5)
         await b.settle()
-        return a.dom.html(), b.dom.html(), len(online._subscribers)
+        return a.dom.html(), b.dom.html(), [len(readers) for readers in online._readers.values()]
 
-    a_html, b_html, subscribers = run(main())
+    a_html, b_html, readers = run(main())
     assert a_html == "<span>2 online</span>"
     assert b_html == "<span>5 online</span>"
-    assert subscribers == 1
+    assert readers == [1], "the closed page's reader is gone"
 
 
 # ---- reading values from the browser ------------------------------------------------
@@ -456,3 +456,67 @@ def test_socket_waits_for_data_so_its_first_render_matches_the_html():
     with client.websocket_connect("/_pyreaction/ws?p=/&h=1") as ws:
         first = json.loads(ws.receive_text())
         assert [op[2] for op in first["ops"] if op[0] == "t"] == ["Ada"], "same as the server's HTML"
+
+
+# ---- per-page stores with selectors --------------------------------------------------------
+
+
+def test_page_store_selectors_rerender_only_the_rows_that_change():
+    import gc
+
+    from reaction import memo, use_page_store
+    from reaction.testing import render
+
+    renders = []
+
+    @memo
+    def Row(i, selection):
+        selected = use_store(selection, lambda s: s == i)
+        renders.append(i)
+        return html.li(i, class_name="on" if selected else None, on_click=lambda: selection.set(i))
+
+    @component
+    def List():
+        selection = use_page_store(-1)
+        show, set_show = use_state(True)
+        return html.div(
+            html.button("hide", on_click=lambda: set_show(False)),
+            html.ul([Row(i, selection, key=i) for i in range(100)]) if show else None,
+        )
+
+    with render(List()) as page:
+        assert len(renders) == 100
+        renders.clear()
+        page.click(page.find_all("li")[7])
+        assert renders == [7] and page.find(".on").text == "7"
+        renders.clear()
+        page.click(page.find_all("li")[42])
+        assert sorted(renders) == [7, 42], "the old and the new selection only"
+        assert [li.text for li in page.find_all(".on")] == ["42"]
+        page.click("button")  # unmounts every row
+        stores = [s for s in gc.get_objects() if isinstance(s, Store) and s._initial == -1]
+        assert all(not s._readers for s in stores), "unmounted rows stop reading"
+
+
+def test_use_store_follows_a_different_store_and_updates_from_threads():
+    import threading
+
+    from reaction.testing import render
+
+    first, second = Store("a"), Store("x")
+
+    @component
+    def Show():
+        which, set_which = use_state(0)
+        value = use_store(first if which == 0 else second)
+        return html.button(value, on_click=lambda: set_which(1))
+
+    with render(Show()) as page:
+        assert page.find("button").text == "a"
+        page.click("button")
+        assert page.find("button").text == "x" and not first._readers and second._readers
+        worker = threading.Thread(target=lambda: second.set("from a thread"))
+        worker.start()
+        worker.join()
+        page.settle()
+        assert page.find("button").text == "from a thread"

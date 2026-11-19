@@ -411,12 +411,24 @@ def start_transition(fn: Callable[..., Any], *args: Any) -> None:
     root.call(lambda: root.background(fn, args, done))
 
 
+class _Optimistic:
+    """One optimistic change: the action it belongs to (or None), its argument, and
+    the state when it was added. An object, not a tuple, since it is found again by
+    identity, which a compiled build does not keep for tuples."""
+
+    __slots__ = ("owner", "arg", "state")
+
+    def __init__(self, owner: Any, arg: Any, state: Any) -> None:
+        self.owner = owner
+        self.arg = arg
+        self.state = state
+
+
 class _OptimisticSlot:
     __slots__ = ("updates", "state", "add")
 
     def __init__(self, node: ComponentNode) -> None:
-        # (the action it belongs to or None, its argument, the state when added)
-        self.updates: list[tuple[Any, Any, Any]] = []
+        self.updates: list[_Optimistic] = []
         self.state: Any = None
         root = node.root
 
@@ -424,7 +436,7 @@ class _OptimisticSlot:
             owner = CURRENT_ACTION.get()
 
             def apply() -> None:
-                entry = (owner, arg, self.state)
+                entry = _Optimistic(owner, arg, self.state)
                 self.updates.append(entry)
                 root.schedule(node)
                 if owner is not None:
@@ -451,10 +463,10 @@ def use_optimistic(
     Outside an action, the change lasts until ``state`` itself changes."""
     slot, _ = _slot(_OptimisticSlot)
     slot.state = state
-    slot.updates = [u for u in slot.updates if u[0] is not None or same(u[2], state)]
+    slot.updates = [u for u in slot.updates if u.owner is not None or same(u.state, state)]
     shown = state
-    for _, arg, _ in slot.updates:
-        shown = update(shown, arg) if update is not None else arg
+    for u in slot.updates:
+        shown = update(shown, u.arg) if update is not None else u.arg
     return shown, slot.add
 
 
@@ -564,6 +576,9 @@ def cache(fn: Callable[..., T]) -> Callable[..., T]:
     import functools
 
     is_async = inspect.iscoroutinefunction(fn)
+    # This function's entries in the page's cache. A marker rather than ``cached``
+    # itself, which a compiled build cannot refer to from its own body.
+    owner = object()
 
     @functools.wraps(fn)
     def cached(*args: Any, **kwargs: Any) -> Any:
@@ -571,7 +586,7 @@ def cache(fn: Callable[..., T]) -> Callable[..., T]:
         root = node.root if node is not None else ACTIVE_ROOT.get()
         if root is None:
             return fn(*args, **kwargs)
-        key = (cached, _cache_key(args, kwargs))
+        key = (owner, _cache_key(args, kwargs))
         store = root.cache
         if key not in store:
             if is_async:

@@ -52,6 +52,7 @@ ENV_OPTIONS: dict[str, tuple[Callable[[str], Any], Any]] = {
     "reconnect_max": (int, 8000),
     "reconnect_attempts": (int, 0),
     "resume_timeout": (float, 30.0),
+    "compress": (_bool, True),
     "handoff_timeout": (float, 5.0),
     "max_handoffs": (int, 64),
 }

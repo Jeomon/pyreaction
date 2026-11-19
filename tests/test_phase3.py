@@ -108,11 +108,12 @@ def test_embed_snippet_and_reconnect_setting():
     from starlette.testclient import TestClient
 
     from reaction import create_app, embed
+    from reaction.server.app import CLIENT_VERSION
 
     snippet = embed(html.p("hi"), mount_path="/ui", element_id="w1")
     assert snippet == (
         '<div id="w1"><p>hi</p></div>'
-        '<script src="/ui/_pyreaction/client.js" data-ws="/ui/_pyreaction/ws" data-mount="w1"></script>'
+        f'<script src="/ui/_pyreaction/client.js?v={CLIENT_VERSION}" data-ws="/ui/_pyreaction/ws" data-mount="w1"></script>'
     )
     assert embed(mount_path="/ui").startswith('<div id="pyreaction-root"></div>')
     page = TestClient(create_app(lambda: html.p("x"), reconnect_max=3000)).get("/").text

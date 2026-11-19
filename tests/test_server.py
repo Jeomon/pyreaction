@@ -277,66 +277,54 @@ def test_resume_timeout_zero_closes_at_once():
 
 
 def test_a_page_that_floods_events_is_disconnected_and_resumes():
-    from reaction.core import vdom
+    # No patching of Root here: the compiled build's classes cannot be patched.
+    from reaction.core.hooks import CURRENT
 
     roots = []
     most = [0]  # the most events ever waiting at once
-    attach = vdom.Root.attach
-    dispatch = vdom.Root.dispatch
-
-    def count(self, *args):
-        dispatch(self, *args)
-        most[0] = max(most[0], self.pending_events)
-
-    def spy(self, *args, **kwargs):
-        roots.append(self)
-        return attach(self, *args, **kwargs)
-
     @component
     def App():
         n, set_n = use_state(0)
+        root = CURRENT.get().root
+        roots.append(root)
 
         def slow():
+            # Seen from each handler: how many events were still waiting behind it.
+            most[0] = max(most[0], root.pending_events)
             time.sleep(0.005)
             set_n(lambda v: v + 1)
 
         return html.button(f"n={n}", on_click=slow)
 
     app = create_app(App, max_pending_events=50)
-    vdom.Root.attach = spy
-    vdom.Root.dispatch = count
-    try:
-        with TestClient(app) as client:
-            with client.websocket_connect("/_pyreaction/ws?p=/") as ws:
-                first = json.loads(ws.receive_text())
-                sid = first["sid"]
-                button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
-                for i in range(500):
-                    ws.send_text(json.dumps([i + 1, button, "click", {}]))
-                with pytest.raises(WebSocketDisconnect) as closed:
-                    while True:
-                        ws.receive_text()
-                assert closed.value.code == 1013
-            root = roots[0]
-            assert most[0] <= 50, "the server never queued past the limit"
-            deadline = time.monotonic() + 5
-            while (root.pending_events or root._busy) and time.monotonic() < deadline:
-                time.sleep(0.01)
-            # Only the events read before the limit ran; the page resumes with them.
-            from reaction import to_vdom
+    with TestClient(app) as client:
+        with client.websocket_connect("/_pyreaction/ws?p=/") as ws:
+            first = json.loads(ws.receive_text())
+            sid = first["sid"]
+            button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
+            for i in range(500):
+                ws.send_text(json.dumps([i + 1, button, "click", {}]))
+            with pytest.raises(WebSocketDisconnect) as closed:
+                while True:
+                    ws.receive_text()
+            assert closed.value.code == 1013
+        root = roots[-1]
+        assert most[0] <= 50, "the server never queued past the limit"
+        deadline = time.monotonic() + 5
+        while (root.pending_events or root._busy) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # Only the events read before the limit ran; the page resumes with them.
+        from reaction import to_vdom
 
-            label = to_vdom(root)["children"][0]["children"][0]
-            assert 1 <= int(label.removeprefix("n=")) < 500, label
-            with client.websocket_connect(f"/_pyreaction/ws?p=/&s={sid}&h=1") as ws:
-                assert json.loads(ws.receive_text())["resumed"]
-                ws.send_text(json.dumps([1000, button, "click", {}]))
-                deadline = time.monotonic() + 5
-                while to_vdom(root)["children"][0]["children"][0] == label and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                assert to_vdom(root)["children"][0]["children"][0] == f"n={int(label[2:]) + 1}"
-    finally:
-        vdom.Root.attach = attach
-        vdom.Root.dispatch = dispatch
+        label = to_vdom(root)["children"][0]["children"][0]
+        assert 1 <= int(label.removeprefix("n=")) < 500, label
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&s={sid}&h=1") as ws:
+            assert json.loads(ws.receive_text())["resumed"]
+            ws.send_text(json.dumps([1000, button, "click", {}]))
+            deadline = time.monotonic() + 5
+            while to_vdom(root)["children"][0]["children"][0] == label and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert to_vdom(root)["children"][0]["children"][0] == f"n={int(label[2:]) + 1}"
 
 
 # ---- settings from PYREACTION_* environment variables -------------------------------------------
@@ -585,3 +573,91 @@ def test_handoffs_expire_and_are_limited_in_number():
     App, renders = _counting_app()
     with TestClient(create_app(App, handoff_timeout=0)) as client:
         assert _handoff_token(client.get("/").text) == "", "turned off"
+
+
+def test_client_script_is_versioned_cached_and_gzipped():
+    import gzip
+    import re
+
+    from reaction.server.app import CLIENT_JS, CLIENT_VERSION
+
+    source = CLIENT_JS.read_bytes()
+    with TestClient(create_app(Counter)) as client:
+        src = re.search(r'<script src="([^"]+)"', client.get("/").text).group(1)
+        assert src == f"/_pyreaction/client.js?v={CLIENT_VERSION}"
+        versioned = client.get(src, headers={"accept-encoding": "gzip"})
+        assert versioned.headers["cache-control"] == "public, max-age=31536000, immutable"
+        assert versioned.headers["content-encoding"] == "gzip" and versioned.content == source
+        plain = client.get("/_pyreaction/client.js", headers={"accept-encoding": "identity"})
+        assert plain.headers["cache-control"] == "no-cache" and "content-encoding" not in plain.headers
+        assert plain.content == source
+        again = client.get("/_pyreaction/client.js", headers={"if-none-match": plain.headers["etag"]})
+        assert again.status_code == 304 and again.content == b""
+    assert len(gzip.compress(source)) < len(source) / 2
+
+
+def test_pages_are_gzipped_unless_turned_off():
+    @component
+    def Big():
+        return html.ul([html.li(f"row {i}", key=i) for i in range(500)])
+
+    with TestClient(create_app(Big)) as client:
+        page = client.get("/", headers={"accept-encoding": "gzip"})
+        assert page.headers["content-encoding"] == "gzip" and "row 499" in page.text
+        js = client.get("/_pyreaction/client.js", headers={"accept-encoding": "gzip"})
+        assert js.headers["content-encoding"] == "gzip", "already gzipped, not twice"
+        assert js.text.startswith("//") or "WebSocket" in js.text
+    with TestClient(create_app(Big, compress=False)) as client:
+        assert "content-encoding" not in client.get("/", headers={"accept-encoding": "gzip"}).headers
+
+
+def test_a_streamed_page_still_streams_when_gzipped():
+    import asyncio
+    import socket
+    import threading
+    import zlib
+
+    import uvicorn
+
+    from reaction import Suspense, use_data
+
+    async def slow():
+        await asyncio.sleep(0.6)
+        return "late"
+
+    @component
+    def Late():
+        return html.p(use_data(slow, []), id="late")
+
+    @component
+    def App():
+        return html.main(html.h1("shell"), Suspense(Late(), fallback=html.p("loading")))
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(create_app(App), port=port, log_level="warning", lifespan="off"))
+    threading.Thread(target=server.run, daemon=True).start()
+    while not server.started:
+        time.sleep(0.01)
+    try:
+        with socket.create_connection(("127.0.0.1", port)) as conn:
+            conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n")
+            start = time.monotonic()
+            raw, first_at = b"", None
+            while chunk := conn.recv(65536):
+                raw += chunk
+                if first_at is None and b"\r\n\r\n" in raw and len(raw.split(b"\r\n\r\n", 1)[1]) > 50:
+                    first_at = time.monotonic() - start
+        head, body = raw.split(b"\r\n\r\n", 1)
+        assert b"content-encoding: gzip" in head.lower()
+        decoded, rest = b"", body  # chunked transfer
+        while rest:
+            size, _, rest = rest.partition(b"\r\n")
+            n = int(size, 16)
+            decoded, rest = decoded + rest[:n], rest[n + 2:]
+        text = zlib.decompress(decoded, 16 + zlib.MAX_WBITS).decode()
+        assert "shell" in text and "late" in text
+        assert first_at is not None and first_at < 0.4, f"the shell came at {first_at:.2f}s, not before the data"
+    finally:
+        server.should_exit = True

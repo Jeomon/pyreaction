@@ -716,3 +716,30 @@ def test_markup_that_differs_is_rebuilt_from_the_server_in_chrome(page):
         assert page.text_content("#which") != "render 0", "the live render, not the HTML"
         page.click("#inc")
         page.wait_for_function("document.querySelector('#inc').textContent === 'n=1'")
+
+
+def test_virtual_list_scrolls_in_chrome(page):
+    from reaction import VirtualList
+
+    items = list(range(100_000))
+
+    @component
+    def App():
+        return VirtualList(items, lambda n, i: html.span(f"row {n}", class_name="row"),
+                           row_height=24, height=240, class_name="list")
+
+    with serve(App) as server:
+        open_page(page, server)
+        assert page.locator(".row").count() < 30
+        page.evaluate("document.querySelector('.list').scrollTop = 24 * 70000")
+        page.wait_for_function("[...document.querySelectorAll('.row')].some(r => r.textContent === 'row 70000')")
+        first_visible = page.evaluate("""() => {
+            const box = document.querySelector('.list').getBoundingClientRect();
+            return [...document.querySelectorAll('.row')].find(r => r.getBoundingClientRect().top >= box.top - 1).textContent;
+        }""")
+        assert first_visible == "row 70000", "the rows on screen are the ones scrolled to"
+        # A quick burst: throttling still sends where the scrolling stopped.
+        page.evaluate("""() => { const box = document.querySelector('.list');
+            for (let k = 1; k <= 20; k++) box.scrollTop = 24 * (1000 + k * 100); }""")
+        page.wait_for_function("[...document.querySelectorAll('.row')].some(r => r.textContent === 'row 3000')")
+        assert page.locator(".row").count() < 30

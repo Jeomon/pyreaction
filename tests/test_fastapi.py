@@ -72,7 +72,7 @@ def test_pages_routing_links_redirects_and_assets(base, tmp_path):
     assert 'id="path">path=/<' in home, "components see paths inside the app"
     assert f'href="{base}/users/7"' in home, "links get the mount prefix"
     assert f'<link rel="preload" href="{base}/static/hero.jpg"' in home
-    assert f'src="{base}/_pyreaction/client.js"' in home and f'data-ws="{base}/_pyreaction/ws"' in home
+    assert f'src="{base}/_pyreaction/client.js?v=' in home and f'data-ws="{base}/_pyreaction/ws"' in home
     assert f'data-base="{base}"' in home
     assert client.get(f"{base}/_pyreaction/client.js").status_code == 200
     assert client.get(f"{base}/static/hero.jpg").content == b"jpg"
@@ -336,7 +336,7 @@ def test_page_renders_with_dependencies_and_path_params():
     client = TestClient(api, cookies={"user": "ada", "name": "bob"})
     body = client.get("/orders/7").text
     assert "<p>ada ordered Pizza at /orders/7</p>" in body and "<title>Order</title>" in body
-    assert 'src="/orders/7/_pyreaction/client.js"' in body and 'data-ws="/orders/7/_pyreaction/ws"' in body
+    assert 'src="/orders/7/_pyreaction/client.js?v=' in body and 'data-ws="/orders/7/_pyreaction/ws"' in body
     assert 'data-page="/orders/7"' in body
     assert client.get("/orders/7/_pyreaction/client.js").status_code == 200
     assert log == ["open", "close"], "a yield dependency closes after the response"

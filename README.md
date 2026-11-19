@@ -49,7 +49,7 @@ The package is `pyreaction`, the import is `reaction`, and the command is
 - [Guide](#guide): [elements](#elements), [events](#events), [hooks](#hooks),
   [data](#data), [forms and pending state](#forms-and-pending-state),
   [routing](#routing), [the page head](#the-page-head), [refs](#acting-on-elements),
-  [portals](#portals-and-hidden-content), [shared state](#shared-state),
+  [portals](#portals-and-hidden-content), [long lists](#long-lists), [shared state](#shared-state),
   [errors](#errors), [file uploads](#file-uploads),
   [JavaScript components](#javascript-components)
 - [Integrations](#integrations): [FastAPI](#fastapi), [Django and Flask](#django-flask-and-other-frameworks),
@@ -186,7 +186,8 @@ html.input(on_focus=js("element.select()"))               # runs in the browser,
 
 `keys` limits a keyboard event to those `KeyboardEvent.key` values; other keys
 stay in the browser and keep their default, so the textarea above still takes
-typing. `event()` also takes `throttle`, `stop_propagation` and
+typing. `event()` also takes `throttle` (at most one event per period, always
+including the last of a burst), `stop_propagation` and
 `stop_immediate_propagation`. `js()` code sees `event` and `element`. A `_capture`
 suffix (`on_click_capture`) listens on the way down, like React's `onClickCapture`.
 
@@ -375,6 +376,19 @@ escape `overflow: hidden`), with state, context and events working as if they
 were in place, in the server's HTML too. `Activity` hides children without
 unmounting them, so their state survives.
 
+### Long lists
+
+```python
+VirtualList(users, lambda user, i: UserRow(user), row_height=36, height=600,
+            key=lambda user: user.id, class_name="users")
+```
+
+`VirtualList` renders only the rows in view (plus `overscan` rows on each side), so
+a list of 100,000 items costs what 30 do, in the first HTML and in every update.
+Rows have a fixed `row_height`; the list is a scrolling box `height` pixels tall,
+and other props go on it. Rows scrolled out are unmounted, so keep their state
+above the list.
+
 ### Shared state
 
 ```python
@@ -397,6 +411,24 @@ votes = Store({"yes": 0, "no": 0}, name="votes", backend=RedisBackend("redis://l
 A write in any process re-renders the readers in all of them. The value must be
 JSON, and `update` is atomic across processes. Valkey works too, and any other
 broker can implement the `StoreBackend` protocol (`load`, `write`, `listen`).
+
+**Stores for one page, read with selectors.** `use_page_store(initial)` makes a
+store that belongs to one page. Components read it with `use_store(store,
+selector)` and re-render only when their selected part changes, so moving a
+selection through 10,000 rows re-renders two of them (about 1 ms instead of 15):
+
+```python
+@component
+def Table(rows):
+    selection = use_page_store(None)
+    return html.tbody([Row(row, selection, key=row.id) for row in rows])
+
+@memo
+def Row(row, selection):
+    selected = use_store(selection, lambda s: s == row.id)
+    return html.tr(html.td(row.name), class_name="on" if selected else None,
+                   on_click=lambda: selection.set(row.id))
+```
 
 ### Errors
 
@@ -641,6 +673,7 @@ variables. Code wins over `[tool.pyreaction]`, which wins over the environment.
 | `resume_timeout` | `30.0` | `PYREACTION_RESUME_TIMEOUT` | seconds a dropped page's state is kept for a reconnect |
 | `handoff_timeout` | `5.0` | `PYREACTION_HANDOFF_TIMEOUT` | seconds a first-HTML render waits for its page's live connection (0: render again) |
 | `max_handoffs` | `64` | `PYREACTION_MAX_HANDOFFS` | first-HTML renders that may wait at once; the oldest makes way |
+| `compress` | `True` | `PYREACTION_COMPRESS` | gzip pages and static files for browsers that accept it |
 
 A project's settings:
 
@@ -663,6 +696,11 @@ to `PYREACTION_HOST` (else `127.0.0.1`) and `PYREACTION_PORT`, then `PORT`
 **Running.** `uv run pro` (or `reaction run --host 0.0.0.0`) serves a project
 with uvicorn; any ASGI server can serve `create_app(App)`. In a container, set
 `PORT` and the `PYREACTION_*` variables instead of editing code.
+
+**Compression and caching.** Pages and static files are gzipped (`compress`; turn
+it off when a proxy already compresses), streamed pages included. The client
+script is served at a URL with a hash of its contents (`client.js?v=...`), so
+browsers keep it for a year and fetch it again only after an upgrade.
 
 **Sessions and workers.** Each open page is a live session on the server. The
 render that made a page's HTML waits up to `handoff_timeout` seconds for the
@@ -756,6 +794,13 @@ uv run python benchmarks/bench.py
 
 The browser tests skip when no browser is available; the shared-store tests use
 an in-process fake Redis server. The test suite also runs on Python 3.11.
+
+**Compiling the core.** `uv run python scripts/compile.py` compiles the core
+(`vdom`, `element`, `ssr`, `hooks`) with mypyc in place, which makes rendering and
+updates 1.5-1.7x faster; `--clean` returns to plain Python. It needs a C compiler.
+Compiled modules take precedence over their `.py` files, so compile again after
+editing one; pyreaction logs a warning when a compiled module is older than its
+source. The tests pass either way.
 
 ```
 src/reaction/

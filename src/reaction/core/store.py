@@ -14,13 +14,17 @@ from typing import Any, Generic, Protocol, TypeVar
 
 import orjson
 
-from .hooks import same, use_sync_external_store
+from .hooks import _slot, same, use_memo
 
-__all__ = ["RedisBackend", "Store", "StoreBackend", "use_store"]
+__all__ = ["RedisBackend", "Store", "StoreBackend", "use_page_store", "use_store"]
 
 T = TypeVar("T")
 
 logger = logging.getLogger("reaction")
+
+# One page's components reading a store (a module-level name: inside Store, `set`
+# would mean Store.set).
+_Readers = set["_StoreSlot"]
 
 
 class StoreBackend(Protocol):
@@ -61,6 +65,9 @@ class Store(Generic[T]):
         self._initial = value
         self._version = 0
         self._subscribers: set[Callable[[], None]] = set()
+        # Components reading the store, grouped by page: a change costs one call per
+        # page, not one per reader (10,000 rows reading a selection).
+        self._readers: dict[Any, _Readers] = {}
         self._lock = threading.Lock()
         self._name = name
         self._backend = backend
@@ -86,7 +93,8 @@ class Store(Generic[T]):
                 return
             self._value = value
             subscribers = list(self._subscribers)
-        self._notify(subscribers)
+            pages = list(self._readers.items())
+        self._notify(subscribers, pages)
 
     def update(self, fn: Callable[[T], T]) -> T:
         """Replace the value with ``fn(old)``, atomically (across processes too, with
@@ -100,7 +108,8 @@ class Store(Generic[T]):
                 return value
             self._value = value
             subscribers = list(self._subscribers)
-        self._notify(subscribers)
+            pages = list(self._readers.items())
+        self._notify(subscribers, pages)
         return value
 
     def _update_shared(self, fn: Callable[[T], T]) -> T:
@@ -131,7 +140,8 @@ class Store(Generic[T]):
             self._version = version
             self._value = value
             subscribers = list(self._subscribers)
-        self._notify(subscribers)
+            pages = list(self._readers.items())
+        self._notify(subscribers, pages)
 
     def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
         with self._lock:
@@ -143,23 +153,89 @@ class Store(Generic[T]):
 
         return unsubscribe
 
-    @staticmethod
-    def _notify(subscribers: list[Callable[[], None]]) -> None:
+    def _notify(self, subscribers: list[Callable[[], None]], pages: list[tuple[Any, _Readers]]) -> None:
         for callback in subscribers:
             try:
                 callback()
             except Exception:
                 logger.exception("A store subscriber failed")
+        for root, readers in pages:
+            root.call(lambda readers=readers: self._refresh(readers))
+
+    def _refresh(self, readers: _Readers) -> None:
+        """On a page's event loop: re-render the readers whose selected value changed."""
+        value = self._value
+        for slot in list(readers):
+            node = slot.node
+            if not node.mounted:
+                continue
+            try:
+                selected = value if slot.selector is None else slot.selector(value)
+            except Exception as exc:
+                node.root.report(exc, f"a store selector in {node.name}")
+                continue
+            if not same(selected, slot.value):
+                slot.value = selected
+                node.root.schedule(node)
+
+    def _watch(self, slot: _StoreSlot) -> None:
+        with self._lock:
+            self._readers.setdefault(slot.node.root, set()).add(slot)
+
+    def _unwatch(self, slot: _StoreSlot) -> None:
+        with self._lock:
+            readers = self._readers.get(slot.node.root)
+            if readers is not None:
+                readers.discard(slot)
+                if not readers:
+                    del self._readers[slot.node.root]
 
     def __repr__(self) -> str:
         return f"Store({self._value!r})"
 
 
+class _StoreSlot:
+    __slots__ = ("node", "store", "selector", "value")
+
+    def __init__(self, node: Any, store: Store[Any], selector: Callable[[Any], Any] | None) -> None:
+        self.node = node
+        self.store = store
+        self.selector = selector
+        self.value: Any = None
+        store._watch(self)
+
+    def dispose(self) -> None:
+        self.store._unwatch(self)
+
+
 def use_store(store: Store[T], selector: Callable[[T], Any] | None = None) -> Any:
-    """The store's value (or ``selector(value)``); re-renders when it changes."""
-    if selector is None:
-        return use_sync_external_store(store.subscribe, store.get)
-    return use_sync_external_store(store.subscribe, lambda: selector(store.get()))
+    """The store's value, or ``selector(value)``; re-renders when that changes.
+
+    With a selector, a component re-renders only when its own part changes:
+    ``use_store(selection, lambda s: s == row_id)`` re-renders two rows of a long
+    list when the selection moves, not all of them."""
+    slot, _ = _slot(_StoreSlot, store, selector)
+    if slot.store is not store:  # a different store passed in: follow it
+        slot.dispose()
+        slot.store = store
+        store._watch(slot)
+    slot.selector = selector
+    value = store.get()
+    slot.value = value if selector is None else selector(value)
+    return slot.value
+
+
+def use_page_store(initial: T) -> Store[T]:
+    """A :class:`Store` belonging to this component (and so to this page), kept while
+    it is mounted. Pass it down and read it with :func:`use_store` and a selector, so
+    only the components whose part changed re-render::
+
+        selection = use_page_store(None)
+        ...
+        selected = use_store(selection, lambda s: s == row.id)   # in each row
+        selection.set(row.id)                                    # in a handler
+    """
+    return use_memo(lambda: Store(initial), [])
 
 
 class RedisBackend:

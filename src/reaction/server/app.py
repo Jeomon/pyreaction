@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import hashlib
 import hmac
 import inspect
@@ -28,8 +29,10 @@ from urllib.parse import urlsplit
 
 import orjson
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import HTTPConnection, Request
-from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket
@@ -47,6 +50,26 @@ logger = logging.getLogger("reaction")
 
 CLIENT_DIR = Path(__file__).parent.parent / "client"
 CLIENT_JS = CLIENT_DIR / "client.js"
+# The client script, served from memory at a URL carrying a hash of its contents
+# (client.js?v=...), so browsers cache it for good and fetch it again only when
+# it changes.
+_CLIENT = CLIENT_JS.read_bytes()
+_CLIENT_GZIP = gzip.compress(_CLIENT, 9, mtime=0)
+CLIENT_VERSION = hashlib.sha256(_CLIENT).hexdigest()[:12]
+
+
+def _client_js(request: Request) -> Response:
+    tag = f'"{CLIENT_VERSION}"'
+    headers = {"ETag": tag, "Vary": "Accept-Encoding"}
+    # Versioned: never changes. Unversioned (an old page, a hand-written tag): check.
+    headers["Cache-Control"] = (
+        "public, max-age=31536000, immutable" if request.query_params.get("v") == CLIENT_VERSION else "no-cache"
+    )
+    if tag in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers=headers)
+    if "gzip" in request.headers.get("accept-encoding", ""):
+        return Response(_CLIENT_GZIP, media_type="text/javascript", headers={**headers, "Content-Encoding": "gzip"})
+    return Response(_CLIENT, media_type="text/javascript", headers=headers)
 # $-placeholders rather than str.format, so the HTML and CSS need no brace escaping.
 PAGE = Template((CLIENT_DIR / "index.html").read_text(encoding="utf-8"))
 STYLE = (CLIENT_DIR / "style.css").read_text(encoding="utf-8")
@@ -381,6 +404,7 @@ def create_app(
     resume_timeout: float = UNSET,
     handoff_timeout: float = UNSET,
     max_handoffs: int = UNSET,
+    compress: bool = UNSET,
     debug: bool = UNSET,
 ) -> Starlette:
     """An ASGI app serving ``app`` on every GET path.
@@ -413,7 +437,8 @@ def create_app(
     after a restart, the page renders afresh. With ``reconnect_attempts`` (0: no
     limit) the page stops retrying after that many failed attempts in a row and
     says the connection was lost, with a button to reload. ``debug`` shows errors
-    in the browser.
+    in the browser. With ``compress`` (default) pages and static files are sent
+    gzipped to browsers that accept it; turn it off when a proxy compresses.
 
     A page's first HTML is rendered once, and its live connection takes over that
     render instead of rendering again, when it connects within ``handoff_timeout``
@@ -424,7 +449,7 @@ def create_app(
     The options ``debug``, ``allowed_origins`` (comma-separated), ``max_upload_size``,
     ``max_pending_events``, ``max_pending_ops``, ``data_timeout``, ``stream``,
     ``threaded``, ``reconnect_max``, ``reconnect_attempts``, ``resume_timeout``,
-    ``handoff_timeout`` and ``max_handoffs`` not passed here are read from ``PYREACTION_<OPTION>`` environment variables
+    ``handoff_timeout``, ``max_handoffs`` and ``compress`` not passed here are read from ``PYREACTION_<OPTION>`` environment variables
     (``PYREACTION_DEBUG=1``), else take their defaults.
     """
     debug = resolve("debug", debug)
@@ -440,6 +465,7 @@ def create_app(
     resume_timeout = resolve("resume_timeout", resume_timeout)
     handoff_timeout = resolve("handoff_timeout", handoff_timeout)
     max_handoffs = resolve("max_handoffs", max_handoffs)
+    compress = resolve("compress", compress)
     make = _as_factory(app)
 
     def new_root(url: str, connection: Any, base: str = "") -> Root:
@@ -552,6 +578,7 @@ def create_app(
                 reconnect_max=int(reconnect_max),
                 reconnect_attempts=int(reconnect_attempts),
                 handoff=token,
+                version=CLIENT_VERSION,
             ).split(_STREAM_SPLIT)
             waiting = {n for node, n in boundaries.items() if node.waiting}
             if not waiting:
@@ -571,8 +598,8 @@ def create_app(
             if not handed_off:
                 root.close()
 
-    async def client_js(request: Request) -> FileResponse:
-        return FileResponse(CLIENT_JS, media_type="text/javascript", headers={"Cache-Control": "no-cache"})
+    async def client_js(request: Request) -> Response:
+        return _client_js(request)
 
     async def socket(ws: WebSocket) -> None:
         if not _origin_allowed(ws, allowed_origins):
@@ -693,7 +720,8 @@ def create_app(
         return Response(status_code=404)  # asked for despite the empty icon: not a page
 
     table += [Route("/favicon.ico", no_icon), Route("/", page), Route("/{path:path}", page)]
-    this_app[0] = _MountableApp(debug=debug, routes=table)
+    middleware = [Middleware(GZipMiddleware, minimum_size=1024)] if compress else []
+    this_app[0] = _MountableApp(debug=debug, routes=table, middleware=middleware)
     return this_app[0]
 
 
@@ -827,8 +855,8 @@ def page(host: Any, path: str, **options: Any) -> Callable[[Callable[..., Any]],
             finally:
                 _PAGE_ELEMENT.reset(token)
 
-        async def client_js(request: Request) -> FileResponse:
-            return FileResponse(CLIENT_JS, media_type="text/javascript", headers={"Cache-Control": "no-cache"})
+        async def client_js(request: Request) -> Response:
+            return _client_js(request)
 
         def with_conn(endpoint: Any, kind: Any) -> Any:
             conn = inspect.Parameter("_reaction_conn", inspect.Parameter.KEYWORD_ONLY, annotation=kind)
@@ -1010,7 +1038,7 @@ def _embed_html(
     base = escape(mount_path.rstrip("/") + prefix)
     return (
         f'<div id="{escape(element_id)}">{body}</div>'
-        f'<script src="{base}/client.js" data-ws="{base}/ws{escape(ws_query)}" data-mount="{escape(element_id)}"></script>'
+        f'<script src="{base}/client.js?v={CLIENT_VERSION}" data-ws="{base}/ws{escape(ws_query)}" data-mount="{escape(element_id)}"></script>'
     )
 
 
@@ -1167,7 +1195,7 @@ def prerender(
     Call it outside an event loop (in async code, run it in a thread).
     """
     asgi = create_app(app, stream=False, **{"handoff_timeout": 0, **options})
-    script = re.compile(r'<script src="[^"]*/client\.js"[^>]*></script>\n?')
+    script = re.compile(r'<script src="[^"]*/client\.js(\?[^"]*)?"[^>]*></script>\n?')
 
     async def render_all() -> dict[str, str]:
         pages: dict[str, str] = {}

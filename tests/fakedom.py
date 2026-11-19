@@ -48,8 +48,8 @@ class FakeDom:
             kind = op[0]
             if kind == "c":
                 node = Node(op[2])
-                node.attrs = dict(op[3])
-                node.events = dict(op[4])
+                node.attrs = dict(op[3]) if len(op) > 3 else {}
+                node.events = dict(op[4]) if len(op) > 4 else {}
                 self.nodes[op[1]] = node
             elif kind == "t":
                 self.nodes[op[1]] = Node(None, op[2])
@@ -124,7 +124,8 @@ class FakeDom:
         for op, node in zip(made, found):
             self.nodes[op[1]] = node
             if op[0] == "c":
-                node.attrs, node.events = dict(op[3]), dict(op[4])
+                node.attrs = dict(op[3]) if len(op) > 3 else {}
+                node.events = dict(op[4]) if len(op) > 4 else {}
             elif op[0] == "j":
                 node.js = {"module": op[3], "export": op[4], "props": op[5]}
         self.apply([op for op in ops if op[0] == "m"])

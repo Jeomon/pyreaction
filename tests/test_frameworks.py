@@ -125,7 +125,7 @@ def test_pages_under_a_path_and_the_framework_everywhere_else(name, make, tmp_pa
 
         page = client.get("/ui/")
         assert page.status_code == 200 and '<p id="where">ada at /</p>' in page.text
-        assert 'src="/ui/_pyreaction/client.js"' in page.text and 'data-base="/ui"' in page.text
+        assert 'src="/ui/_pyreaction/client.js?v=' in page.text and 'data-base="/ui"' in page.text
         assert client.get("/ui/_pyreaction/client.js").status_code == 200
         assert client.get("/ui/static/app.css").text == "body{}"
         redirect = client.get("/ui/old", follow_redirects=False)
@@ -173,7 +173,7 @@ def check_embedded(client, page_url):
     page = client.get(page_url).text
     assert "<h1>Shop</h1>" in page, "the framework's own template"
     assert '<div id="pyreaction-root"><button>n=0</button></div>' in page, "server-rendered widget"
-    assert 'src="/widget/_pyreaction/client.js"' in page and 'data-ws="/widget/_pyreaction/ws"' in page
+    assert 'src="/widget/_pyreaction/client.js?v=' in page and 'data-ws="/widget/_pyreaction/ws"' in page
     assert client.get("/widget/_pyreaction/client.js").status_code == 200
     with client.websocket_connect(f"/widget/_pyreaction/ws?p={page_url}&h=1") as ws:
         first = json.loads(ws.receive_text())
@@ -261,7 +261,7 @@ def test_component_tag_in_fastapi_jinja_templates():
         _, box, ws = tag_page(page)
         assert box == "<button>hi ada 5 at /shop</button>", "server-rendered with the template's props"
         assert ws.startswith("/components/_pyreaction/ws?c=")
-        assert 'src="/components/_pyreaction/client.js"' in page
+        assert 'src="/components/_pyreaction/client.js?v=' in page
         assert click_once(client, ws, "/shop", page) == (
             "<button>hi ada 5 at /shop</button>", "<button>hi ada 6 at /shop</button>",
         )

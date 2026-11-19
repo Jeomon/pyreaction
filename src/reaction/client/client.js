@@ -93,6 +93,14 @@
       } catch (_) {} // selectionStart throws on some input types
     }
     if (t.tagName) target.tagName = t.tagName.toLowerCase();
+    if (e.type === "scroll") {
+      // Read only for scroll events: reading layout on every event would be slow.
+      const box = t === document ? document.scrollingElement : t;
+      if (box) {
+        target.scrollTop = box.scrollTop;
+        target.scrollLeft = box.scrollLeft;
+      }
+    }
     if (t.dataset && Object.keys(t.dataset).length) target.dataset = { ...t.dataset };
     if (t.multiple && t.selectedOptions) target.values = Array.from(t.selectedOptions, (o) => o.value);
     const data = { type: e.type, target, value: target.value, checked: target.checked };
@@ -196,10 +204,18 @@
         clearTimeout(timer);
         timer = setTimeout(() => fire(data, e), debounce);
       } else if (throttle) {
+        // At most one event per window, and the last one of a burst always goes,
+        // so the server ends with the final state (where scrolling stopped).
         const now = Date.now();
+        clearTimeout(timer);
         if (now - last >= throttle) {
           last = now;
           fire(data, e);
+        } else {
+          timer = setTimeout(() => {
+            last = Date.now();
+            fire(data, e);
+          }, throttle - (now - last));
         }
       } else fire(data, e);
     };
@@ -355,8 +371,10 @@
         case "c": {
           const el = create(op[2], op[5]);
           register(op[1], el);
-          for (const k in op[3]) setProp(el, k, op[3][k]);
-          for (const k in op[4]) listen(el, k, op[4][k]);
+          const attrs = op[3] || {};
+          const events = op[4] || {};
+          for (const k in attrs) setProp(el, k, attrs[k]);
+          for (const k in events) listen(el, k, events[k]);
           break;
         }
         case "t":
@@ -473,12 +491,13 @@
         return;
       }
       if (op[0] !== "c") return;
-      const attrs = op[3];
+      const attrs = op[3] || {};
+      const events = op[4] || {};
       for (const a of Array.from(n.attributes)) if (!(a.name in attrs)) n.removeAttribute(a.name);
       for (const k in attrs) setProp(n, k, attrs[k]);
       // Listeners left from a previous session would send stale node ids.
-      for (const k in n.__ev || {}) if (!(k in op[4])) listen(n, k, null);
-      for (const k in op[4]) listen(n, k, op[4][k]);
+      for (const k in n.__ev || {}) if (!(k in events)) listen(n, k, null);
+      for (const k in events) listen(n, k, events[k]);
     });
     apply(ops.filter((op) => op[0] === "m"));
   }

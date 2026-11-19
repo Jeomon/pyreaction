@@ -12,6 +12,8 @@ import inspect
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
+from ._compiled import python_class
+
 if TYPE_CHECKING:
     from ._html_types import (
         ATag,
@@ -159,7 +161,8 @@ def event(
     """Wrap an event callback with browser-side options.
 
     ``debounce`` and ``throttle`` are in milliseconds and are applied in the
-    browser, so skipped events never cross the network. ``keys`` limits a
+    browser, so skipped events never cross the network. ``throttle`` sends at most
+    one event per period and always the last one of a burst. ``keys`` limits a
     keyboard event to those ``KeyboardEvent.key`` values, e.g. ``["Enter",
     "Escape"]``: other keys are neither sent nor have their default prevented,
     so ``event(save, keys=["Enter"], prevent_default=True)`` blocks only Enter.
@@ -199,7 +202,14 @@ class _EmptyDict(dict):
     def _read_only(self, *args: Any, **kwargs: Any) -> Any:
         raise TypeError("an element's props are read-only: build a new dict instead")
 
-    __setitem__ = __delitem__ = setdefault = update = pop = popitem = clear = __ior__ = _read_only
+    __setitem__ = _read_only
+    __delitem__ = _read_only
+    setdefault = _read_only
+    update = _read_only
+    pop = _read_only
+    popitem = _read_only
+    clear = _read_only
+    __ior__ = _read_only
 
 
 _EMPTY: dict[str, Any] = _EmptyDict()
@@ -702,6 +712,7 @@ class _Html:
 html = _Html()
 
 
+@python_class
 class Component:
     """A render function turned into an element factory by :func:`component`."""
 
@@ -737,6 +748,7 @@ def memo(fn: Callable[..., Any] | Component) -> Component:
     return Component(fn.fn if isinstance(fn, Component) else fn, memo=True)
 
 
+@python_class
 class JsComponent:
     """A JavaScript module drawn inside an element; made by :func:`js_component`."""
 

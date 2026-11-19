@@ -73,11 +73,12 @@ def _children(
     stack: list[Any] = list(reversed(children))
     while stack:
         node = stack.pop()
-        if isinstance(node, _End):
+        kind = type(node)
+        if kind is _End:
             out.append(f"<!--/pr-s:{node.n}-->")
             prev_text = False
             continue
-        if isinstance(node, ComponentNode):
+        if kind is ComponentNode:
             if boundaries is not None and node.suspend is not None:
                 n = boundaries.setdefault(node, len(boundaries) + 1)
                 out.append(f"<!--pr-s:{n}-->")
@@ -85,7 +86,7 @@ def _children(
                 stack.append(_End(n))
             stack.extend(reversed(node.children))
             continue
-        if isinstance(node, TextNode):
+        if kind is TextNode:
             if static:
                 text = node.text.replace("</", "<\\/") if raw else escape(node.text, quote=False)
                 out.append(text)

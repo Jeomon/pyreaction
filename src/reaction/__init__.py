@@ -21,6 +21,7 @@ from .core.components import (
     StrictMode,
     Suspense,
     ViewTransition,
+    VirtualList,
     image,
     use_form_status,
     use_linked_inputs,
@@ -90,7 +91,7 @@ from .core.vdom import ElementHandle, Event, FormFields, Location, Reply, Root, 
 from .core.router import Link, Navigate, Router
 from .core.ssr import render_to_static_markup, render_to_string
 from .core.resources import preconnect, prefetch_dns, preinit, preinit_module, preload, preload_module
-from .core.store import RedisBackend, Store, StoreBackend, use_store
+from .core.store import RedisBackend, Store, StoreBackend, use_page_store, use_store
 
 def _version() -> str:
     # The version is written once, in pyproject.toml; this reads the installed copy.
@@ -113,6 +114,7 @@ __all__ = [
     "browser",
     "add_transition_type",
     "ViewTransition",
+    "VirtualList",
     "cache",
     "Profiler",
     "use_deferred_value",
@@ -199,6 +201,7 @@ __all__ = [
     "use_request",
     "use_state",
     "use_status",
+    "use_page_store",
     "use_store",
     "use_sync_external_store",
     "use_title",
