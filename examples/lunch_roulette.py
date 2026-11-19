@@ -8,7 +8,7 @@ dependencies, a derived value, and a custom hook.
 
 import asyncio
 
-from pyreaction import (
+from reaction import (
     StrictMode,
     component,
     create_context,

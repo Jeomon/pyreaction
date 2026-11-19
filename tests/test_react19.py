@@ -7,7 +7,7 @@ import time
 import pytest
 from starlette.testclient import TestClient
 
-from pyreaction import (
+from reaction import (
     Children,
     Profiler,
     Root,
@@ -32,7 +32,7 @@ from pyreaction import (
     use_optimistic,
     use_state,
 )
-from pyreaction.testing import render
+from reaction.testing import render
 
 from .fakedom import FakeDom
 
@@ -127,7 +127,7 @@ def test_capture_prop_names():
 
 
 def test_form_action_runs_with_the_fields_and_pending_status():
-    from pyreaction import use_form_status
+    from reaction import use_form_status
 
     got = []
 
@@ -498,7 +498,7 @@ def test_prerender_writes_complete_static_pages(tmp_path):
             await asyncio.sleep(0.05)
             return "loaded"
 
-        from pyreaction import use_data
+        from reaction import use_data
 
         return html.p(use_data(load))
 

@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import RedirectResponse
 from starlette.routing import Route
 
-from pyreaction import component, html, run, use_request
+from reaction import component, html, run, use_request
 
 USERS = {"ada": "lovelace"}  # use a real user store and password hashing
 SESSIONS: dict[str, str] = {}  # session token -> user name; use a database or Redis

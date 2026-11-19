@@ -5,7 +5,7 @@
 
 import asyncio
 
-from pyreaction import component, create_context, html, run, use_context, use_effect, use_state
+from reaction import component, create_context, html, run, use_context, use_effect, use_state
 
 Theme = create_context("light")
 

@@ -1,6 +1,6 @@
 """Test components without a browser.
 
-    from pyreaction.testing import render
+    from reaction.testing import render
 
     def test_counter():
         with render(Counter()) as page:
@@ -454,7 +454,7 @@ class LiveServer:
             port = probe.getsockname()[1]
         self.url = f"http://{host}:{port}"
         self._server = uvicorn.Server(uvicorn.Config(asgi, host=host, port=port, log_level="warning", lifespan="off"))
-        self._thread = threading.Thread(target=self._server.run, name="pyreaction-live-server", daemon=True)
+        self._thread = threading.Thread(target=self._server.run, name="reaction-live-server", daemon=True)
         self._thread.start()
         import time
 

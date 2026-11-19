@@ -6,7 +6,7 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
-from pyreaction import create_app
+from reaction import create_app
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "login.py"
 
@@ -31,8 +31,8 @@ def test_login_sets_httponly_cookie_that_components_read():
 
 
 def test_navigate_reload_reaches_the_browser():
-    from pyreaction import component, html, use_navigate
-    from pyreaction.testing import render
+    from reaction import component, html, use_navigate
+    from reaction.testing import render
 
     @component
     def App():

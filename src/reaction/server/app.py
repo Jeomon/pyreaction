@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - depends on the optional extra
 
 __all__ = ["create_app", "embed", "prerender", "run"]
 
-logger = logging.getLogger("pyreaction")
+logger = logging.getLogger("reaction")
 
 CLIENT_DIR = Path(__file__).parent.parent / "client"
 CLIENT_JS = CLIENT_DIR / "client.js"

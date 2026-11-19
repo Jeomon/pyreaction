@@ -25,11 +25,13 @@ dependencies = [
 ]
 
 [project.scripts]
-pyreaction = "pyreaction.cli:main"
+# The command is `reaction`; `pyreaction` is the same, so `uvx pyreaction ...` works.
+reaction = "reaction.cli:main"
+pyreaction = "reaction.cli:main"
 
 [project.optional-dependencies]
 fast = ["orjson>=3.9"]
-# For tests in a real browser with pyreaction.testing.serve().
+# For tests in a real browser with reaction.testing.serve().
 browser = ["playwright>=1.50"]
 # Stores shared by several worker processes: Store(..., backend=RedisBackend(url)).
 redis = ["redis>=5"]
@@ -48,13 +50,17 @@ dev = [
 requires = ["uv_build>=0.13.0,<0.14.0"]
 build-backend = "uv_build"
 
+# Installed as pyreaction, imported as reaction.
+[tool.uv.build-backend]
+module-name = "reaction"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["browser: runs in a real browser through Playwright (skipped when none is available)"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["src/pyreaction"]
+files = ["src/reaction"]
 check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true

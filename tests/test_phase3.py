@@ -1,7 +1,7 @@
 """JS components with children and a fallback, portals."""
 
-from pyreaction import Root, component, html, js_component, portal, render_to_string, use_state
-from pyreaction.testing import render
+from reaction import Root, component, html, js_component, portal, render_to_string, use_state
+from reaction.testing import render
 
 Map = js_component("/static/map.js", "mount")
 
@@ -70,7 +70,7 @@ def test_on_error_hook_gets_uncaught_errors_with_their_connection():
 
     from starlette.testclient import TestClient
 
-    from pyreaction import create_app
+    from reaction import create_app
 
     seen = []
 
@@ -107,7 +107,7 @@ def test_mismatch_report_shows_in_debug(caplog):
 def test_embed_snippet_and_reconnect_setting():
     from starlette.testclient import TestClient
 
-    from pyreaction import create_app, embed
+    from reaction import create_app, embed
 
     snippet = embed(html.p("hi"), mount_path="/ui", element_id="w1")
     assert snippet == (
@@ -120,7 +120,7 @@ def test_embed_snippet_and_reconnect_setting():
 
 
 def test_use_effect_event_sees_latest_values_without_rerunning_the_effect():
-    from pyreaction import use_effect, use_effect_event
+    from reaction import use_effect, use_effect_event
 
     runs, calls = [], []
     holder = {}
@@ -141,7 +141,7 @@ def test_use_effect_event_sees_latest_values_without_rerunning_the_effect():
 
 
 def test_use_imperative_handle_exposes_an_api_to_the_parent():
-    from pyreaction import use_imperative_handle, use_ref
+    from reaction import use_imperative_handle, use_ref
 
     @component
     def Dialog(handle):
@@ -161,7 +161,7 @@ def test_use_imperative_handle_exposes_an_api_to_the_parent():
 
 
 def test_debug_warns_once_about_lists_without_keys(caplog):
-    from pyreaction import Root
+    from reaction import Root
 
     @component
     def List():
@@ -184,9 +184,9 @@ def test_debug_warns_once_about_lists_without_keys(caplog):
 def test_use_debug_value_logs_changes_in_debug(caplog):
     import logging
 
-    from pyreaction import Root, use_debug_value
+    from reaction import Root, use_debug_value
 
-    caplog.set_level(logging.INFO, logger="pyreaction")
+    caplog.set_level(logging.INFO, logger="reaction")
 
     @component
     def Status():
@@ -200,7 +200,7 @@ def test_use_debug_value_logs_changes_in_debug(caplog):
 def test_portals_are_in_the_first_html_at_the_end_of_body():
     from starlette.testclient import TestClient
 
-    from pyreaction import create_app
+    from reaction import create_app
 
     @component
     def App():

@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from pyreaction import (
+from reaction import (
     Form,
     Link,
     Router,
@@ -17,7 +17,7 @@ from pyreaction import (
     use_state,
     use_title,
 )
-from pyreaction.testing import render
+from reaction.testing import render
 
 
 @component

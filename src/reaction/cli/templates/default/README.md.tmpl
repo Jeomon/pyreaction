@@ -3,8 +3,8 @@
 A [pyreaction](https://pypi.org/project/pyreaction/) app.
 
 ```sh
-uv run pyreaction dev    # http://127.0.0.1:8000, reloads when you save
-uv run pyreaction        # production: no reloading, no debug output (same as `run`)
+uv run dev    # http://127.0.0.1:8000, reloads when you save, errors shown in the page
+uv run pro    # production: no reloading, no debug output; add --host 0.0.0.0 --port 8000 to serve publicly
 ```
 
 - `app.py`: the `App` component the page renders

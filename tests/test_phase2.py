@@ -6,7 +6,7 @@ import json
 import pytest
 from starlette.testclient import TestClient
 
-from pyreaction import (
+from reaction import (
     Activity,
     Form,
     Head,
@@ -368,7 +368,7 @@ def test_store_updates_every_session():
 
 
 def test_element_calls_return_the_browsers_answer():
-    from pyreaction import use_ref
+    from reaction import use_ref
 
     seen = []
 
@@ -420,7 +420,7 @@ def test_element_calls_return_the_browsers_answer():
 
 
 def test_reply_for_a_removed_element_fails_fast():
-    from pyreaction import use_ref
+    from reaction import use_ref
 
     holder = {}
 

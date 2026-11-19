@@ -3,7 +3,7 @@
     uv run python examples/pages.py
 """
 
-from pyreaction import (
+from reaction import (
     ErrorBoundary,
     Link,
     Router,

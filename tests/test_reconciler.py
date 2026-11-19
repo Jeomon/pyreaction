@@ -2,7 +2,7 @@ import random
 
 import pytest
 
-from pyreaction import (
+from reaction import (
     Root,
     component,
     create_context,
@@ -426,8 +426,8 @@ def test_ssr_escapes_and_marks_text():
 def test_rendering_pauses_the_gc_and_restores_it():
     import gc
 
-    from pyreaction import Root, component, html, use_state
-    from pyreaction.core.reconciler import _gc_paused
+    from reaction import Root, component, html, use_state
+    from reaction.core.reconciler import _gc_paused
 
     seen = []
 

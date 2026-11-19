@@ -47,7 +47,7 @@ from urllib.parse import parse_qs
 from .element import FRAGMENT, PORTAL, Component, Element, JsComponent
 from .hooks import ACTIVE_ROOT, BROWSER_ONLY, CURRENT, CURRENT_ACTION, BrowserOnly, Context, EffectSlot, Suspended, same
 
-logger = logging.getLogger("pyreaction")
+logger = logging.getLogger("reaction")
 
 # Renders of one component within one pass before it counts as an endless loop
 # (a component that sets state every time it renders), as React does.

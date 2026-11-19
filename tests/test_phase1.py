@@ -8,7 +8,7 @@ import time
 import pytest
 from starlette.testclient import TestClient
 
-from pyreaction import (
+from reaction import (
     FormFields,
     Navigate,
     Root,

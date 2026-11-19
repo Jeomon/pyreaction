@@ -1,4 +1,4 @@
-from pyreaction import component, html
+from reaction import component, html
 
 from components.counter import Counter
 

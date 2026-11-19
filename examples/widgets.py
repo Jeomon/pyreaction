@@ -5,7 +5,7 @@
 
 from pathlib import Path
 
-from pyreaction import component, event, html, js, js_component, portal, run, use_state
+from reaction import component, event, html, js, js_component, portal, run, use_state
 
 Bars = js_component("/static/bars.js", "mount")
 Slider = js_component("/static/react_slider.js", "mount")

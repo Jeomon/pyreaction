@@ -5,8 +5,8 @@ import logging
 
 import pytest
 
-from pyreaction import ErrorBoundary, component, html, use_effect, use_state
-from pyreaction.testing import render
+from reaction import ErrorBoundary, component, html, use_effect, use_state
+from reaction.testing import render
 
 
 @pytest.fixture(autouse=True)
@@ -86,7 +86,7 @@ def test_calling_a_hook_in_an_event_handler_is_an_invalid_hook_call():
 
 
 def test_context_provider_is_the_older_spelling():
-    from pyreaction import create_context, use_context
+    from reaction import create_context, use_context
 
     Votes = create_context(None)
 
@@ -103,7 +103,7 @@ def test_context_provider_is_the_older_spelling():
 
 
 def test_use_layout_effect_runs_like_use_effect():
-    from pyreaction import use_layout_effect
+    from reaction import use_layout_effect
 
     log = []
 
@@ -119,7 +119,7 @@ def test_use_layout_effect_runs_like_use_effect():
 
 
 def _strict_app(log):
-    from pyreaction import StrictMode
+    from reaction import StrictMode
 
     @component
     def Countdown():
@@ -142,7 +142,7 @@ def _strict_app(log):
 def _root_log(debug):
     import asyncio
 
-    from pyreaction import Root
+    from reaction import Root
 
     log = []
 

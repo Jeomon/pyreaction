@@ -6,7 +6,7 @@ import time
 
 from starlette.testclient import TestClient
 
-from pyreaction import Suspense, component, create_app, html, use_async, use_data
+from reaction import Suspense, component, create_app, html, use_async, use_data
 
 
 @component

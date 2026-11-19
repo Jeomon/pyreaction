@@ -1,4 +1,4 @@
-"""Write src/pyreaction/core/_html_types.py: typed call signatures for html.<tag>.
+"""Write src/reaction/core/_html_types.py: typed call signatures for html.<tag>.
 
     uv run python scripts/gen_html_types.py
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parent.parent / "src" / "pyreaction" / "core" / "_html_types.py"
+OUT = Path(__file__).resolve().parent.parent / "src" / "reaction" / "core" / "_html_types.py"
 
 TEXT = "Text"  # str | int | float
 FLAG = "bool"

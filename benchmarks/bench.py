@@ -9,7 +9,7 @@ import json
 import random
 import time
 
-from pyreaction import Root, component, html, memo, use_state
+from reaction import Root, component, html, memo, use_state
 
 ROWS = 10_000
 setters = {}

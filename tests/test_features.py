@@ -1,6 +1,6 @@
 import asyncio
 
-from pyreaction import (
+from reaction import (
     ErrorBoundary,
     Link,
     Router,
@@ -58,7 +58,7 @@ def test_commands_before_attach_run_after_hydration():
     sent = []
 
     async def go():
-        from pyreaction import Root
+        from reaction import Root
 
         root = Root(App())
         refs["input"].current.focus()  # before the browser is connected

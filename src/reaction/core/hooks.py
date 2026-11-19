@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 if TYPE_CHECKING:
     from .reconciler import ComponentNode
 
-logger = logging.getLogger("pyreaction")
+logger = logging.getLogger("reaction")
 
 __all__ = [
     "AsyncState",
@@ -56,13 +56,13 @@ __all__ = [
 
 T = TypeVar("T")
 
-CURRENT: ContextVar[ComponentNode | None] = ContextVar("pyreaction_current", default=None)
+CURRENT: ContextVar[ComponentNode | None] = ContextVar("reaction_current", default=None)
 # The page whose event handler, effect or background work is running (worker threads
 # get it too: they run in a copy of the context that started them).
-ACTIVE_ROOT: ContextVar[Any] = ContextVar("pyreaction_root", default=None)
+ACTIVE_ROOT: ContextVar[Any] = ContextVar("reaction_root", default=None)
 # The action running now (a transition's task, or an event handler's completion
 # future): optimistic values set during it last until it is done.
-CURRENT_ACTION: ContextVar[Any] = ContextVar("pyreaction_action", default=None)
+CURRENT_ACTION: ContextVar[Any] = ContextVar("reaction_action", default=None)
 
 
 def active_root() -> Any:

@@ -119,7 +119,7 @@ def ViewTransition(*children: Any, name: str | None = None) -> Any:
 @component
 def StrictMode(*children: Any) -> Any:
     """Finds impure components and effects without cleanup, in debug mode (as
-    ``pyreaction dev`` runs) only, like React's development builds: components
+    ``reaction dev`` runs) only, like React's development builds: components
     inside render twice, and each effect is set up, cleaned up and set up again
     when it first runs. Outside debug mode it does nothing."""
     node = CURRENT.get()

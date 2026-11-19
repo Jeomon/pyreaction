@@ -3,8 +3,8 @@ import tomllib
 import pytest
 from starlette.testclient import TestClient
 
-from pyreaction import cli
-from pyreaction.cli.serve import find_project, load_app
+from reaction import cli
+from reaction.cli.serve import find_project, load_app
 
 
 def test_init_creates_a_project_that_serves(tmp_path, monkeypatch):
@@ -24,6 +24,8 @@ def test_init_creates_a_project_that_serves(tmp_path, monkeypatch):
     config = tomllib.loads((dest / "pyproject.toml").read_text())
     assert config["project"]["name"] == "My-App"
     assert config["tool"]["pyreaction"]["app"] == "app:App"
+    assert config["project"]["scripts"] == {"dev": "reaction.cli:dev", "pro": "reaction.cli:pro"}
+    assert config["build-system"]["build-backend"] == "hatchling.build"
     assert "{{" not in (dest / "app.py").read_text()
 
     root, settings = find_project(dest / "components")
@@ -45,7 +47,7 @@ def test_init_refuses_a_non_empty_folder(tmp_path, capsys):
 
 def test_commands_outside_a_project_explain_what_to_do(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(SystemExit, match="pyreaction init"):
+    with pytest.raises(SystemExit, match="reaction init"):
         cli.main(["run"])
 
 
@@ -70,3 +72,13 @@ def _parser_recording(seen):
         return parser
 
     return build
+
+
+def test_dev_and_pro_entry_points_pass_their_options_on(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "build_parser", _parser_recording(seen))
+    monkeypatch.setattr(cli.sys, "argv", ["pro", "--port", "9100"])
+    cli.pro()
+    monkeypatch.setattr(cli.sys, "argv", ["dev"])
+    cli.dev()
+    assert seen == [("run", "127.0.0.1", 9100), ("dev", "127.0.0.1", 8000)]

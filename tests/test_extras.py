@@ -4,7 +4,7 @@ import json
 
 from starlette.testclient import TestClient
 
-from pyreaction import (
+from reaction import (
     UploadedFile,
     component,
     create_app,
@@ -89,8 +89,8 @@ def _frame(upload_id, name, data, type_="text/plain", part=0, last=True, size=No
 
 
 def test_upload_frames_are_parsed_assembled_and_checked():
-    from pyreaction import Root
-    from pyreaction.server.app import UPLOAD_CHUNK, _parse_frame, _Uploads
+    from reaction import Root
+    from reaction.server.app import UPLOAD_CHUNK, _parse_frame, _Uploads
 
     header, data = _parse_frame(_frame("7", "a.txt", b"hello"))
     assert (header["u"], header["name"], data) == ("7", "a.txt", b"hello")
@@ -114,8 +114,8 @@ def test_upload_frames_are_parsed_assembled_and_checked():
 
 
 def test_large_upload_is_spooled_and_saved(tmp_path):
-    from pyreaction import Root
-    from pyreaction.server.app import UPLOAD_CHUNK, _Uploads
+    from reaction import Root
+    from reaction.server.app import UPLOAD_CHUNK, _Uploads
 
     root = Root(html.p())
     uploads = _Uploads(root, max_size=10 * UPLOAD_CHUNK)

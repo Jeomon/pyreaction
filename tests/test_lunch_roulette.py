@@ -5,7 +5,7 @@ import asyncio
 import runpy
 from pathlib import Path
 
-from pyreaction.testing import render
+from reaction.testing import render
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "lunch_roulette.py"
 m = runpy.run_path(str(EXAMPLE))
@@ -78,7 +78,7 @@ def test_countdown_ticks_once_per_tick_never_faster_and_stops_at_zero():
 def test_the_whole_app_under_strict_mode_in_debug():
     """StrictMode renders twice and sets each effect up twice; the app is pure and its
     effects clean up, so it behaves the same."""
-    from pyreaction import Root
+    from reaction import Root
 
     async def main():
         root = Root(m["Main"](), debug=True, threaded=False)

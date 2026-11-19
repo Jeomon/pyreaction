@@ -1,4 +1,4 @@
-"""``pyreaction dev`` and ``pyreaction run``: serve the project in the current folder.
+"""``reaction dev`` and ``reaction run``: serve the project in the current folder.
 
 A project is any folder whose ``pyproject.toml`` has a ``[tool.pyreaction]`` table:
 
@@ -36,14 +36,14 @@ def find_project(start: Path) -> tuple[Path, dict[str, Any]]:
                 return folder, config
     raise SystemExit(
         "error: no pyproject.toml with a [tool.pyreaction] table here or above.\n"
-        "Run `pyreaction init my-app` to create a project."
+        "Run `reaction init my-app` to create a project."
     )
 
 
 def load_app(root: Path, config: dict[str, Any], debug: bool = False) -> Any:
     """Import the project's root component and build the ASGI app for it.
 
-    ``debug`` shows errors in the browser; ``pyreaction dev`` turns it on.
+    ``debug`` shows errors in the browser; ``reaction dev`` turns it on.
     """
     from ..server.app import DEFAULT_MAX_UPLOAD, create_app
 
@@ -77,7 +77,7 @@ def load_app(root: Path, config: dict[str, Any], debug: bool = False) -> Any:
 
 
 def app_factory() -> Any:
-    """Entry point for uvicorn's reloader in ``pyreaction dev``, which starts a fresh
+    """Entry point for uvicorn's reloader in ``reaction dev``, which starts a fresh
     process on every change."""
     root = Path(os.environ[PROJECT_ENV])
     _, config = find_project(root)
@@ -92,7 +92,7 @@ def _serve(args: argparse.Namespace, reload: bool) -> int:
     os.environ[PROJECT_ENV] = str(root)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     if reload:
-        print(f"pyreaction dev: serving {root.name} at http://{args.host}:{args.port} (reloads on save)")
+        print(f"reaction dev: serving {root.name} at http://{args.host}:{args.port} (reloads on save)")
         uvicorn.run(
             f"{__name__}:app_factory",
             factory=True,

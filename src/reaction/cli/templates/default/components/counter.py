@@ -1,4 +1,4 @@
-from pyreaction import component, html, use_state
+from reaction import component, html, use_state
 
 
 @component

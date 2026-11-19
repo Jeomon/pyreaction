@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from pyreaction import Suspense, component, event, html, js, js_component, use_data, use_state
-from pyreaction.testing import serve
+from reaction import Suspense, component, event, html, js, js_component, use_data, use_state
+from reaction.testing import serve
 
 pytestmark = pytest.mark.browser
 
@@ -160,7 +160,7 @@ def test_enter_only_key_filter_in_a_real_browser(page):
 
 
 def test_portal_from_server_html_is_adopted_not_rebuilt(page):
-    from pyreaction import portal
+    from reaction import portal
 
     @component
     def App():
@@ -313,7 +313,7 @@ def test_capture_events_and_button_form_action_in_chrome(page):
 
 
 def test_head_tags_resources_and_callback_refs_in_chrome(page):
-    from pyreaction import preinit
+    from reaction import preinit
 
     refs = []
 
@@ -346,7 +346,7 @@ def test_head_tags_resources_and_callback_refs_in_chrome(page):
 
 
 def test_view_transition_updates_in_chrome(page):
-    from pyreaction import ViewTransition
+    from reaction import ViewTransition
 
     @component
     def App():
@@ -366,7 +366,7 @@ def test_view_transition_updates_in_chrome(page):
 
 
 def test_browser_only_part_is_adopted_then_rendered_in_chrome(page):
-    from pyreaction import Suspense, browser
+    from reaction import Suspense, browser
 
     @component
     def Width():
@@ -390,7 +390,7 @@ def test_browser_only_part_is_adopted_then_rendered_in_chrome(page):
 def test_flush_sync_form_reset_and_transition_types_in_chrome(page):
     import time
 
-    from pyreaction import ViewTransition, add_transition_type, flush_sync, request_form_reset, use_ref
+    from reaction import ViewTransition, add_transition_type, flush_sync, request_form_reset, use_ref
 
     @component
     def App():

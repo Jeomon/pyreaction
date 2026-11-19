@@ -4,8 +4,11 @@ React-style UI components in pure Python. Components run on the server; the
 browser gets server-rendered HTML for the first paint, then small DOM patches
 over a WebSocket. No JavaScript to write and no build step.
 
+It is installed as `pyreaction` and imported as `reaction`; the command is
+`reaction` (`pyreaction` works too, so `uvx pyreaction ...` does).
+
 ```python
-from pyreaction import component, html, run, use_state
+from reaction import component, html, run, use_state
 
 @component
 def Counter():
@@ -20,7 +23,8 @@ run(Counter)  # http://127.0.0.1:8000
 ```sh
 uvx pyreaction init my-app     # creates the project, runs uv sync and git init
 cd my-app
-uv run pyreaction dev          # http://127.0.0.1:8000, restarts on every save
+uv run dev                     # http://127.0.0.1:8000, restarts on every save
+uv run pro                     # production
 ```
 
 ```
@@ -31,12 +35,15 @@ my-app/
   public/            served at /static; style.css is linked from the page
 ```
 
-When you save a `.py` file, `pyreaction dev` restarts the server and open pages
-reconnect and redraw by themselves; component state starts over. Changes to
-files in `public/` show on the next refresh. For production, `pyreaction` on its
-own serves without reloading or debug output (`uv run pyreaction --host 0.0.0.0
---port 8000`); `pyreaction run` is the same. `dev` also turns on debug mode (errors shown in
-the page, warnings for lists without keys).
+`dev` and `pro` are commands the project declares in its `[project.scripts]`
+(add your own there). They are the same as `uv run reaction dev` and
+`uv run reaction` (or `reaction run`), which work in any project.
+
+When you save a `.py` file, `dev` restarts the server and open pages reconnect
+and redraw by themselves; component state starts over. Changes to files in
+`public/` show on the next refresh. `dev` also turns on debug mode (errors shown
+in the page, warnings for lists without keys). `pro` serves without reloading or
+debug output; `uv run pro --host 0.0.0.0 --port 8000` listens publicly.
 
 ```toml
 [tool.pyreaction]
@@ -110,7 +117,7 @@ in arrival order, so a slow one (a database call) does not freeze other pages
 Submit events call `preventDefault` by default. For other options:
 
 ```python
-from pyreaction import event, js
+from reaction import event, js
 html.input(on_input=event(search, debounce=300))          # skipped events never reach the server
 html.a("Open", href="#", on_click=event(open_, prevent_default=True))
 html.textarea(on_key_down=event(send, keys=["Enter"], prevent_default=True))
@@ -185,7 +192,7 @@ many re-renders" instead of looping forever; the error goes to the nearest
 `ErrorBoundary`.
 
 `StrictMode(*children)` helps find impure components and effects missing a
-cleanup: in debug mode (`pyreaction dev`) its children render twice and each
+cleanup: in debug mode (`reaction dev`) its children render twice and each
 effect is set up, cleaned up and set up again when it first runs, as in React's
 development builds. Outside debug mode it does nothing.
 
@@ -297,7 +304,7 @@ current action is done.
 ## Routing
 
 ```python
-from pyreaction import Link, Navigate, Router
+from reaction import Link, Navigate, Router
 
 @component
 def App():
@@ -409,7 +416,7 @@ logged and not caught by boundaries, as in React.
 
 `create_app(on_error=fn)` calls `fn(exc, where, connection)` for every error not
 caught by a boundary, to send them to a monitoring service. With `debug=True`,
-which `pyreaction dev` sets, they also show in the browser with their traceback,
+which `reaction dev` sets, they also show in the browser with their traceback,
 as does a warning when the server's HTML did not match the live render.
 
 ## JavaScript components
@@ -418,7 +425,7 @@ For what Python cannot draw in the browser (charts, maps, editors), wrap a
 JavaScript module:
 
 ```python
-from pyreaction import js_component
+from reaction import js_component
 
 Chart = js_component("/static/chart.js", "mount")
 
@@ -448,7 +455,7 @@ React component with `createRoot` inside `mount`, passes props through in
 ## Testing
 
 ```python
-from pyreaction.testing import render
+from reaction.testing import render
 
 def test_todo():
     with render(Todo()) as page:
@@ -469,7 +476,7 @@ For a real browser, `serve` runs the app on a free local port in a background
 thread; the page marks `<html data-pyreaction-ready>` once it is live:
 
 ```python
-from pyreaction.testing import serve
+from reaction.testing import serve
 
 def test_counter(page):                      # Playwright's page (pytest-playwright)
     with serve(Counter) as server:           # create_app options go here too
@@ -573,16 +580,16 @@ instance, keeps its state.
 5. While you type, the browser ignores server values older than your latest keystroke, so a slow round trip never undoes typing.
 6. If the browser falls behind, pending updates merge into one message; past 100,000 pending operations the connection is closed and the browser starts over.
 
-The operation format is documented at the top of `src/pyreaction/core/reconciler.py`.
+The operation format is documented at the top of `src/reaction/core/reconciler.py`.
 
 ## Layout
 
 ```
-src/pyreaction/
+src/reaction/
   core/       elements, hooks, components, the reconciler and HTML rendering (no web dependencies)
   server/     the Starlette app, run() and embed()
   client/     client.js, the index.html page template and its style.css
-  cli/        the pyreaction command: scaffold.py (init), serve.py (dev, run)
+  cli/        the reaction command: scaffold.py (init), serve.py (dev, run)
               and templates/, what init copies
   testing.py  render() and the fake browser for tests, serve() for real browsers
 ```

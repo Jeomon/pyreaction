@@ -9,7 +9,7 @@ import time
 import pytest
 from starlette.testclient import TestClient
 
-from pyreaction import (
+from reaction import (
     ErrorBoundary,
     Root,
     Suspense,
@@ -32,7 +32,7 @@ from pyreaction import (
     use_ref,
     use_state,
 )
-from pyreaction.testing import render
+from reaction.testing import render
 
 from .fakedom import FakeDom
 
@@ -289,7 +289,7 @@ def test_cache_signal_aborts_when_the_page_closes_and_cancels_cached_work():
         return Suspense(html.p(stream_value()), fallback=html.p("loading"))
 
     def stream_value():
-        from pyreaction import use
+        from reaction import use
 
         return use(stream("news"))
 

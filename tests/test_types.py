@@ -7,7 +7,7 @@ import pytest
 mypy_api = pytest.importorskip("mypy.api")
 
 GOOD = """
-from pyreaction import EventHandler, event, html, js
+from reaction import EventHandler, event, html, js
 
 html.div("x", id="a", class_name="box", hidden=True, data_id=7, aria_label="ok", style={"color": "red"})
 html.input(type="checkbox", checked=False, value=3, on_change=lambda e: None, my_custom="x")
@@ -18,7 +18,7 @@ html.my_widget("custom tags take anything", foo=1)
 """
 
 BAD = """
-from pyreaction import html
+from reaction import html
 
 html.button("x", on_click="alert(1)")
 html.input(checked="yes")

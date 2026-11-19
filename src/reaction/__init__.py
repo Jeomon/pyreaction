@@ -1,7 +1,7 @@
 """pyreaction: React-style components in Python, rendered on the server and
 patched into the browser over a WebSocket.
 
-    from pyreaction import component, html, use_state, run
+    from reaction import component, html, use_state, run
 
     @component
     def Counter():
@@ -183,4 +183,4 @@ def __getattr__(name: str):
         from . import server
 
         return getattr(server, name)
-    raise AttributeError(f"module 'pyreaction' has no attribute {name!r}")
+    raise AttributeError(f"module 'reaction' has no attribute {name!r}")

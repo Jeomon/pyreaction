@@ -5,7 +5,7 @@ from __future__ import annotations
 from html import escape
 from typing import Any
 
-from pyreaction.core.ssr import VOID
+from reaction.core.ssr import VOID
 
 
 class Node:
@@ -109,8 +109,8 @@ class FakeDom:
 
 def tree_html(root: Any) -> str:
     """The mounted tree in FakeDom's format, built straight from the reconciler's nodes."""
-    from pyreaction.core.element import JsComponent
-    from pyreaction.core.reconciler import ComponentNode, TextNode
+    from reaction.core.element import JsComponent
+    from reaction.core.reconciler import ComponentNode, TextNode
 
     def nodes(children: list[Any]) -> str:
         out = []

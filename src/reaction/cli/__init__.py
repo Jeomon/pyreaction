@@ -1,7 +1,7 @@
-"""The ``pyreaction`` command: ``init`` a project, then ``dev`` or ``run`` it.
+"""The ``reaction`` command (also installed as ``pyreaction``): ``init`` a project, then ``dev`` or ``run`` it.
 
-With no command, ``pyreaction`` serves the project for production, as ``run``
-does: ``pyreaction --port 8000`` is ``pyreaction run --port 8000``.
+With no command, ``reaction`` serves the project for production, as ``run``
+does: ``reaction --port 8000`` is ``reaction run --port 8000``.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ COMMANDS = ("init", "dev", "run")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pyreaction",
+        prog="reaction",
         description="React-style UIs in Python. With no command, serves the project for production (like `run`).",
     )
     parser.add_argument("--version", action="version", version=f"pyreaction {__version__}")
@@ -56,3 +56,17 @@ def main(argv: list[str] | None = None) -> int:
         args_in.insert(0, "run")
     args = build_parser().parse_args(args_in)
     return args.func(args)
+
+
+# Entry points a project declares in its own [project.scripts], so that inside it
+# `uv run dev` and `uv run pro` work (reaction init writes them).
+
+
+def dev() -> int:
+    """``uv run dev``: serve the project, restarting on every save, in debug mode."""
+    return main(["dev", *sys.argv[1:]])
+
+
+def pro() -> int:
+    """``uv run pro``: serve the project for production."""
+    return main(["run", *sys.argv[1:]])

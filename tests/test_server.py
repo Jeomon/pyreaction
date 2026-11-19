@@ -8,8 +8,8 @@ import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from pyreaction import component, create_app, html, use_effect, use_location, use_state, use_title
-from pyreaction.server.app import _Outbox
+from reaction import component, create_app, html, use_effect, use_location, use_state, use_title
+from reaction.server.app import _Outbox
 
 from .fakedom import FakeDom
 

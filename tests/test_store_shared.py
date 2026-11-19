@@ -12,8 +12,8 @@ import pytest
 pytest.importorskip("redis")
 fakeredis = pytest.importorskip("fakeredis")
 
-from pyreaction import RedisBackend, Store, component, html, use_store  # noqa: E402
-from pyreaction.testing import render  # noqa: E402
+from reaction import RedisBackend, Store, component, html, use_store  # noqa: E402
+from reaction.testing import render  # noqa: E402
 
 
 @pytest.fixture
@@ -87,7 +87,7 @@ def test_concurrent_updates_from_several_processes_lose_nothing(backends):
 def test_a_real_second_process_shares_the_store(backends, redis_url):
     mine = Store(0, name="hits", backend=backends())
     script = textwrap.dedent(f"""
-        from pyreaction import RedisBackend, Store
+        from reaction import RedisBackend, Store
         backend = RedisBackend({redis_url!r})
         store = Store(0, name="hits", backend=backend)
         for _ in range(50):

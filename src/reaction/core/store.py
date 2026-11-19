@@ -19,7 +19,7 @@ __all__ = ["RedisBackend", "Store", "StoreBackend", "use_store"]
 
 T = TypeVar("T")
 
-logger = logging.getLogger("pyreaction")
+logger = logging.getLogger("reaction")
 
 
 class StoreBackend(Protocol):

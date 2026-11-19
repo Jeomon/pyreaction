@@ -1,4 +1,4 @@
-"""``pyreaction init``: copy a project template into a new folder."""
+"""``reaction init``: copy a project template into a new folder."""
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             return 1
 
     cd = os.path.relpath(dest)
-    run = "uv run pyreaction dev" if uv else "pyreaction dev"
+    run = "uv run dev" if uv else "dev"
     print("\nNext:")
     if cd != ".":
         print(f"  cd {cd}")
