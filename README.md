@@ -134,6 +134,24 @@ to the page as written, so never build it from user input.
 A `_capture` suffix (`on_click_capture`) listens on the way down, before the
 target's own handlers, as React's `onClickCapture`.
 
+An event carries the common fields (value, checked, key, mouse position...). For
+anything else, ask the browser while the event is recent (the last 50 events, for
+a minute):
+
+```python
+async def dropped(e):
+    files = await e.read("dataTransfer.files")            # [{"name", "type", "size", ...}]
+    text = await e.call("dataTransfer.getData", "text/plain")
+    top = await e.target.read("scrollTop")
+
+def clicked(e):                                           # a plain handler waits with .result()
+    shift = e.read("shiftKey").result()
+```
+
+Values come back as JSON (a file as its name, type and size; a list as its items).
+The browser has finished with the event by then, so `preventDefault` and the like
+are set with `event(...)` options, not called afterwards.
+
 ### File uploads
 
 ```python
@@ -603,6 +621,32 @@ Checked against FastAPI 0.165: routers and OpenAPI, a proxy root path
 (streamed pages stay streamed), `request.user` from Starlette's
 `AuthenticationMiddleware`, several apps in one FastAPI app, Jinja pages with
 `embed()`, `fastapi run` and `uvicorn --workers N`.
+
+### With Django, Flask and other frameworks
+
+`wrap` puts pyreaction pages in front of another web app and returns an ASGI app
+to run with uvicorn:
+
+```python
+# Django: asgi.py, then `uvicorn mysite.asgi:application`
+from django.core.asgi import get_asgi_application
+from reaction import wrap
+application = wrap(get_asgi_application(), Dashboard, "/dashboard")
+
+# Flask: a WSGI app, run through a2wsgi (pip install "pyreaction[wsgi]")
+app = wrap(flask_app, Dashboard, "/dashboard")          # uvicorn main:app
+```
+
+Requests under the path go to pyreaction (pages, script, WebSocket and
+`static_dir`); everything else reaches the framework unchanged. With `"/"` the
+framework answers first, and a GET it answers with 404 becomes a pyreaction page.
+Components read the request through `use_request()` (`.cookies`, `.headers`),
+not the framework's own request object: `flask.request` and Django's
+`request.user` are not available in components; read the session cookie, or
+expose what they need through an API route. Flask runs under uvicorn here, not
+its own server or gunicorn's sync workers. To put a component inside a Django or
+Flask template, wrap it under a path and add `embed(Widget, mount_path="/widget")`
+to the template (`|safe` / `mark_safe`). Checked with Django 6.1 and Flask 3.1.
 
 Options: `title`, `head`, `lang`, `static_dir`, `static_path`, `stylesheets`,
 `routes` (extra Starlette routes), `data_timeout`, `stream`, `max_upload_size`,

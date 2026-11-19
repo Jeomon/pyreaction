@@ -526,3 +526,97 @@ def test_fastapi_page_routes_in_chrome(page):
         page.wait_for_function("location.pathname === '/orders/7'")
         page.wait_for_selector("#title")
         assert "order 7" in page.text_content("#title")
+
+
+def test_event_properties_on_demand_in_chrome(page):
+    seen = {}
+
+    @component
+    def App():
+        async def dropped(e):
+            seen["types"] = await e.read("dataTransfer.types")
+            seen["files"] = await e.read("dataTransfer.files")
+            seen["text"] = await e.call("dataTransfer.getData", "text/plain")
+
+        async def scrolled(e):
+            seen["scroll"] = await e.target.read("scrollTop")
+            seen["rect"] = await e.call("target.getBoundingClientRect")
+
+        def clicked(e):  # a plain handler waits with .result()
+            seen["shift"] = e.read("shiftKey").result()
+            seen["tag"] = e.target.read("tagName").result()
+
+        return html.div(
+            html.div("drop here", id="zone", style={"height": "60px"},
+                     on_drop=event(dropped, prevent_default=True), on_drag_over=event(lambda: None, prevent_default=True)),
+            html.div(html.div(style={"height": "2000px"}), id="box", style={"height": "100px", "overflow": "auto"},
+                     on_scroll=event(scrolled, debounce=50)),
+            html.button("go", id="go", on_click=clicked),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.evaluate("""() => {
+            const dt = new DataTransfer();
+            dt.setData('text/plain', 'hello');
+            dt.items.add(new File(['abc'], 'notes.txt', {type: 'text/plain'}));
+            document.querySelector('#zone').dispatchEvent(new DragEvent('drop', {dataTransfer: dt, bubbles: true}));
+        }""")
+        page.evaluate("document.querySelector('#box').scrollTop = 250")
+        page.click("#go", modifiers=["Shift"])
+        page.wait_for_function("true", timeout=100)
+        import time
+
+        deadline = time.monotonic() + 5
+        while len(seen) < 7 and time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+        assert "text/plain" in seen["types"] and "Files" in seen["types"]
+        assert seen["files"] == [{"name": "notes.txt", "type": "text/plain", "size": 3, "lastModified": seen["files"][0]["lastModified"]}]
+        assert seen["text"] == "hello"
+        assert seen["scroll"] == 250 and seen["rect"]["height"] == 100
+        assert seen["shift"] is True and seen["tag"] == "BUTTON"
+
+
+def test_flask_app_with_pages_under_ui_in_chrome(page):
+    flask = pytest.importorskip("flask")
+    pytest.importorskip("a2wsgi")
+    from reaction import Link, Router, use_location, wrap
+
+    app = flask.Flask("flask_browser_test")
+
+    @app.get("/")
+    def home():
+        return '<h1 id="flask">Flask home</h1><a id="to-ui" href="/ui/">pages</a>'
+
+    @component
+    def Index():
+        n, set_n = use_state(0)
+        return html.div(
+            html.p(f"at {use_location().path}", id="at"),
+            html.button(f"n={n}", id="inc", on_click=lambda: set_n(n + 1)),
+            Link("about", to="/about", id="about"),
+        )
+
+    @component
+    def About():
+        return html.p("about page", id="about-page")
+
+    @component
+    def App():
+        return Router({"/": Index, "/about": About})
+
+    with serve(wrap(app, App, "/ui"), asgi=True) as server:
+        page.goto(server.url + "/")
+        assert page.text_content("#flask") == "Flask home"
+        page.click("#to-ui")
+        page.wait_for_selector(server.READY, state="attached")
+        assert page.text_content("#at") == "at /"
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+        page.click("#inc")
+        page.wait_for_function("document.querySelector('#inc').textContent === 'n=1'")
+        page.click("#about")
+        page.wait_for_selector("#about-page")
+        assert page.evaluate("location.pathname") == "/ui/about"
+        page.go_back()
+        page.wait_for_selector("#at")
+        assert page.evaluate("location.pathname") == "/ui/"

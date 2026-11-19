@@ -185,11 +185,45 @@ class Event(dict):
     """Event data from the browser. Keys read as attributes: ``e.value``, ``e.target.checked``.
 
     A missing key reads as None, since which keys arrive depends on the event type.
+    For anything that was not sent, ask the browser while the event is recent
+    (about a minute): ``await e.read("dataTransfer.files")``,
+    ``await e.target.read("scrollTop")``, ``await e.call("target.getBoundingClientRect")``.
     """
 
+    def __init__(self, data: Any = (), root: Root | None = None, seq: int | None = None, path: str = "") -> None:
+        super().__init__(data)
+        self._root = root
+        self._seq = seq
+        self._path = path
+
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
         value = self.get(name)
-        return Event(value) if type(value) is dict else value
+        if value is None and name == "target" and not self._path:
+            value = {}  # always there, so e.target.read(...) works
+        if type(value) is dict:
+            return Event(value, self._root, self._seq, f"{self._path}{name}.")
+        return value
+
+    def read(self, path: str = "") -> Reply:
+        """The value of ``path`` (dotted, from this event, or from ``e.target`` for
+        ``e.target.read(...)``) in the browser: ``await e.read("dataTransfer.types")``
+        in an ``async`` handler, ``.result()`` in a plain one. Values come back as
+        JSON (a file as its name, type and size; a list as its items)."""
+        return self._ask(path, [], False)
+
+    def call(self, path: str, *args: Any) -> Reply:
+        """Call the method at ``path`` with ``args`` and get its result:
+        ``await e.call("target.getBoundingClientRect")``. The browser has finished
+        with the event by then, so calls such as ``preventDefault`` do nothing; use
+        :func:`event` options for those."""
+        return self._ask(path, list(args), True)
+
+    def _ask(self, path: str, args: list[Any], call: bool) -> Reply:
+        if self._root is None or self._seq is None:
+            raise RuntimeError("this event did not come from a browser")
+        return self._root.command(0, "#event", [self._seq, (self._path + path).rstrip("."), args, call])
 
 
 class FormFields(dict):
@@ -1202,7 +1236,7 @@ class Root:
         reply_id = next(self._reply_ids)
 
         def apply() -> None:
-            if node_id not in self.hosts:
+            if node_id != 0 and node_id not in self.hosts:  # 0: the page itself
                 future.set_exception(LookupError("the element is no longer on the page"))
                 return
             self._replies[reply_id] = future
@@ -1318,7 +1352,7 @@ class Root:
         if fn is None:
             self._ack(seq)
             return None
-        event = Event(data)
+        event = Event(data, self, seq)
         wants = _wants_event(fn)
 
         def call() -> Any:

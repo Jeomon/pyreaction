@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - depends on the optional extra
     def _dumps(data: Any) -> str:
         return _encoder.encode(data)
 
-__all__ = ["create_app", "embed", "mount", "page", "prerender", "run"]
+__all__ = ["create_app", "embed", "mount", "page", "prerender", "run", "wrap"]
 
 logger = logging.getLogger("reaction")
 
@@ -715,6 +715,116 @@ def page(host: Any, path: str, **options: Any) -> Callable[[Callable[..., Any]],
         return fn
 
     return decorate
+
+
+def _as_asgi(app: Any) -> Any:
+    """``app`` as an ASGI app: as is, or a WSGI app (Flask) through a2wsgi."""
+    call = getattr(app, "__call__", None)
+    if inspect.iscoroutinefunction(app) or inspect.iscoroutinefunction(call):
+        return app
+    try:
+        from a2wsgi import WSGIMiddleware
+    except ImportError:
+        raise ImportError(
+            'wrap() needs a2wsgi for a WSGI app such as Flask: pip install "pyreaction[wsgi]"'
+        ) from None
+    return WSGIMiddleware(app)
+
+
+async def _empty_request(receive: Any) -> Any:
+    """A receive that gives an empty request body, then waits for the disconnect."""
+    sent = False
+
+    async def again() -> Any:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return await receive()
+
+    return again
+
+
+def wrap(
+    app: Any,
+    component: Component | Element | Callable[[], Element],
+    path: str = "/",
+    **options: Any,
+) -> Any:
+    """Serve pyreaction pages in front of another web app, such as Django or Flask.
+
+    Returns an ASGI app to run with uvicorn (or any ASGI server). Requests at
+    ``path`` go to pyreaction (its pages, script, WebSocket and ``static_dir``);
+    everything else goes to ``app`` unchanged::
+
+        # Django (asgi.py)
+        application = wrap(get_asgi_application(), Dashboard, "/dashboard")
+
+        # Flask: a WSGI app, run through a2wsgi (pip install "pyreaction[wsgi]")
+        app = wrap(flask_app, Dashboard, "/dashboard")      # uvicorn main:app
+
+    At ``"/"``, the other app answers first and the pages take what it does not
+    find: a GET it answers with 404 is rendered by pyreaction instead.
+    Components see the request through ``use_request()`` (``.cookies``,
+    ``.headers``), not the framework's own request object. The app's lifespan
+    events are answered here (Django and Flask have none), and WebSockets other
+    than pyreaction's are passed on as they are. ``options`` go to
+    :func:`create_app`. To put a component inside the framework's own templates,
+    wrap it under a path and add :func:`embed` to the template.
+    """
+    inner = _as_asgi(app)
+    ours = create_app(component, **options)
+    base = "/" + path.strip("/") if path.strip("/") else ""
+    prefix = options.get("prefix", "/_pyreaction")
+    own_paths = [prefix]
+    if options.get("static_dir") is not None:
+        own_paths.append(options.get("static_path", "/static"))
+
+    def under(p: str, start: str) -> bool:
+        return p == start or p.startswith(start.rstrip("/") + "/")
+
+    async def ours_at(scope: Any, receive: Any, send: Any) -> None:
+        if base:
+            scope = {**scope, "root_path": scope.get("root_path", "") + base}
+        await ours(scope, receive, send)
+
+    async def wrapped(scope: Any, receive: Any, send: Any) -> None:
+        kind = scope["type"]
+        if kind == "lifespan":
+            await ours(scope, receive, send)  # Django and a2wsgi cannot handle these
+            return
+        root = scope.get("root_path", "")
+        p = scope.get("path", "/")
+        p = p[len(root):] if root and p.startswith(root) else p
+        if base:
+            if under(p, base):
+                await ours_at(scope, receive, send)
+            else:
+                await inner(scope, receive, send)
+            return
+        if any(under(p, own) for own in own_paths):
+            await ours(scope, receive, send)
+            return
+        if kind != "http" or scope.get("method") not in ("GET", "HEAD"):
+            await inner(scope, receive, send)
+            return
+        # At "/": the other app first; a 404 for a GET becomes a pyreaction page.
+        state = {"fallback": False}
+
+        async def watch(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                if message["status"] == 404:
+                    state["fallback"] = True
+                    return
+                await send(message)
+            elif not state["fallback"]:
+                await send(message)
+
+        await inner(scope, receive, watch)
+        if state["fallback"]:
+            await ours(scope, await _empty_request(receive), send)
+
+    return wrapped
 
 
 def run(

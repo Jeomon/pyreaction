@@ -155,9 +155,10 @@
     const [preventDefault, stopPropagation, debounce, throttle, keys, code, stopImmediate, withForm] = spec;
     let timer = null;
     let last = 0;
-    const fire = (data) => {
+    const fire = (data, e) => {
       const s = ++seq;
       lastSent.set(el, s);
+      remember(s, e);
       send([s, el.__id, name, data]);
     };
     // A js() handler runs here and sends nothing.
@@ -189,17 +190,17 @@
       }
       const t = e.target;
       if (t && t.localName === "input" && t.type === "file" && t.files && t.files.length) {
-        upload(t.files).then((files) => fire({ ...data, files }));
+        upload(t.files).then((files) => fire({ ...data, files }, e));
       } else if (debounce) {
         clearTimeout(timer);
-        timer = setTimeout(() => fire(data), debounce);
+        timer = setTimeout(() => fire(data, e), debounce);
       } else if (throttle) {
         const now = Date.now();
         if (now - last >= throttle) {
           last = now;
-          fire(data);
+          fire(data, e);
         }
-      } else fire(data);
+      } else fire(data, e);
     };
     events[name] = handler;
     el.addEventListener(type, handler, capture);
@@ -286,11 +287,47 @@
   // anything else as text.
   function toJson(value) {
     if (value === undefined) return null;
+    if (typeof File !== "undefined" && value instanceof File) {
+      return { name: value.name, type: value.type, size: value.size, lastModified: value.lastModified };
+    }
+    // FileList, classList, DataTransfer types and other lists: their items.
+    if (value && typeof value === "object" && !Array.isArray(value) && typeof value.length === "number" &&
+        typeof value[Symbol.iterator] === "function") {
+      return Array.from(value, toJson);
+    }
     try {
       return JSON.parse(JSON.stringify(value));
     } catch (_) {
       return String(value);
     }
+  }
+
+  // Recent events, so Python can read more of one than was sent (e.read / e.call).
+  const EVENT_KEEP = 50;
+  const EVENT_MS = 60000;
+  const recentEvents = new Map();
+
+  function remember(s, e) {
+    const now = Date.now();
+    recentEvents.set(s, { e, at: now });
+    for (const [k, v] of recentEvents) {
+      if (recentEvents.size <= EVENT_KEEP && now - v.at < EVENT_MS) break;
+      recentEvents.delete(k);
+    }
+  }
+
+  async function readEvent([s, path, args, isCall]) {
+    const kept = recentEvents.get(s);
+    if (!kept || Date.now() - kept.at > EVENT_MS) throw new Error("the event is no longer available");
+    let parent = null;
+    let value = kept.e;
+    for (const part of path ? path.split(".") : []) {
+      parent = value;
+      value = value == null ? undefined : value[part];
+    }
+    if (!isCall) return value;
+    if (typeof value !== "function") throw new Error(`${path} is not a method of the event`);
+    return value.apply(parent, args);
   }
 
   // ref.current.call/get/set from Python: run it and send the answer back.
@@ -299,7 +336,8 @@
     let error = null;
     try {
       if (!el) throw new Error("the element is no longer on the page");
-      if (method === "#get") value = el[args[0]];
+      if (method === "#event") value = await readEvent(args);
+      else if (method === "#get") value = el[args[0]];
       else if (method === "#set") el[args[0]] = args[1];
       else if (typeof el[method] === "function") value = await el[method](...args);
       else throw new Error(`the element has no method ${method}`);
@@ -654,6 +692,7 @@
         // while offline still apply. A new one numbers everything afresh: nothing
         // queued for the old one, and no pending input edit, may carry over.
         if (!data.resumed) {
+          recentEvents.clear(); // their numbers belong to the old session
           outbox.length = 0;
           seq = 0;
           lastSent = new WeakMap();

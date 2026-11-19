@@ -35,22 +35,27 @@ def test_slow_sync_handler_does_not_block_other_sessions():
         root = Root(Slow())
         root.attach(lambda m: None)
         start = time.perf_counter()
-        ticks = 0
+        longest = 0.0
 
         async def other_session():
-            nonlocal ticks
-            while time.perf_counter() - start < 0.6:
-                ticks += 1
+            # The longest the loop went without running this session: the handler's
+            # 0.5 s sleep if it ran on the loop, scheduling noise otherwise.
+            nonlocal longest
+            last = time.perf_counter()
+            while last - start < 0.6:
                 await asyncio.sleep(0.01)
+                now = time.perf_counter()
+                longest = max(longest, now - last)
+                last = now
 
         task = asyncio.create_task(other_session())
         await asyncio.sleep(0.05)
         root.dispatch(1, 1, "click", {})
         await task
         root.close()
-        return ticks
+        return longest
 
-    assert asyncio.run(main()) > 40, "the event loop kept running while the handler slept"
+    assert asyncio.run(main()) < 0.3, "the event loop kept running while the handler slept"
 
 
 def test_sync_handlers_and_effects_run_off_the_loop_in_order():

@@ -35,11 +35,17 @@ fast = ["orjson>=3.9"]
 browser = ["playwright>=1.50"]
 # Stores shared by several worker processes: Store(..., backend=RedisBackend(url)).
 redis = ["redis>=5"]
+wsgi = [
+    "a2wsgi>=1.10",
+]
 
 [dependency-groups]
 dev = [
+    "a2wsgi>=1.10",
+    "django>=5",
     "fakeredis>=2.20",
     "fastapi>=0.115",
+    "flask>=3",
     "httpx2>=2.16.2",
     "itsdangerous>=2",
     "mypy>=2.4.1",

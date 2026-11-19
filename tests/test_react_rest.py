@@ -385,3 +385,37 @@ def test_lazy_error_goes_to_the_boundary_and_is_retried():
         assert page.html() == "<button>retry: not yet</button>"
         page.click("button")
         assert page.html() == "<p>loaded</p>"
+
+
+# ---- reading event properties on demand -------------------------------------------------------
+
+
+def test_event_read_and_call_ask_the_browser_for_that_event():
+    got = []
+
+    @component
+    def App():
+        async def scrolled(e):
+            got.append(await e.target.read("scrollTop"))
+            got.append(await e.call("target.getBoundingClientRect"))
+
+        return html.div("long", on_scroll=scrolled)
+
+    def answer(node, method, args):
+        assert method == "#event"
+        seq, path, call_args, is_call = args
+        return {"target.scrollTop": 120, "target.getBoundingClientRect": {"top": 5}}[path] if seq == 1 else None
+
+    with render(App(), on_call=answer) as page:
+        page.dispatch("div", "scroll")
+        sent = [(n.id, m, a) for n, m, a in page.calls]
+    assert got == [120, {"top": 5}]
+    assert sent == [(0, "#event", [1, "target.scrollTop", [], False]), (0, "#event", [1, "target.getBoundingClientRect", [], True])]
+
+
+def test_event_read_needs_a_browser_event():
+    from reaction import Event
+
+    with pytest.raises(RuntimeError, match="did not come from a browser"):
+        Event({"value": 1}).read("x")
+    assert Event({"target": {"value": 2}}).target.value == 2

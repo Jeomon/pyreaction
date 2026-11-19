@@ -129,6 +129,7 @@ __all__ = [
     "create_app",
     "mount",
     "page",
+    "wrap",
     "prerender",
     "create_context",
     "embed",
@@ -182,7 +183,7 @@ __all__ = [
 
 def __getattr__(name: str):
     # The server pulls in Starlette; load it only when it is asked for.
-    if name in ("create_app", "embed", "mount", "page", "prerender", "run"):
+    if name in ("create_app", "embed", "mount", "page", "prerender", "run", "wrap"):
         from . import server
 
         return getattr(server, name)
