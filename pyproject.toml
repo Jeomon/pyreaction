@@ -3,6 +3,8 @@ name = "pyreaction"
 version = "0.1.0"
 description = "React-style UI components in pure Python, rendered on the server and patched into the browser over a WebSocket."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "jeomon", email = "jeogeoalukka@gmail.com" }
 ]
