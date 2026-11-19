@@ -234,7 +234,8 @@ flow, JavaScript widgets, and a FastAPI app.
   `js_component_from_string` are sent as written: never build them from user input.
 - Uploads, queued events and pending updates are capped per page.
 
-[Deployment and security](docs/deployment.md#security) has the details.
+[Deployment and security](docs/deployment.md#security) has the details. To report a
+vulnerability, see [SECURITY.md](SECURITY.md); please do not open a public issue.
 
 ## 📝 Limitations
 
@@ -242,9 +243,9 @@ flow, JavaScript widgets, and a FastAPI app.
   follows the network; use `js()` for what must react instantly, such as selecting
   an input's text.
 - **Each open page holds state on the server.** Memory grows with open tabs, and a
-  10,000-row page holds about 29 MB. Long lists should use `VirtualList`.
+  10,000-row page holds about 20 MB. Long lists should use `VirtualList`.
 - **Rendering runs on the server's event loop.** A very large page (10,000 rows)
-  takes about 170 ms to render, during which other pages on that process wait.
+  takes about 80 ms to serve, during which other pages on that process wait.
 - **Resuming after a drop needs the same process.** With several workers, route a
   page's connections to the worker that served it (sticky sessions).
 - **Not on PyPI yet**, and the API may still change before 1.0.
@@ -253,6 +254,7 @@ flow, JavaScript widgets, and a FastAPI app.
 
 Bug reports and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md)
 explains the setup, the tests and type checks, and what a change needs.
+[CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
 
 ## 🙏 References
 
@@ -272,6 +274,10 @@ explanation of the ideas it borrows.
 
 It is built on [Starlette](https://www.starlette.io), [uvicorn](https://www.uvicorn.org)
 and [orjson](https://github.com/ijl/orjson).
+
+pyreaction is an independent project. It is not affiliated with, endorsed by or
+sponsored by Meta, the React project or the ReactPy project. React is a trademark of
+Meta Platforms, Inc.; the name is used only to describe what pyreaction follows.
 
 ## 🪪 License
 

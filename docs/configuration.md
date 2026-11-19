@@ -21,7 +21,7 @@ variables. Code wins over `[tool.pyreaction]`, which wins over the environment.
 | `allowed_origins` | `()` | `PYREACTION_ALLOWED_ORIGINS` (comma-separated) | extra origins allowed to open the WebSocket |
 | `max_upload_size` | 10 MiB | `PYREACTION_MAX_UPLOAD_SIZE` | bytes per uploaded file |
 | `max_pending_events` | `1000` | `PYREACTION_MAX_PENDING_EVENTS` | events a page may queue before it is disconnected |
-| `max_pending_ops` | `100000` | `PYREACTION_MAX_PENDING_OPS` | updates a slow browser may fall behind before it starts over |
+| `max_pending_ops` | `100000` | `PYREACTION_MAX_PENDING_OPS` | updates a slow browser may fall behind (queued behind the one being sent, which goes however large) before it starts over |
 | `data_timeout` | `5.0` | `PYREACTION_DATA_TIMEOUT` | seconds the first HTML waits for data |
 | `stream` | `True` | `PYREACTION_STREAM` | stream Suspense content into the first response |
 | `threaded` | `True` | `PYREACTION_THREADED` | run plain handlers and effects in worker threads |

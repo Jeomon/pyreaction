@@ -17,7 +17,8 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Framework :: AsyncIO",
-    # PyPI rejects any upload with this classifier: the project is private.
+    # PyPI rejects any upload with this classifier: not published there yet (see
+    # CHANGELOG.md). Remove it for the first release.
     "Private :: Do Not Upload",
 ]
 dependencies = [
@@ -26,6 +27,13 @@ dependencies = [
     "websockets>=12",
     "orjson>=3.9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Jeomon/pyreaction"
+Documentation = "https://github.com/Jeomon/pyreaction/tree/main/docs"
+Repository = "https://github.com/Jeomon/pyreaction"
+Issues = "https://github.com/Jeomon/pyreaction/issues"
+Changelog = "https://github.com/Jeomon/pyreaction/blob/main/CHANGELOG.md"
 
 [project.scripts]
 # The command is `reaction`; `pyreaction` is the same, so `uvx pyreaction ...` works.

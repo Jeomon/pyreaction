@@ -13,6 +13,11 @@ it off when a proxy already compresses), streamed pages included. The client
 script is served at a URL with a hash of its contents (`client.js?v=...`), so
 browsers keep it for a year and fetch it again only after an upgrade.
 
+**Early Hints.** Each page response has a `Link` header with the client script and
+the page's resource hints. CDNs that support 103 Early Hints (Cloudflare, Fastly)
+send it ahead of the page, so the browser starts on those files while the server
+is still rendering. uvicorn does not send 103 itself.
+
 **Sessions and workers.** Each open page is a live session on the server. The
 render that made a page's HTML waits up to `handoff_timeout` seconds for the
 page's live connection, which takes it over instead of rendering again (only for
@@ -68,5 +73,6 @@ minutes. The page reconnects by itself when that happens.
 - **Templates.** `jinja_components` signs the component and props it puts in the
   page; tampered links render nothing.
 - **Content-Security-Policy.** The page uses inline style and small inline
-  scripts for streaming, and `js_component_from_string` needs `data:` scripts;
-  allow them in a policy that restricts `script-src`.
+  scripts for streaming (swapping in Suspense content, and opening the WebSocket
+  early), and `js_component_from_string` needs `data:` scripts; allow them in a
+  policy that restricts `script-src`.

@@ -95,7 +95,7 @@ explained. Docstrings in the source have the details (`help(reaction.use_state)`
 | `embed(App, mount_path=)`, `jinja_components(env, components)` | inside server-rendered templates |
 | `prerender(App, paths, folder)` | static pages ([Static prerendering](integrations.md#static-prerendering)) |
 | `render_to_string`, `render_to_static_markup`, `to_vdom` | an element as HTML, as HTML that never goes live, or as plain dicts |
-| `Root` | one live page: the mounted tree and its updates (used by the server and tests) |
+| `Root` | one live page: the mounted tree and its updates (used by the server and tests; `ops=False` for a render no browser is connected to yet) |
 
 ## Testing (`reaction.testing`)
 

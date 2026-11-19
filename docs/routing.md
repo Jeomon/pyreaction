@@ -36,3 +36,10 @@ As in React 19, `<title>`, `<meta>` and `<link>` written anywhere go into
 `<head>`, in the first HTML too, and leave it when they unmount. `Head(...)` and
 `use_title` do the same. The resource hints `prefetch_dns`, `preconnect`,
 `preload`, `preload_module`, `preinit` and `preinit_module` add each resource once.
+
+Images in the page are preloaded from `<head>` as React does: the first ten, plus
+any with `fetch_priority="high"` (lazy and low-priority images, `data:` URLs and
+images inside `<picture>` are not). In a streamed page, the hints and `<head>`
+tags a `Suspense` boundary adds arrive with its content, and a stylesheet it
+preinits loads before that content shows. Each page response also lists its hints
+in a `Link` header (up to about 2 kB).

@@ -16,9 +16,13 @@ html.div(
 
 - `class_name` becomes `class`, `html_for` becomes `for`, and underscores become
   dashes (`aria_label`, `data_id`). `style` takes a dict with snake_case or
-  camelCase keys.
+  camelCase keys; an update sets only the properties that changed, so styles a
+  script set on the element stay.
 - `True` sets an attribute; `False` or `None` leaves it out.
 - `value` and `checked` are live DOM properties, so inputs can be controlled.
+  The field shows the server's value once it has handled an edit, so a handler
+  that rejects a keystroke (keeps the old value) undoes it; a number input keeps
+  what was typed when the server's value is the same number ("2.50" and 2.5).
   `default_value` and `default_checked` make an uncontrolled input that only
   starts with that value (read it on submit from `e.form`, or through a `ref`).
 - `fragment(*children)` groups children without a wrapper; a component may also
