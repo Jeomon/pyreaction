@@ -199,3 +199,71 @@ def test_outbox_gives_up_past_its_limit():
         return await box.take()
 
     assert _run(go()) is None
+
+
+def _button(message):
+    return next(op[1] for op in message["ops"] if op[0] == "c" and op[2] == "button")
+
+
+def test_reconnect_with_the_session_id_keeps_state():
+    # One TestClient context = one event loop, as one server process would have.
+    with TestClient(create_app(Counter)) as client:
+        with connect(client) as ws:
+            first = json.loads(ws.receive_text())
+            sid = first["sid"]
+            dom = FakeDom()
+            dom.apply(first["ops"])
+            button = _button(first)
+            ws.send_text(json.dumps([1, button, "click", {}]))
+            dom.apply(json.loads(ws.receive_text())["ops"])
+            assert dom.html() == "<div><button>+</button><span>1</span></div>"
+        # The browser comes back with its id and an event it made while offline.
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&s={sid}") as ws:
+            again = json.loads(ws.receive_text())
+            assert again["resumed"] is True and again["init"] == "hydrate"
+            assert again["sid"] != sid, "a fresh id each connection: an old one cannot be reused"
+            resumed = FakeDom()
+            resumed.apply(again["ops"])
+            assert resumed.html() == "<div><button>+</button><span>1</span></div>"
+            assert _button(again) == button, "node ids are kept"
+            ws.send_text(json.dumps([2, button, "click", {}]))
+            update = json.loads(ws.receive_text())
+            resumed.apply(update["ops"])
+            assert resumed.html() == "<div><button>+</button><span>2</span></div>"
+            assert update["ack"] == 2
+        # The id is single use.
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&s={sid}") as ws:
+            assert "resumed" not in json.loads(ws.receive_text())
+
+
+def test_a_parked_session_expires_and_its_effects_clean_up():
+    cleaned = []
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        use_effect(lambda: (lambda: cleaned.append(n)), [])
+        return html.button(n, on_click=lambda: set_n(n + 1))
+
+    with TestClient(create_app(App, resume_timeout=0.2)) as client:
+        with connect(client) as ws:
+            sid = json.loads(ws.receive_text())["sid"]
+        time.sleep(0.1)
+        assert cleaned == [], "kept while it may still come back"
+        wait_for(lambda: cleaned == [0])
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&s={sid}") as ws:
+            assert "resumed" not in json.loads(ws.receive_text()), "expired: rendered afresh"
+
+
+def test_resume_timeout_zero_closes_at_once():
+    cleaned = []
+
+    @component
+    def App():
+        use_effect(lambda: (lambda: cleaned.append(1)), [])
+        return html.p("x")
+
+    with TestClient(create_app(App, resume_timeout=0)) as client:
+        with connect(client) as ws:
+            assert "sid" in json.loads(ws.receive_text())
+        wait_for(lambda: cleaned == [1])

@@ -26,14 +26,22 @@ dependencies = [
 
 [project.scripts]
 pyreaction = "pyreaction.cli:main"
+
 [project.optional-dependencies]
 fast = ["orjson>=3.9"]
+# For tests in a real browser with pyreaction.testing.serve().
+browser = ["playwright>=1.50"]
+# Stores shared by several worker processes: Store(..., backend=RedisBackend(url)).
+redis = ["redis>=5"]
 
 [dependency-groups]
 dev = [
+    "fakeredis>=2.20",
     "httpx2>=2.16.2",
     "mypy>=2.4.1",
+    "playwright>=1.50",
     "pytest>=8",
+    "redis>=5",
 ]
 
 [build-system]
@@ -42,6 +50,7 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["browser: runs in a real browser through Playwright (skipped when none is available)"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -54,5 +63,5 @@ no_implicit_optional = true
 exclude = ["cli/templates/"]
 
 [[tool.mypy.overrides]]
-module = ["orjson"]
+module = ["orjson", "redis", "fakeredis"]
 ignore_missing_imports = true

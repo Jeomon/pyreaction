@@ -15,7 +15,7 @@ from typing import Any
 from .element import PORTAL, RAW_HTML, Element, JsComponent
 from .reconciler import ComponentNode, HostNode, Root, TextNode
 
-__all__ = ["render_head", "render_to_string"]
+__all__ = ["render_children", "render_head", "render_portals", "render_to_string"]
 
 VOID = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
@@ -23,22 +23,50 @@ VOID = frozenset(
 RAW_TEXT = frozenset({"script", "style"})
 
 
-def render_to_string(target: Root | Element) -> str:
-    """Render a root, or an element (mounted just for this), to HTML."""
+def render_to_string(target: Root | Element, boundaries: dict[Any, int] | None = None) -> str:
+    """Render a root, or an element (mounted just for this), to HTML.
+
+    With ``boundaries`` (for streaming), each Suspense boundary is wrapped in
+    ``<!--pr-s:N-->`` ... ``<!--/pr-s:N-->`` comments, and its number is recorded
+    in the dict, so a later chunk can replace what is between them.
+    """
     root = target if isinstance(target, Root) else Root(target)
     out: list[str] = []
-    _children(root.container.children, out, raw=False)
+    _children(root.container.children, out, raw=False, boundaries=boundaries)
     if root is not target:
         root.close()
     return "".join(out)
 
 
-def _children(children: list[Any], out: list[str], raw: bool) -> None:
+def render_children(children: list[Any], boundaries: dict[Any, int]) -> str:
+    """HTML for a list of mounted nodes, marking Suspense boundaries as above."""
+    out: list[str] = []
+    _children(children, out, raw=False, boundaries=boundaries)
+    return "".join(out)
+
+
+class _End:
+    __slots__ = ("n",)
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+
+def _children(children: list[Any], out: list[str], raw: bool, boundaries: dict[Any, int] | None = None) -> None:
     prev_text = False
-    stack = list(reversed(children))
+    stack: list[Any] = list(reversed(children))
     while stack:
         node = stack.pop()
+        if isinstance(node, _End):
+            out.append(f"<!--/pr-s:{node.n}-->")
+            prev_text = False
+            continue
         if isinstance(node, ComponentNode):
+            if boundaries is not None and node.suspend is not None:
+                n = boundaries.setdefault(node, len(boundaries) + 1)
+                out.append(f"<!--pr-s:{n}-->")
+                prev_text = False
+                stack.append(_End(n))
             stack.extend(reversed(node.children))
             continue
         if isinstance(node, TextNode):
@@ -52,7 +80,7 @@ def _children(children: list[Any], out: list[str], raw: bool) -> None:
                 out.append(escape(node.text, quote=False))
             prev_text = True
         else:
-            _host(node, out)
+            _host(node, out, boundaries)
             prev_text = False
 
 
@@ -65,9 +93,49 @@ def render_head(elements: list[Element]) -> str:
     return "".join(out)
 
 
-def _host(node: HostNode, out: list[str]) -> None:
+# Moves server-rendered portal boxes whose target is not <body> into place.
+_PLACE_PORTALS = (
+    "<script>document.querySelectorAll('[data-pyreaction-portal][data-target]').forEach(function(b){"
+    "var t=document.querySelector(b.dataset.target);if(t)t.appendChild(b)})</script>"
+)
+
+
+def render_portals(root: Root, boundaries: dict[Any, int] | None = None) -> str:
+    """Boxes holding each portal's content, for the end of the page's <body>.
+
+    They are numbered in the order the first live message lists portals (the
+    page's tree first, then each portal's own nested portals), which is how the
+    browser pairs them up to adopt them.
+    """
+    queue: list[HostNode] = []
+
+    def collect(host: HostNode) -> None:
+        for node in Root._dom_nodes(host.children, queue):
+            if isinstance(node, HostNode):
+                collect(node)
+
+    collect(root.container)
+    out: list[str] = []
+    placed = False
+    i = 0
+    while i < len(queue):
+        portal = queue[i]
+        collect(portal)  # nested portals go to the end of the queue, as live
+        target = portal.attrs.get("target", "body")
+        where = "" if target == "body" else f' data-target="{escape(target)}"'
+        placed = placed or bool(where)
+        out.append(f'<div data-pyreaction-portal="{i}"{where} style="display:contents">')
+        _children(portal.children, out, raw=False, boundaries=boundaries)
+        out.append("</div>")
+        i += 1
+    if placed:
+        out.append(_PLACE_PORTALS)
+    return "".join(out)
+
+
+def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = None) -> None:
     if node.type == PORTAL:
-        return  # portals appear once the page is live
+        return  # rendered by render_portals, at the end of the page
     if isinstance(node.type, JsComponent):
         # The module draws into this box once the page is live. Until then it shows
         # the fallback; Python children sit in a slot the module places later.
@@ -78,7 +146,7 @@ def _host(node: HostNode, out: list[str]) -> None:
             out.append(f'<div data-pyreaction-fallback style="display:contents">{fallback}</div>')
         if node.children:
             out.append('<div data-pyreaction-slot style="display:contents">')
-            _children(node.children, out, raw=False)
+            _children(node.children, out, raw=False, boundaries=boundaries)
             out.append("</div>")
         out.append(f"</{tag}>")
         return
@@ -106,5 +174,5 @@ def _host(node: HostNode, out: list[str]) -> None:
     elif tag == "textarea" and not node.children:
         out.append(escape(str(node.attrs.get("value", "")), quote=False))
     else:
-        _children(node.children, out, raw=tag in RAW_TEXT)
+        _children(node.children, out, raw=tag in RAW_TEXT, boundaries=boundaries)
     out.append(f"</{tag}>")

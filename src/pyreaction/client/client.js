@@ -22,6 +22,7 @@
   let seq = 0;
   let ack = 0;
   let retry = 0;
+  let sid = null; // this session's id on the server, for resuming after a drop
   const outbox = [];
   let uploads = 0;
   let maxUpload = 0; // set by the server's first message
@@ -334,8 +335,8 @@
     }
   }
 
-  // The page's markup in document order: the order of the server's first message.
-  function domOrder() {
+  // Markup under `root` in document order: the order of the server's first message.
+  function domOrder(root) {
     const out = [];
     const walk = (parent) => {
       for (let c = parent.firstChild; c; c = c.nextSibling) {
@@ -360,33 +361,25 @@
         }
       }
     };
-    walk(mount);
+    walk(root);
     return out;
   }
 
-  // Adopt the nodes already on the page; on any difference build the tree afresh.
-  function hydrate(ops) {
-    clearPortals();
-    const found = domOrder();
-    // Portals come after the page's own tree and are always built afresh.
-    const portalAt = ops.findIndex((op) => op[0] === "P");
-    const own = portalAt < 0 ? ops : ops.slice(0, portalAt);
-    const rest = portalAt < 0 ? [] : ops.slice(portalAt);
-    const created = own.filter((op) => op[0] === "c" || op[0] === "t" || op[0] === "j");
-    const ok =
-      created.length === found.length &&
-      created.every((op, i) => {
+  const created = (ops) => ops.filter((op) => op[0] === "c" || op[0] === "t" || op[0] === "j");
+
+  function matches(ops, found) {
+    const made = created(ops);
+    return (
+      made.length === found.length &&
+      made.every((op, i) => {
         const n = found[i];
         return op[0] === "t" ? n.nodeType === 3 && n.data === op[2] : n.nodeType === 1 && n.localName === op[2];
-      });
-    if (!ok) {
-      console.warn("pyreaction: the page's markup differs from this render (clock, randomness?); rebuilding it");
-      mount.dataset.hydration = "rebuilt";
-      return replace(ops);
-    }
-    mount.dataset.hydration = "adopted";
-    nodes = new Map([[0, mount]]);
-    created.forEach((op, i) => {
+      })
+    );
+  }
+
+  function adopt(ops, found) {
+    created(ops).forEach((op, i) => {
       const n = found[i];
       register(op[1], n);
       if (op[0] === "j") {
@@ -403,8 +396,42 @@
       for (const k in n.__ev || {}) if (!(k in op[4])) listen(n, k, null);
       for (const k in op[4]) listen(n, k, op[4][k]);
     });
-    apply(own.filter((op) => op[0] === "m"));
-    apply(rest);
+    apply(ops.filter((op) => op[0] === "m"));
+  }
+
+  // Adopt the nodes already on the page; where they differ, build afresh. The
+  // message lists the page's own tree, then each portal (["P", ...] and its
+  // content) in the order the server numbered the portal boxes it rendered.
+  function hydrate(ops) {
+    const segments = [[]];
+    for (const op of ops) {
+      if (op[0] === "P") segments.push([op]);
+      else segments[segments.length - 1].push(op);
+    }
+    const own = segments[0];
+    const found = domOrder(mount);
+    if (!matches(own, found)) {
+      console.warn("pyreaction: the page's markup differs from this render (clock, randomness?); rebuilding it");
+      mount.dataset.hydration = "rebuilt";
+      return replace(ops);
+    }
+    mount.dataset.hydration = "adopted";
+    nodes = new Map([[0, mount]]);
+    adopt(own, found);
+    const kept = new Set();
+    segments.slice(1).forEach((seg, k) => {
+      const box = document.querySelector(`[data-pyreaction-portal="${k}"]`);
+      const inside = box ? domOrder(box) : null;
+      if (box && matches(seg, inside)) {
+        register(seg[0][1], box);
+        kept.add(box);
+        adopt(seg, inside);
+      } else apply(seg); // a portal whose markup differs is built afresh
+    });
+    // Boxes nothing adopted: from the server's HTML or the last session.
+    for (const box of document.querySelectorAll("[data-pyreaction-portal]")) {
+      if (box.__id === undefined || (!kept.has(box) && nodes.get(box.__id) !== box)) box.remove();
+    }
   }
 
   function clearPortals() {
@@ -505,6 +532,8 @@
     url.searchParams.set("p", here());
     // Offer to adopt what is on the page: the server's HTML, or the last session's tree.
     if (mount.firstChild) url.searchParams.set("h", "1");
+    // Ask to resume the last session, which the server keeps for a while.
+    if (sid) url.searchParams.set("s", sid);
     socket = new WebSocket(url);
     socket.onopen = () => {
       retry = 0;
@@ -515,12 +544,16 @@
     socket.onmessage = (msg) => {
       const data = JSON.parse(msg.data);
       if (data.init) {
-        // A new session numbers its nodes and events afresh: nothing queued for the
-        // old one, and no pending input edit, may carry over.
-        outbox.length = 0;
-        seq = 0;
-        lastSent = new WeakMap();
+        sid = data.sid || null;
         maxUpload = data.maxUpload || 0;
+        // A resumed session keeps its node ids and event numbers, so events made
+        // while offline still apply. A new one numbers everything afresh: nothing
+        // queued for the old one, and no pending input edit, may carry over.
+        if (!data.resumed) {
+          outbox.length = 0;
+          seq = 0;
+          lastSent = new WeakMap();
+        }
       }
       ack = data.ack;
       if (data.init === "hydrate") {
@@ -535,11 +568,14 @@
       // The page may have moved while the socket was down.
       if (data.init && here() !== url.searchParams.get("p")) navigated();
       while (outbox.length && socket.readyState === 1) send(outbox.shift());
+      // The page is live: browser tests (and anyone curious) can wait for this.
+      if (data.init) document.documentElement.setAttribute("data-pyreaction-ready", "");
     };
     socket.onclose = () => {
       socket = null;
       clearInterval(heartbeat);
       document.documentElement.setAttribute("data-pyreaction-offline", "");
+      document.documentElement.removeAttribute("data-pyreaction-ready");
       const delay = Math.min(250 * 2 ** retry++, RECONNECT_MAX);
       setTimeout(connect, delay / 2 + Math.random() * (delay / 2));
     };

@@ -421,3 +421,37 @@ def test_ssr_escapes_and_marks_text():
         '<input value="a&quot;b" checked=""><textarea>&lt;x&gt;</textarea>'
         "<style>a > b { color: red }</style></div>"
     )
+
+
+def test_rendering_pauses_the_gc_and_restores_it():
+    import gc
+
+    from pyreaction import Root, component, html, use_state
+    from pyreaction.core.reconciler import _gc_paused
+
+    seen = []
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        seen.append(gc.isenabled())
+        return html.button(n, on_click=lambda: set_n(n + 1))
+
+    assert gc.isenabled()
+    root = Root(App())
+    assert seen == [False], "paused while rendering"
+    assert gc.isenabled(), "resumed afterwards"
+    with _gc_paused():
+        with _gc_paused():
+            pass
+        assert not gc.isenabled(), "nested pauses resume only at the outermost"
+    assert gc.isenabled()
+    gc.disable()
+    try:
+        root._render_dirty()
+        with _gc_paused():
+            pass
+        assert not gc.isenabled(), "an app that turned the GC off keeps it off"
+    finally:
+        gc.enable()
+        root.close()

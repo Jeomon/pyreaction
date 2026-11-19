@@ -8,7 +8,46 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ._html_types import (
+        ATag,
+        AreaTag,
+        ButtonTag,
+        CanvasTag,
+        CellTag,
+        ColTag,
+        DataTag,
+        EditTag,
+        FieldsetTag,
+        FormTag,
+        GlobalTag,
+        IframeTag,
+        ImgTag,
+        InputTag,
+        LabelTag,
+        LiTag,
+        LinkTag,
+        MediaTag,
+        MetaTag,
+        ObjectTag,
+        OlTag,
+        OpenTag,
+        OptgroupTag,
+        OptionTag,
+        OutputTag,
+        QuoteTag,
+        RangeTag,
+        ScriptTag,
+        SelectTag,
+        SourceTag,
+        StyleTag,
+        SvgTag,
+        TextareaTag,
+        TimeTag,
+        TrackTag,
+    )
 
 __all__ = [
     "Component",
@@ -132,7 +171,7 @@ def event(
 def js(code: str) -> EventHandler:
     """An event handler that runs ``code`` in the browser, with no round trip.
 
-    The code sees ``event`` and ``element``: ``on_click=js("element.select()")``.
+    The code sees ``event`` and ``element``: ``on_focus=js("element.select()")``.
     It is sent to the page as written, so never build it from user input.
     """
     if not isinstance(code, str):
@@ -326,162 +365,162 @@ class _Html:
     """
 
     # Document and sections
-    html: _TagFactory
-    head: _TagFactory
-    title: _TagFactory
-    base: _TagFactory
-    link: _TagFactory
-    meta: _TagFactory
-    style: _TagFactory
-    body: _TagFactory
-    address: _TagFactory
-    article: _TagFactory
-    aside: _TagFactory
-    footer: _TagFactory
-    header: _TagFactory
-    h1: _TagFactory
-    h2: _TagFactory
-    h3: _TagFactory
-    h4: _TagFactory
-    h5: _TagFactory
-    h6: _TagFactory
-    hgroup: _TagFactory
-    main: _TagFactory
-    nav: _TagFactory
-    section: _TagFactory
-    search: _TagFactory
+    html: GlobalTag
+    head: GlobalTag
+    title: GlobalTag
+    base: GlobalTag
+    link: LinkTag
+    meta: MetaTag
+    style: StyleTag
+    body: GlobalTag
+    address: GlobalTag
+    article: GlobalTag
+    aside: GlobalTag
+    footer: GlobalTag
+    header: GlobalTag
+    h1: GlobalTag
+    h2: GlobalTag
+    h3: GlobalTag
+    h4: GlobalTag
+    h5: GlobalTag
+    h6: GlobalTag
+    hgroup: GlobalTag
+    main: GlobalTag
+    nav: GlobalTag
+    section: GlobalTag
+    search: GlobalTag
     # Text content
-    blockquote: _TagFactory
-    dd: _TagFactory
-    div: _TagFactory
-    dl: _TagFactory
-    dt: _TagFactory
-    figcaption: _TagFactory
-    figure: _TagFactory
-    hr: _TagFactory
-    li: _TagFactory
-    menu: _TagFactory
-    ol: _TagFactory
-    p: _TagFactory
-    pre: _TagFactory
-    ul: _TagFactory
+    blockquote: QuoteTag
+    dd: GlobalTag
+    div: GlobalTag
+    dl: GlobalTag
+    dt: GlobalTag
+    figcaption: GlobalTag
+    figure: GlobalTag
+    hr: GlobalTag
+    li: LiTag
+    menu: GlobalTag
+    ol: OlTag
+    p: GlobalTag
+    pre: GlobalTag
+    ul: GlobalTag
     # Inline text
-    a: _TagFactory
-    abbr: _TagFactory
-    b: _TagFactory
-    bdi: _TagFactory
-    bdo: _TagFactory
-    br: _TagFactory
-    cite: _TagFactory
-    code: _TagFactory
-    data: _TagFactory
-    dfn: _TagFactory
-    em: _TagFactory
-    i: _TagFactory
-    kbd: _TagFactory
-    mark: _TagFactory
-    q: _TagFactory
-    rp: _TagFactory
-    rt: _TagFactory
-    ruby: _TagFactory
-    s: _TagFactory
-    samp: _TagFactory
-    small: _TagFactory
-    span: _TagFactory
-    strong: _TagFactory
-    sub: _TagFactory
-    sup: _TagFactory
-    time: _TagFactory
-    u: _TagFactory
-    var: _TagFactory
-    wbr: _TagFactory
+    a: ATag
+    abbr: GlobalTag
+    b: GlobalTag
+    bdi: GlobalTag
+    bdo: GlobalTag
+    br: GlobalTag
+    cite: GlobalTag
+    code: GlobalTag
+    data: DataTag
+    dfn: GlobalTag
+    em: GlobalTag
+    i: GlobalTag
+    kbd: GlobalTag
+    mark: GlobalTag
+    q: QuoteTag
+    rp: GlobalTag
+    rt: GlobalTag
+    ruby: GlobalTag
+    s: GlobalTag
+    samp: GlobalTag
+    small: GlobalTag
+    span: GlobalTag
+    strong: GlobalTag
+    sub: GlobalTag
+    sup: GlobalTag
+    time: TimeTag
+    u: GlobalTag
+    var: GlobalTag
+    wbr: GlobalTag
     # Media and embedded
-    area: _TagFactory
-    audio: _TagFactory
-    img: _TagFactory
-    map: _TagFactory
-    track: _TagFactory
-    video: _TagFactory
-    embed: _TagFactory
-    iframe: _TagFactory
-    object: _TagFactory
-    picture: _TagFactory
-    source: _TagFactory
-    canvas: _TagFactory
-    noscript: _TagFactory
-    script: _TagFactory
+    area: AreaTag
+    audio: MediaTag
+    img: ImgTag
+    map: GlobalTag
+    track: TrackTag
+    video: MediaTag
+    embed: ObjectTag
+    iframe: IframeTag
+    object: ObjectTag
+    picture: GlobalTag
+    source: SourceTag
+    canvas: CanvasTag
+    noscript: GlobalTag
+    script: ScriptTag
     # Edits and tables
-    del_: _TagFactory
-    ins: _TagFactory
-    caption: _TagFactory
-    col: _TagFactory
-    colgroup: _TagFactory
-    table: _TagFactory
-    tbody: _TagFactory
-    td: _TagFactory
-    tfoot: _TagFactory
-    th: _TagFactory
-    thead: _TagFactory
-    tr: _TagFactory
+    del_: EditTag
+    ins: EditTag
+    caption: GlobalTag
+    col: ColTag
+    colgroup: ColTag
+    table: GlobalTag
+    tbody: GlobalTag
+    td: CellTag
+    tfoot: GlobalTag
+    th: CellTag
+    thead: GlobalTag
+    tr: GlobalTag
     # Forms
-    button: _TagFactory
-    datalist: _TagFactory
-    fieldset: _TagFactory
-    form: _TagFactory
-    input: _TagFactory
-    label: _TagFactory
-    legend: _TagFactory
-    meter: _TagFactory
-    optgroup: _TagFactory
-    option: _TagFactory
-    output: _TagFactory
-    progress: _TagFactory
-    select: _TagFactory
-    textarea: _TagFactory
+    button: ButtonTag
+    datalist: GlobalTag
+    fieldset: FieldsetTag
+    form: FormTag
+    input: InputTag
+    label: LabelTag
+    legend: GlobalTag
+    meter: RangeTag
+    optgroup: OptgroupTag
+    option: OptionTag
+    output: OutputTag
+    progress: RangeTag
+    select: SelectTag
+    textarea: TextareaTag
     # Interactive and components
-    details: _TagFactory
-    dialog: _TagFactory
-    summary: _TagFactory
-    slot: _TagFactory
-    template: _TagFactory
+    details: OpenTag
+    dialog: OpenTag
+    summary: GlobalTag
+    slot: GlobalTag
+    template: GlobalTag
     # SVG
-    svg: _TagFactory
-    g: _TagFactory
-    defs: _TagFactory
-    symbol: _TagFactory
-    use: _TagFactory
-    path: _TagFactory
-    circle: _TagFactory
-    ellipse: _TagFactory
-    line: _TagFactory
-    polyline: _TagFactory
-    polygon: _TagFactory
-    rect: _TagFactory
-    text: _TagFactory
-    tspan: _TagFactory
-    textPath: _TagFactory
-    image: _TagFactory
-    foreignObject: _TagFactory
-    linearGradient: _TagFactory
-    radialGradient: _TagFactory
-    stop: _TagFactory
-    clipPath: _TagFactory
-    mask: _TagFactory
-    pattern: _TagFactory
-    marker: _TagFactory
-    filter: _TagFactory
+    svg: SvgTag
+    g: SvgTag
+    defs: SvgTag
+    symbol: SvgTag
+    use: SvgTag
+    path: SvgTag
+    circle: SvgTag
+    ellipse: SvgTag
+    line: SvgTag
+    polyline: SvgTag
+    polygon: SvgTag
+    rect: SvgTag
+    text: SvgTag
+    tspan: SvgTag
+    textPath: SvgTag
+    image: SvgTag
+    foreignObject: SvgTag
+    linearGradient: SvgTag
+    radialGradient: SvgTag
+    stop: SvgTag
+    clipPath: SvgTag
+    mask: SvgTag
+    pattern: SvgTag
+    marker: SvgTag
+    filter: SvgTag
     # MathML
-    math: _TagFactory
-    mi: _TagFactory
-    mn: _TagFactory
-    mo: _TagFactory
-    mrow: _TagFactory
-    msup: _TagFactory
-    msub: _TagFactory
-    mfrac: _TagFactory
-    msqrt: _TagFactory
+    math: GlobalTag
+    mi: GlobalTag
+    mn: GlobalTag
+    mo: GlobalTag
+    mrow: GlobalTag
+    msup: GlobalTag
+    msub: GlobalTag
+    mfrac: GlobalTag
+    msqrt: GlobalTag
 
-    def __getattr__(self, tag: str) -> _TagFactory:
+    def __getattr__(self, tag: str) -> GlobalTag:
         if tag.startswith("__"):
             raise AttributeError(tag)
         factory = _TagFactory(tag.rstrip("_").replace("_", "-"))

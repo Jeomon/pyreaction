@@ -32,7 +32,7 @@ def App():
             value=draft,
             on_change=lambda e: set_draft(e.value),
             on_key_down=event(add, keys=["Enter"], prevent_default=True),
-            on_click=js("element.select()"),  # runs in the browser, no round trip
+            on_focus=js("element.select()"),  # runs in the browser, no round trip
         ),
         Bars(values=values, color="teal", on_pick=lambda e: set_picked(e), fallback=html.p("Loading chart...")),
         html.p(f"Picked bar {picked['index']}: {picked['value']}" if picked else "Click a bar.", id="picked"),

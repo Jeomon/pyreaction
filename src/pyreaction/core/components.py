@@ -95,6 +95,7 @@ def Suspense(*children: Any, fallback: Any = None) -> Any:
 
     node.suspend = suspend
     hidden = waiting > 0
+    node.waiting = hidden
     return [
         fallback if hidden else None,
         html.div(*children, hidden=hidden, style=None if hidden else "display:contents"),

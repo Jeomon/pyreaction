@@ -46,6 +46,8 @@ stylesheets = ["style.css"]  # files in the static folder to link
 head = ""                    # extra raw HTML for <head>
 max_upload_size = 10485760   # bytes per uploaded file (default 10 MiB)
 allowed_origins = []         # extra origins allowed to open the WebSocket
+stream = true                # send Suspense content as it loads (see Data)
+resume_timeout = 30          # seconds a dropped page's state is kept for a reconnect
 ```
 
 `init` takes `--no-install` and `--no-git`.
@@ -108,7 +110,7 @@ from pyreaction import event, js
 html.input(on_input=event(search, debounce=300))          # skipped events never reach the server
 html.a("Open", href="#", on_click=event(open_, prevent_default=True))
 html.textarea(on_key_down=event(send, keys=["Enter"], prevent_default=True))
-html.input(on_click=js("element.select()"))               # runs in the browser, no round trip
+html.input(on_focus=js("element.select()"))               # runs in the browser, no round trip
 ```
 
 `keys` limits a keyboard event to those `KeyboardEvent.key` values. Other keys
@@ -185,6 +187,11 @@ error goes to the nearest `ErrorBoundary`.
 The server waits for this data (up to `data_timeout`, 5 seconds by default)
 before sending a page's first HTML, so the page arrives with the data in it,
 for search engines and without a loading flash.
+
+Data inside a `Suspense` boundary does not hold the page back: the HTML goes out
+at once with the fallback, and the boundary's content follows in the same
+response when its data arrives, swapped in by a small inline script before the
+page goes live. `create_app(stream=False)` waits for all of it instead.
 
 ## Pending state and forms
 
@@ -270,8 +277,9 @@ Activity(Settings(), mode="hidden" if tab != "settings" else "visible")
 
 `portal` renders children elsewhere in the page (for modals and toasts that must
 escape `overflow: hidden`), with state, context and events working as if they
-were in place; portals appear once the page is live. `Activity` hides children
-without unmounting them, so their state survives.
+were in place. They are in the server's HTML too, at the end of `<body>` (moved
+into their `target` by a one-line script), and the live page adopts them.
+`Activity` hides children without unmounting them, so their state survives.
 
 ## Shared state
 
@@ -285,8 +293,18 @@ def Badge():
 online.update(lambda n: n + 1)   # from any thread: every Badge re-renders
 ```
 
-`Store` holds a value in one process. With several worker processes, keep the
-truth in a database or Redis and update the store from it.
+A plain `Store` holds a value in one process. To share it between worker
+processes or machines, give it a name and a backend:
+
+```python
+votes = Store({"yes": 0, "no": 0}, name="votes", backend=RedisBackend("redis://localhost:6379/0"))
+```
+
+A write in any process re-renders the readers in all of them. The value must be
+JSON, `update` is atomic across processes (its function may run again if another
+write got in first), and a process that starts later loads the current value.
+It needs `pip install "pyreaction[redis]"`; Valkey works too, and any other
+broker can implement the `StoreBackend` protocol (`load`, `write`, `listen`).
 `use_sync_external_store(subscribe, get_snapshot)` connects any other source.
 
 ## Errors
@@ -362,6 +380,22 @@ action waits until the page has settled. `find`/`find_all` take CSS selectors
 raised by your components fail the test (`raise_errors=False` collects them in
 `page.errors`). `on_call=` answers element calls such as `getBoundingClientRect`.
 
+For a real browser, `serve` runs the app on a free local port in a background
+thread; the page marks `<html data-pyreaction-ready>` once it is live:
+
+```python
+from pyreaction.testing import serve
+
+def test_counter(page):                      # Playwright's page (pytest-playwright)
+    with serve(Counter) as server:           # create_app options go here too
+        page.goto(server.url)
+        page.wait_for_selector(server.READY)
+        page.click("button")
+```
+
+`serve(asgi_app, asgi=True)` serves an app you built yourself. Install the
+browser driver with `pip install "pyreaction[browser]"`.
+
 ## Authentication
 
 A WebSocket cannot set cookies, and JavaScript must not be able to read a
@@ -388,24 +422,31 @@ api.mount("/ui", create_app(App, static_dir="public", stylesheets=["app.css"]))
 ```
 
 Options: `title`, `head`, `lang`, `static_dir`, `static_path`, `stylesheets`,
-`routes` (extra Starlette routes), `data_timeout`, `max_upload_size`,
-`allowed_origins`, `on_error`, `threaded`, `reconnect_max` (ms) and `debug`.
+`routes` (extra Starlette routes), `data_timeout`, `stream`, `max_upload_size`,
+`allowed_origins`, `on_error`, `threaded`, `reconnect_max` (ms),
+`resume_timeout` (s) and `debug`.
 
 To put an app inside a page your own server renders (Jinja, Django), mount it
 as above and add `embed(App, mount_path="/ui", location=request.url.path)` to
 the page, unescaped (`| safe` in Jinja).
 
 Each page view is a live session on the server. If the connection drops, the
-page dims, reconnects (with growing, randomised delays) and starts a fresh
-session at the same URL; component state starts over, which is also what a
-deploy or restart does.
+page dims and reconnects (with growing, randomised delays). The server keeps the
+dropped session for `resume_timeout` seconds (30 by default; 0 turns this off),
+so a reconnect within that time continues where it left off: component state is
+kept, and clicks made while offline are sent and applied. After that, or when
+the reconnect reaches another worker process, or after a deploy or restart, the
+page renders afresh at the same URL and component state starts over.
 
 WebSockets are accepted only from the page's own origin, so other websites
 cannot drive a visitor's session. Behind a proxy that rewrites the `Host`
 header, list the public origin in `allowed_origins`.
 
 Any number of worker processes can serve the app: the page load and its
-WebSocket need not reach the same one.
+WebSocket need not reach the same one. To resume sessions after a dropped
+connection with several workers, route reconnects to the same worker (sticky
+sessions); otherwise they start afresh. Share stores between workers with a
+`RedisBackend`.
 
 ### Deploying
 
@@ -427,12 +468,13 @@ location / {
 
 On Google Cloud Run a WebSocket counts as a request, so it is closed at the
 service's request timeout (5 minutes by default, 60 at most); raise it to 60
-minutes. The page reconnects by itself when that happens, with fresh state.
+minutes. The page reconnects by itself when that happens and, on the same
+instance, keeps its state.
 
 ## How it works
 
-1. A GET renders the component tree at the requested URL, waits for its data, and returns its HTML, keeping nothing in memory.
-2. `client.js` (about 550 lines, no dependencies) opens a WebSocket for the same URL. The server renders again and sends the tree in document order; when it matches the page, the browser adopts the existing nodes in place, and otherwise rebuilds them (for a render that reads the clock or a random number). This is how React hydrates server HTML.
+1. A GET renders the component tree at the requested URL, waits for its data, and returns its HTML, keeping nothing in memory. Content waiting in a `Suspense` boundary is streamed into the same response when it is ready.
+2. `client.js` (about 590 lines, no dependencies) opens a WebSocket for the same URL. The server renders again and sends the tree in document order; when it matches the page, the browser adopts the existing nodes in place, and otherwise rebuilds them (for a render that reads the clock or a random number). This is how React hydrates server HTML.
 3. A state change re-renders only the dirty components, shallowest first. The reconciler matches children by key and sends operations such as "set text of node 12" or "move node 40 before node 9". Moves are kept to the minimum using a longest-increasing-subsequence pass.
 4. Events from one page run one at a time, in order, each seeing the page as the previous one left it; plain handlers and effects run in worker threads.
 5. While you type, the browser ignores server values older than your latest keystroke, so a slow round trip never undoes typing.
@@ -449,7 +491,7 @@ src/pyreaction/
   client/     client.js, the index.html page template and its style.css
   cli/        the pyreaction command: scaffold.py (init), serve.py (dev, run)
               and templates/, what init copies
-  testing.py  render() and the fake browser for tests
+  testing.py  render() and the fake browser for tests, serve() for real browsers
 ```
 
 `index.html` uses `$name` placeholders (`$title`, `$head`, `$body`, ...). The
@@ -459,8 +501,11 @@ contents of `style.css` are inlined into the page so they cost no extra request.
 
 ```sh
 uv sync
-uv run pytest
+uv run pytest          # browser tests use the installed Chrome, or: uv run playwright install chromium
 uv run mypy
 uv run python examples/todo.py       # also: pages.py, widgets.py, login.py
 uv run python benchmarks/bench.py
 ```
+
+The browser tests (`tests/test_browser.py`) skip when no browser is available, and
+the shared-store tests run against an in-process fake Redis server.

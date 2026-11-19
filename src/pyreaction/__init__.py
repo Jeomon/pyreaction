@@ -13,7 +13,7 @@ patched into the browser over a WebSocket.
 
 from .core.boundary import ErrorBoundary
 from .core.components import Activity, Form, FormStatus, Head, Suspense, use_form_status
-from .core.element import Component, Element, JsComponent, component, event, fragment, h, html, js, js_component, memo, portal
+from .core.element import Component, Element, EventHandler, JsComponent, component, event, fragment, h, html, js, js_component, memo, portal
 from .core.hooks import (
     AsyncState,
     Context,
@@ -45,7 +45,7 @@ from .core.parse import parse_html
 from .core.reconciler import ElementHandle, Event, FormFields, Location, Reply, Root, UploadedFile
 from .core.router import Link, Navigate, Router
 from .core.ssr import render_to_string
-from .core.store import Store, use_store
+from .core.store import RedisBackend, Store, StoreBackend, use_store
 
 __version__ = "0.1.0"
 
@@ -58,6 +58,7 @@ __all__ = [
     "ElementHandle",
     "ErrorBoundary",
     "Event",
+    "EventHandler",
     "Form",
     "FormFields",
     "FormStatus",
@@ -70,7 +71,9 @@ __all__ = [
     "Reply",
     "Root",
     "Router",
+    "RedisBackend",
     "Store",
+    "StoreBackend",
     "Suspense",
     "UploadedFile",
     "component",

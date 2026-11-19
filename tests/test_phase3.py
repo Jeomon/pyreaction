@@ -195,3 +195,29 @@ def test_use_debug_value_logs_changes_in_debug(caplog):
 
     Root(Status(), debug=True)
     assert "Status: 'ONLINE'" in caplog.text
+
+
+def test_portals_are_in_the_first_html_at_the_end_of_body():
+    from starlette.testclient import TestClient
+
+    from pyreaction import create_app
+
+    @component
+    def App():
+        return html.main(
+            html.p("page"),
+            portal(html.div("toast", class_name="toast"), portal(html.b("nested")), target="body"),
+            portal(html.span("in aside"), target="#side"),
+            html.aside(id="side"),
+        )
+
+    page = TestClient(create_app(App)).get("/").text
+    body = page.split('<div id="pyreaction-root">', 1)[1]
+    root_html, after = body.split("</div>\n", 1)
+    assert "toast" not in root_html, "portal content is not inside the page's own tree"
+    assert after.index('data-pyreaction-portal="0"') < after.index('data-pyreaction-portal="1"') < after.index(
+        'data-pyreaction-portal="2"'
+    )
+    assert '<div data-pyreaction-portal="0" style="display:contents"><div class="toast">toast</div></div>' in after
+    assert 'data-pyreaction-portal="1" data-target="#side"' in after, "non-body targets are moved by a script"
+    assert '<div data-pyreaction-portal="2" style="display:contents"><b>nested</b></div>' in after

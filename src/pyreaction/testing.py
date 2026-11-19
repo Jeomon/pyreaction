@@ -25,7 +25,7 @@ from typing import Any
 from .core.element import Element
 from .core.reconciler import Root
 
-__all__ = ["Page", "TestNode", "render"]
+__all__ = ["LiveServer", "Page", "TestNode", "render", "serve"]
 
 VOID = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
@@ -389,3 +389,63 @@ def render(element: Element, **options: Any) -> Page:
     ``close()``. Options: ``location``, ``connection``, ``raise_errors``,
     ``timeout``, and ``on_call(node, method, args)`` to answer element calls."""
     return Page(element, **options)
+
+
+# ---- real browsers ------------------------------------------------------------------
+
+
+class LiveServer:
+    """An app served by uvicorn in a background thread, for tests in a real browser.
+
+    ``url`` is its address. After ``page.goto(server.url)``, wait for the page to be
+    live with ``page.wait_for_selector(server.READY)`` (Playwright), or for the
+    ``data-pyreaction-ready`` attribute on ``<html>`` with any other driver.
+    """
+
+    READY = "html[data-pyreaction-ready]"
+
+    def __init__(self, app: Any, host: str = "127.0.0.1", **options: Any) -> None:
+        import socket
+        import threading
+
+        import uvicorn
+
+        from .server import create_app
+
+        asgi = app if options.pop("asgi", False) else create_app(app, **options)
+        with socket.socket() as probe:
+            probe.bind((host, 0))
+            port = probe.getsockname()[1]
+        self.url = f"http://{host}:{port}"
+        self._server = uvicorn.Server(uvicorn.Config(asgi, host=host, port=port, log_level="warning", lifespan="off"))
+        self._thread = threading.Thread(target=self._server.run, name="pyreaction-live-server", daemon=True)
+        self._thread.start()
+        import time
+
+        deadline = time.monotonic() + 10
+        while not self._server.started:
+            if time.monotonic() > deadline or not self._thread.is_alive():
+                raise RuntimeError("the live server did not start")
+            time.sleep(0.01)
+
+    def close(self) -> None:
+        self._server.should_exit = True
+        self._thread.join(timeout=10)
+
+    def __enter__(self) -> LiveServer:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+def serve(app: Any, **options: Any) -> LiveServer:
+    """Serve ``app`` (a component, element or factory, with :func:`create_app`'s
+    options) on a free local port until closed. With ``asgi=True``, ``app`` is an
+    ASGI app you built yourself (``create_app`` with extra routes, a FastAPI app)::
+
+        with serve(App) as server:
+            page.goto(server.url)
+            page.wait_for_selector(server.READY)
+    """
+    return LiveServer(app, **options)

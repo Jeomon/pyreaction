@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from html import escape
 from pathlib import Path
 from string import Template
@@ -22,14 +23,14 @@ from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
 from starlette.requests import HTTPConnection, Request
-from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket
 
 from ..core.element import Component, Element
 from ..core.reconciler import Root, UploadedFile
-from ..core.ssr import render_to_string
+from ..core.ssr import render_children, render_portals, render_to_string
 
 try:
     import orjson
@@ -62,6 +63,65 @@ def _as_factory(app: Component | Element | Callable[[], Element]) -> Callable[[]
     if isinstance(app, Element):
         return lambda: app
     return app
+
+
+# Where the page template is cut for streaming: the shell goes first, Suspense
+# chunks next, and the client script last, once the page is complete.
+_STREAM_SPLIT = "<!--pyreaction-stream-->"
+
+# Replaces the content between a boundary's <!--pr-s:N--> markers with its chunk.
+_SWAP = (
+    "<script>function __prSwap(n){var t=document.getElementById('pr-c'+n),"
+    "w=document.createTreeWalker(document.body,128),s,e,c;"
+    "while(c=w.nextNode()){if(c.data==='pr-s:'+n)s=c;else if(c.data==='/pr-s:'+n){e=c;break}}"
+    "if(!t||!s||!e)return;while(s.nextSibling&&s.nextSibling!==e)s.nextSibling.remove();"
+    "e.parentNode.insertBefore(t.content,e);t.remove()}</script>\n"
+)
+
+
+async def _stream_page(
+    root: Root, parts: list[str], boundaries: dict[Any, int], waiting: set[int], deadline: float
+) -> AsyncIterator[str]:
+    """The page in pieces: the shell with Suspense fallbacks at once, then each
+    boundary's content as its data arrives, then the client script."""
+    loop = asyncio.get_running_loop()
+    try:
+        yield parts[0] + _SWAP
+        while waiting:
+            remaining = deadline - loop.time()
+            pending = set(root._pending)
+            if remaining <= 0 or not pending:
+                break
+            await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.sleep(0)  # let the loaded data's state updates land
+            root._render_dirty()
+            by_number = {n: node for node, n in boundaries.items()}
+            ready = sorted(n for n in waiting if by_number[n].mounted and not by_number[n].waiting)
+            done: set[Any] = set()
+            chunks = []
+            for n in ready:
+                node = by_number[n]
+                waiting.discard(n)
+                parent = node.parent
+                while parent is not None and parent not in done:
+                    parent = parent.parent
+                if parent is not None:
+                    continue  # an outer boundary's chunk already carries this one
+                done.add(node)
+                html = render_children(node.children, boundaries)
+                chunks.append(
+                    f'<template id="pr-c{n}">{html}</template>'
+                    f"<script>__prSwap({n});document.currentScript.remove()</script>\n"
+                )
+            # Boundaries that appear only inside the new content, still waiting.
+            waiting |= {n for node, n in boundaries.items() if node.waiting and node.mounted} - {
+                boundaries[d] for d in done
+            }
+            if chunks:
+                yield "".join(chunks)
+        yield parts[1]
+    finally:
+        root.close()
 
 
 def _origin_allowed(conn: HTTPConnection, allowed: Sequence[str]) -> bool:
@@ -237,10 +297,12 @@ def create_app(
     max_upload_size: int = DEFAULT_MAX_UPLOAD,
     prefix: str = "/_pyreaction",
     data_timeout: float = 5.0,
+    stream: bool = True,
     routes: Sequence[Any] = (),
     on_error: Callable[[BaseException, str, Any], None] | None = None,
     threaded: bool = True,
     reconnect_max: int = 8000,
+    resume_timeout: float = 30.0,
     debug: bool = False,
 ) -> Starlette:
     """An ASGI app serving ``app`` on every GET path.
@@ -255,53 +317,87 @@ def create_app(
     ``"*"`` allows any). ``max_upload_size`` (bytes) caps each uploaded file.
 
     The first HTML waits up to ``data_timeout`` seconds for data that
-    ``use_async``/``use_data`` load, so it arrives with the data in it.
+    ``use_async``/``use_data`` load, so it arrives with the data in it. With
+    ``stream`` (the default), data a ``Suspense`` boundary waits for does not hold
+    the page back: it is sent at once with the fallback, and the boundary's
+    content follows in the same response when its data arrives.
     ``routes`` are extra Starlette routes (a login POST endpoint, an API), matched
     before the page. ``on_error(exc, where, connection)`` is called for every
     error not caught by an ErrorBoundary, for Sentry-style reporting. With
     ``threaded`` (default) synchronous handlers and effects run in worker
     threads. After a dropped connection the page retries with growing delays of
-    at most ``reconnect_max`` milliseconds. ``debug`` shows errors in the browser.
+    at most ``reconnect_max`` milliseconds. The server keeps the dropped page's
+    components for ``resume_timeout`` seconds (0: not at all), so a reconnect within
+    that time continues with their state; later, or on another worker process or
+    after a restart, the page renders afresh. ``debug`` shows errors in the browser.
     """
     make = _as_factory(app)
 
     def new_root(url: str, connection: Any) -> Root:
         root = Root(make(), location=url, connection=connection, debug=debug, threaded=threaded)
         if on_error is not None:
-            root.on_error = lambda exc, where: on_error(exc, where, connection)
+            root.on_error = lambda exc, where: on_error(exc, where, root.connection)
         return root
+
+    # Pages whose connection dropped, kept for a reconnect: id -> (root, expiry timer).
+    parked: dict[str, tuple[Root, asyncio.TimerHandle]] = {}
+
+    def discard(root: Root) -> None:
+        for upload in root.uploads.values():
+            upload.file.close()
+        root.close()
+
+    def expire(sid: str) -> None:
+        entry = parked.pop(sid, None)
+        if entry is not None:
+            discard(entry[0])
 
     async def page(request: Request) -> Response:
         url = request.url.path + (f"?{request.url.query}" if request.url.query else "")
         root = new_root(url, request)
+        handed_off = False
         try:
-            if not await root.settle(data_timeout):
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + data_timeout
+            # With streaming, data a Suspense boundary waits for is sent later.
+            if not await root.settle(data_timeout, suspense=not stream):
                 logger.warning("Rendering %s before its data loaded (data_timeout=%ss)", url, data_timeout)
             if root.redirect is not None:
                 return RedirectResponse(root.redirect, status_code=307)
-            body = render_to_string(root)
+            boundaries: dict[Any, int] = {}
+            body = render_to_string(root, boundaries if stream else None)
+            portals = render_portals(root, boundaries if stream else None)
             page_title = root.title if root.title is not None else title
             head_tags = root.head_html()
             status = root.status
-        finally:
-            root.close()
-        root_path = request.scope.get("root_path", "")
-        links = "".join(
-            f'<link rel="stylesheet" href="{escape(root_path + static_path)}/{escape(name)}">\n'
-            for name in stylesheets
-        )
-        return HTMLResponse(
-            PAGE.substitute(
+            root_path = request.scope.get("root_path", "")
+            links = "".join(
+                f'<link rel="stylesheet" href="{escape(root_path + static_path)}/{escape(name)}">\n'
+                for name in stylesheets
+            )
+            parts = PAGE.substitute(
                 lang=escape(lang),
                 title=escape(page_title),
                 style=STYLE,
                 head=links + head + head_tags,
                 body=body,
+                portals=portals,
+                stream=_STREAM_SPLIT,
                 base=escape(root_path + prefix),
                 reconnect_max=int(reconnect_max),
-            ),
-            status_code=status,
-        )
+            ).split(_STREAM_SPLIT)
+            waiting = {n for node, n in boundaries.items() if node.waiting}
+            if not waiting:
+                return HTMLResponse(parts[0] + parts[1], status_code=status)
+            handed_off = True
+            return StreamingResponse(
+                _stream_page(root, parts, boundaries, waiting, deadline),
+                media_type="text/html",
+                status_code=status,
+            )
+        finally:
+            if not handed_off:
+                root.close()
 
     async def client_js(request: Request) -> FileResponse:
         return FileResponse(CLIENT_JS, media_type="text/javascript", headers={"Cache-Control": "no-cache"})
@@ -318,6 +414,8 @@ def create_app(
         outbox = _Outbox(max_pending_ops)
         root: Root | None = None
         uploads: _Uploads | None = None
+        resumed = parked.pop(ws.query_params.get("s", ""), None)
+        sid = secrets.token_urlsafe(18)
 
         async def writer() -> None:
             while (message := await outbox.take()) is not None:
@@ -327,17 +425,27 @@ def create_app(
 
         writing = asyncio.create_task(writer())
         try:
-            root = new_root(url, ws)
 
             def send(message: dict[str, Any]) -> None:
                 if "init" in message:
                     message["maxUpload"] = max_upload_size  # the browser checks sizes first
+                    message["sid"] = sid
+                    if resumed is not None:
+                        message["resumed"] = True
                 outbox.push(message)
 
-            # Load data as the page's HTML did, so this render matches it and the
-            # browser can adopt the HTML instead of rebuilding it.
-            await root.settle(data_timeout)
-            root.attach(send, hydrate=ws.query_params.get("h") == "1")
+            if resumed is not None:
+                root, timer = resumed
+                timer.cancel()
+                root.connection = ws
+                root.set_location(url)
+                root.attach(send, hydrate=True)
+            else:
+                root = new_root(url, ws)
+                # Load data as the page's HTML did, so this render matches it and the
+                # browser can adopt the HTML instead of rebuilding it.
+                await root.settle(data_timeout)
+                root.attach(send, hydrate=ws.query_params.get("h") == "1")
             uploads = _Uploads(root, max_upload_size)
             while True:
                 message = await ws.receive()
@@ -355,13 +463,16 @@ def create_app(
                     continue
                 root.dispatch(*event)
         finally:
-            if uploads is not None:
-                uploads.close()
-            if root is not None:
-                for upload in root.uploads.values():
-                    upload.file.close()
-                root.close()
             writing.cancel()
+            if uploads is not None:
+                uploads.close()  # files half-sent on this connection
+            if root is not None:
+                if resume_timeout > 0 and root._sink is not None:
+                    root.detach()
+                    timer = asyncio.get_running_loop().call_later(resume_timeout, expire, sid)
+                    parked[sid] = (root, timer)
+                else:
+                    discard(root)
 
     table: list[Any] = [
         Route(prefix + "/client.js", client_js),

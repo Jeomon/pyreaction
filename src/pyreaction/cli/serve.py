@@ -69,6 +69,8 @@ def load_app(root: Path, config: dict[str, Any], debug: bool = False) -> Any:
         static_dir=static_dir,
         stylesheets=config.get("stylesheets", []) if static_dir is not None else [],
         allowed_origins=config.get("allowed_origins", []),
+        stream=config.get("stream", True),
+        resume_timeout=config.get("resume_timeout", 30.0),
         max_upload_size=config.get("max_upload_size", DEFAULT_MAX_UPLOAD),
         debug=debug,
     )

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gc
 import heapq
 import inspect
 import io
@@ -37,7 +38,8 @@ import shutil
 import threading
 import traceback
 from bisect import bisect_left
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -52,6 +54,31 @@ _SKIP = object()
 
 # The event a worker thread is handling, so state updates it makes carry its ack.
 _handling = threading.local()
+
+# A render creates many objects that all live on (nodes, ops, elements), so the
+# cyclic garbage collector, triggered by allocation counts, rescans them again and
+# again for nothing: over half of a large mount's time. It is paused while a render
+# pass runs and resumes after it, where it runs as usual.
+_gc_lock = threading.Lock()
+_gc_pauses = 0
+_gc_resume = False
+
+
+@contextmanager
+def _gc_paused() -> Iterator[None]:
+    global _gc_pauses, _gc_resume
+    with _gc_lock:
+        if _gc_pauses == 0:
+            _gc_resume = gc.isenabled()
+            gc.disable()
+        _gc_pauses += 1
+    try:
+        yield
+    finally:
+        with _gc_lock:
+            _gc_pauses -= 1
+            if _gc_pauses == 0 and _gc_resume:
+                gc.enable()
 
 
 class TextNode:
@@ -107,7 +134,7 @@ class ComponentNode:
     __slots__ = (
         "type", "key", "parent", "root", "element", "depth", "children", "hooks",
         "hook_index", "pending_effects", "dirty", "mounted", "value", "subscribers",
-        "subscriptions", "catch", "suspend",
+        "subscriptions", "catch", "suspend", "waiting",
     )
 
     def __init__(self, root: Root, element: Element, key: Any, parent: Any) -> None:
@@ -128,8 +155,10 @@ class ComponentNode:
         self.subscriptions: list[ComponentNode] = []
         # Set by an error boundary: receives errors thrown while rendering its descendants.
         self.catch: Callable[[BaseException], None] | None = None
-        # Set by a Suspense boundary: told when a descendant waits for data.
+        # Set by a Suspense boundary: told when a descendant waits for data, and
+        # whether it is showing its fallback right now.
         self.suspend: Callable[[Any], None] | None = None
+        self.waiting = False
 
     @property
     def name(self) -> str:
@@ -438,11 +467,14 @@ class Root:
         self._tasks: set[asyncio.Task[Any]] = set()
         # Work started by background(): what settle() waits for.
         self._pending: set[asyncio.Task[Any]] = set()
+        # The part of it a Suspense boundary waits for: streamable after the shell.
+        self._suspense_tasks: set[asyncio.Task[Any]] = set()
         # Events and effect batches, run in order by one worker once attached.
         self._queue: asyncio.Queue[tuple[str, Any]] | None = None
         self._busy = False
-        self.container.children = self._reconcile(self.container, [], (element,))
-        self.container.dom = self._dom_ids(self.container.children)
+        with _gc_paused():
+            self.container.children = self._reconcile(self.container, [], (element,))
+            self.container.dom = self._dom_ids(self.container.children)
         # An error boundary that caught during the first render re-renders now,
         # so the first paint already shows its fallback.
         self._render_dirty()
@@ -452,15 +484,20 @@ class Root:
     def attach(self, sink: Callable[[dict[str, Any]], None], hydrate: bool = False) -> None:
         """Start sending: the whole tree goes out, then effects run and updates flow.
 
-        Must be called from the event loop that will serve this root.
+        Must be called from the event loop that will serve this root. After
+        :meth:`detach` it can be called again, for a new connection to the same
+        page: the components keep their state.
         """
         self._loop = asyncio.get_running_loop()
         self._thread = threading.get_ident()
-        self._queue = asyncio.Queue()
-        self.spawn(self._work())
+        if self._queue is None:
+            self._queue = asyncio.Queue()
+            self.spawn(self._work())
+        self._render_dirty()
         # Operations so far only built the tree; the snapshot replaces them.
-        # Element commands made before now still have to run.
-        commands = [op for op in self.ops if op[0] == "m"]
+        # Element commands made before now still have to run, unless their caller
+        # already gave up waiting for the answer.
+        commands = [op for op in self.ops if op[0] == "m" and (op[4] is None or op[4] in self._replies)]
         self.ops = []
         if self.title is not None:
             self._title_dirty = True
@@ -473,6 +510,16 @@ class Root:
         self._run_effects()
         if self._dirty or self.ops or self._nav or self._errors or self._title_dirty or self._head_dirty:
             self.flush()
+
+    def detach(self) -> None:
+        """Stop sending: the connection dropped. State, queued events and background
+        work carry on (effects wait), and :meth:`attach` resumes the page."""
+        self._sink = None
+        # The browser may never answer these: fail them so no handler waits forever.
+        replies, self._replies = self._replies, {}
+        for future in replies.values():
+            if not future.done():
+                future.set_exception(ConnectionError("the page disconnected"))
 
     def close(self) -> None:
         """Unmount everything, running effect cleanups and cancelling tasks."""
@@ -570,16 +617,22 @@ class Root:
     def _render_dirty(self) -> None:
         self._flushing = True
         try:
-            while self._dirty:
-                _, _, node = heapq.heappop(self._dirty)
-                if not node.dirty or not node.mounted:
-                    continue
-                before = self._dom_ids(node.children)
-                self._render(node, node.element)
-                if self._dom_ids(node.children) != before:
-                    self._sync_dom(self._host_of(node))
+            if not self._dirty:
+                return
+            with _gc_paused():
+                self._render_all_dirty()
         finally:
             self._flushing = False
+
+    def _render_all_dirty(self) -> None:
+        while self._dirty:
+            _, _, node = heapq.heappop(self._dirty)
+            if not node.dirty or not node.mounted:
+                continue
+            before = self._dom_ids(node.children)
+            self._render(node, node.element)
+            if self._dom_ids(node.children) != before:
+                self._sync_dom(self._host_of(node))
 
     def _message(self, ops: list[list[Any]]) -> dict[str, Any]:
         message: dict[str, Any] = {"ops": ops, "ack": self.ack}
@@ -646,7 +699,7 @@ class Root:
             self._cleanup(slot)
             try:
                 if self.threaded and not inspect.iscoroutinefunction(fn):
-                    result = await asyncio.to_thread(fn)
+                    result = await self._in_thread(fn)
                 else:
                     result = fn()
             except Exception as exc:
@@ -654,8 +707,37 @@ class Root:
                 continue
             self._keep_effect_result(slot, result)
 
+    async def _in_thread(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Run ``fn`` in a worker thread, and return only once every state update it
+        sent to the loop has been applied, so the caller can render them."""
+        loop = self._loop
+        assert loop is not None
+        applied = loop.create_future()
+
+        def landed() -> None:
+            if not applied.done():
+                applied.set_result(None)
+
+        def run() -> Any:
+            try:
+                return fn(*args)
+            finally:
+                # Updates reach the loop as callbacks in the order they were made, so
+                # once this one runs, all of the function's updates have landed.
+                loop.call_soon_threadsafe(landed)
+
+        try:
+            return await asyncio.to_thread(run)
+        finally:
+            await applied
+
     async def _work(self) -> None:
-        """Run queued events and effect batches one at a time, in arrival order."""
+        """Run queued events and effect batches one at a time, in arrival order.
+
+        After each one its updates are rendered before the next starts, so every
+        handler sees the page as the previous event left it: two quick clicks on a
+        counter count two, even when they arrive in the same network packet.
+        """
         assert self._queue is not None
         while True:
             kind, job = await self._queue.get()
@@ -665,6 +747,8 @@ class Root:
                     await self._dispatch_async(*job)
                 else:
                     await self._run_effects_async(job)
+                if self._dirty:
+                    self.flush()
             except Exception as exc:  # never let one bad job stop the session
                 self.report(exc, "the event worker")
             finally:
@@ -745,28 +829,36 @@ class Root:
         task.add_done_callback(self._pending.discard)
         return task
 
-    async def settle(self, timeout: float = 5.0) -> bool:
+    async def settle(self, timeout: float = 5.0, suspense: bool = True) -> bool:
         """Wait until queued events, effects, background work (data loads, actions,
         async handlers) are done and their updates rendered. False if ``timeout``
-        (seconds) ran out first. Long-running async effects are not waited for."""
+        (seconds) ran out first. Long-running async effects are not waited for.
+
+        With ``suspense=False``, data that a Suspense boundary is waiting for is not
+        waited for: the page can be sent with those fallbacks and streamed later."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+
+        def waiting_on() -> set[asyncio.Task[Any]]:
+            return self._pending if suspense else self._pending - self._suspense_tasks
+
+        def queued() -> bool:
+            return self._queue is not None and (not self._queue.empty() or self._busy)
+
         while True:
             if self._dirty:
                 self._render_dirty() if self._sink is None else self.flush()
-            queued = self._queue is not None and (not self._queue.empty() or self._busy)
-            if not self._pending and not queued:
+            if not waiting_on() and not queued():
                 await asyncio.sleep(0)  # done-callbacks and thread hand-offs land
-                if not self._dirty and not self._pending and not (
-                    self._queue is not None and (not self._queue.empty() or self._busy)
-                ):
+                if not self._dirty and not waiting_on() and not queued():
                     return True
                 continue
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
-            if self._pending:
-                await asyncio.wait(set(self._pending), timeout=min(remaining, 0.05))
+            pending = waiting_on()
+            if pending:
+                await asyncio.wait(pending, timeout=min(remaining, 0.05))
             else:
                 await asyncio.sleep(0.005)
             await asyncio.sleep(0)
@@ -896,7 +988,7 @@ class Root:
                         loop.call_soon_threadsafe(self._ack, seq)
                     return result
 
-                result = await asyncio.to_thread(run)
+                result = await self._in_thread(run)
             else:
                 result = call()
         except Exception as exc:
@@ -1114,6 +1206,9 @@ class Root:
                 node.pending_effects.clear()
                 boundary = self._boundary_for(node, "suspend")
                 if boundary is not None:
+                    if waiting.task is not None:
+                        self._suspense_tasks.add(waiting.task)
+                        waiting.task.add_done_callback(self._suspense_tasks.discard)
                     boundary.suspend(waiting.task)  # type: ignore[misc]
                 if node.children:
                     return
