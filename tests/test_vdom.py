@@ -674,3 +674,163 @@ def test_duplicate_keys_are_warned_and_still_render(caplog):
         setters["keys"](keys)
         h.flush()  # checks the fake DOM against the tree
         assert h.html() == "<ul>" + "".join(f"<li>{k}{i}</li>" for i, k in enumerate(keys)) + "</ul>"
+
+
+def test_memo_given_elements_in_a_tuple_sees_new_handlers():
+    from reaction import h
+
+    clicks = []
+    setters = {}
+
+    @memo
+    def Panel(children=()):
+        return html.div(*children)
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        setters["n"] = set_n
+        return h(Panel, {}, html.button("go", on_click=lambda: clicks.append(n)))
+
+    harness = Harness(App())
+    setters["n"](5)
+    harness.flush()
+    button = next(node for node in harness.root.hosts.values() if node.type == "button")
+    button.events["click"].fn()
+    assert clicks == [5], "a new element in the tuple re-renders the memo component"
+
+
+def test_same_compares_tuples_one_level_at_a_time():
+    from reaction.core.hooks import same
+
+    assert same((1, "a", (2.5, None)), (1, "a", (2.5, None))), "plain values compare by value"
+    assert not same((1, [2]), (1, [2])), "a list inside compares by identity, as on its own"
+    shared = [2]
+    assert same((1, shared), (1, shared))
+    assert not same(html.b("x"), html.b("x")), "elements compare by identity"
+    assert not same((html.b("x"),), (html.b("x"),))
+    assert not same((1, 2), (1, 2, 3)) and not same((1,), [1])
+
+
+def test_mounted_view_transitions_are_counted_so_dirty_nodes_skip_the_walk():
+    from reaction import ViewTransition
+
+    setters = {}
+
+    @component
+    def App():
+        shown, set_shown = use_state(True)
+        n, set_n = use_state(0)
+        setters.update(shown=set_shown, n=set_n)
+        inner = ViewTransition(html.p(n)) if shown else html.p(n)
+        return html.div(inner, ViewTransition(html.span("always")))
+
+    h = Harness(App())
+    assert h.root._view_transitions == 2
+    setters["n"](1)
+    h.flush()
+    assert h.root._view_transitions == 2, "a re-render does not count it twice"
+    setters["shown"](False)
+    h.flush()
+    assert h.root._view_transitions == 1
+    h.root.close()
+    assert h.root._view_transitions == 0
+
+
+def test_a_row_that_gains_a_child_syncs_only_its_own_element():
+    """Only the host whose children changed has its DOM order recomputed, not every
+    host above it; the fake DOM still matches the tree after each change."""
+    from reaction import use_page_store, use_store
+
+    selections = {}
+    synced = []
+
+    @memo
+    def Row(i, selection):
+        selected = use_store(selection, lambda s: s == i)
+        return html.li(html.span(i), html.b("*") if selected else None, " end")
+
+    @component
+    def App():
+        selection = use_page_store(-1)
+        selections["s"] = selection
+        return html.div(html.ul([Row(i, selection, key=i) for i in range(50)]))
+
+    h = Harness(App())
+    real_sync = h.root._sync_dom
+    h.root._sync_dom = lambda host: (synced.append(host.type), real_sync(host))[1]
+    for pick in (3, 40, 3, -1):
+        synced.clear()
+        selections["s"].set(pick)
+        h.flush()
+        assert set(synced) <= {"li"}, f"only rows sync, not {synced}"
+    assert "<b>" not in h.html()
+
+
+def test_prop_names_mean_the_same_on_every_call():
+    """Prop names are classified once and cached: the second element gets what the
+    first did, for every kind of name."""
+    from reaction.core.element import RAW_HTML, _split_props
+
+    def submit(fields):
+        return None
+
+    def props(action):
+        return dict(  # noqa: C408 - written as the keyword arguments a tag call gets
+            key="k", ref=None, class_name="a", class_="b", html_for="x", data_row_id=7, aria_label="l",
+            default_value="d", value=None, checked=True, hidden=True, disabled=False, title=None,
+            style={"background_color": "red"}, on_click=print, on_click_capture=print, on_change=print,
+            on_submit=print, onDoubleClick=print, dangerously_set_inner_html="<i>x</i>", form_action=action,
+        )
+
+    for _ in range(2):
+        key, ref, attrs, events = _split_props(props(submit))
+        assert key == "k" and ref is None
+        assert attrs == {
+            "class": "b", "for": "x", "data-row-id": "7", "aria-label": "l", "defaultValue": "d",
+            "value": "", "checked": True, "hidden": "", "style": "background-color:red",
+            RAW_HTML: "<i>x</i>", "data-pyreaction-raw": "",
+        }
+        assert set(events) == {"click", "click:capture", "input", "submit", "dblclick"}
+        assert events["submit"].prevent_default and events["click"].form, "form_action took the click"
+        _, _, attrs, events = _split_props(props("/save"))
+        assert attrs["form-action"] == "/save" and not events["click"].form, "a string stays an attribute"
+
+
+def test_state_set_while_rendering_reruns_before_the_children_are_diffed():
+    """React's "adjust state when a prop changes": the component runs again at once,
+    so its children render only the final output and effects see final values."""
+    child_renders = []
+    effects = []
+    setters = {}
+
+    @component
+    def Child(label):
+        child_renders.append(label)
+        return html.li(label)
+
+    @component
+    def List(items):
+        prev, set_prev = use_state(items)
+        shown, set_shown = use_state(items)
+        if items is not prev:
+            set_prev(items)
+            set_shown(items)
+        use_effect(lambda: effects.append(shown), [shown])
+        return html.ul([Child(str(x), key=x) for x in shown])
+
+    @component
+    def App():
+        items, set_items = use_state((1, 2, 3))
+        setters["items"] = set_items
+        return List(items)
+
+    h = Harness(App())
+    child_renders.clear()
+    effects.clear()
+    setters["items"]((4, 5, 6))
+    h.flush()
+    assert child_renders == ["4", "5", "6"], "the stale (1, 2, 3) output was never diffed"
+    assert h.html() == "<ul><li>4</li><li>5</li><li>6</li></ul>"
+    h.root._run_effects()
+    assert effects == [(4, 5, 6)], "the effect ran once, with the final value"

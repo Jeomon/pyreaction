@@ -209,7 +209,9 @@ def ViewTransition(*children: Any, name: str | None = None) -> Any:
     it the same name on both pages). Names must be unique on the page."""
     node = CURRENT.get()
     assert node is not None
-    node.view_transition = True
+    if not node.view_transition:
+        node.view_transition = True
+        node.root._view_transitions += 1
     if name is None:
         return list(children)
     return html.div(*children, style={"view_transition_name": name})

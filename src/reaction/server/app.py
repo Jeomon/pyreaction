@@ -107,11 +107,21 @@ _SWAP = (
 
 
 async def _stream_page(
-    root: Root, parts: list[str], boundaries: dict[Any, int], waiting: set[int], deadline: float
+    root: Root,
+    parts: list[str],
+    boundaries: dict[Any, int],
+    waiting: set[int],
+    deadline: float,
+    hand_off: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     """The page in pieces: the shell with Suspense fallbacks at once, then each
-    boundary's content as its data arrives, then the client script."""
+    boundary's content as its data arrives, then the client script.
+
+    ``hand_off`` keeps the render for the page's live connection. It runs just before
+    the last piece: the browser connects only once that piece (the client script)
+    arrives, so the render it takes over is the one the HTML shows."""
     loop = asyncio.get_running_loop()
+    handed_off = False
     try:
         yield parts[0] + _SWAP
         while waiting:
@@ -146,9 +156,13 @@ async def _stream_page(
             }
             if chunks:
                 yield "".join(chunks)
+        if hand_off is not None:
+            hand_off()
+            handed_off = True
         yield parts[1]
     finally:
-        root.close()
+        if not handed_off:
+            root.close()  # streaming stopped early, or nothing will connect
 
 
 def _app_path(scope: Any) -> tuple[str, str]:
@@ -587,9 +601,12 @@ def create_app(
                     hand_off(token, root, request, url, base)
                     handed_off = True
                 return response
-            handed_off = True
+            handed_off = True  # _stream_page keeps or closes it from here
             return StreamingResponse(
-                _stream_page(root, parts, boundaries, waiting, deadline),
+                _stream_page(
+                    root, parts, boundaries, waiting, deadline,
+                    (lambda: hand_off(token, root, request, url, base)) if token else None,
+                ),
                 media_type="text/html",
                 status_code=status,
                 headers=root.headers,
@@ -720,7 +737,9 @@ def create_app(
         return Response(status_code=404)  # asked for despite the empty icon: not a page
 
     table += [Route("/favicon.ico", no_icon), Route("/", page), Route("/{path:path}", page)]
-    middleware = [Middleware(GZipMiddleware, minimum_size=1024)] if compress else []
+    # Level 6, not Starlette's 9: on a 388 kB page 9 takes 20 ms (longer than the
+    # render) for 1.4% fewer bytes than 6, which takes 2 ms.
+    middleware = [Middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)] if compress else []
     this_app[0] = _MountableApp(debug=debug, routes=table, middleware=middleware)
     return this_app[0]
 

@@ -198,3 +198,100 @@ def test_navigate_redirects_on_first_load_and_live():
         first = json.loads(ws.receive_text())
         message = first if "nav" in first else json.loads(ws.receive_text())
         assert message["nav"] == {"to": "/", "replace": True}
+
+
+def test_threaded_effects_run_as_one_batch_with_errors_reported_each(caplog):
+    """Plain effects of one flush run together in a worker thread: every cleanup
+    first, then every setup in order; an async effect splits the batch; a failing
+    effect is reported on its own and the others still run and update state."""
+    log = []
+    setters = {}
+
+    @component
+    def Item(i, n):
+        def effect():
+            log.append(("setup", i, n, threading.get_ident() != loop_thread[0]))
+            if i == 1 and n == 1:
+                raise ValueError("effect 1 failed")
+            return lambda: log.append(("cleanup", i, n))
+
+        use_effect(effect, [n])
+        return html.li(i)
+
+    @component
+    def Async(n):
+        async def effect():
+            log.append(("async", n))
+
+        use_effect(effect, [n])
+
+    @component
+    def App():
+        n, set_n = use_state(0)
+        seen, set_seen = use_state(0)
+        setters["n"] = set_n
+        use_effect(lambda: set_seen(n), [n])  # an effect's state update renders
+        return html.ul(Item(0, n), Item(1, n), Async(n), Item(2, n), html.p(f"seen {seen}"))
+
+    loop_thread = []
+
+    async def main():
+        loop_thread.append(threading.get_ident())
+        sent = []
+        root = Root(App())
+        root.attach(sent.append)
+        await asyncio.sleep(0.2)
+        log.clear()
+        setters["n"](1)
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if any("seen 1" in t for m in sent for t in op_texts(m["ops"])):
+                break
+        root.close()
+        return sent
+
+    sent = asyncio.run(main())
+    plain = [entry for entry in log if entry[0] != "async"]
+    assert plain[:2] == [("cleanup", 0, 0), ("cleanup", 1, 0)], "cleanups of a batch run before its setups"
+    assert ("setup", 0, 1, True) in plain and ("setup", 2, 1, True) in plain, "the rest ran, in a thread"
+    assert ("async", 1) in log
+    # The async effect (its body runs later, as a task) ends the first batch: the
+    # item after it is cleaned up only once the batch before it has set up.
+    assert plain.index(("cleanup", 2, 0)) > plain.index(("setup", 1, 1, True)), "the async effect split the batch"
+    assert "effect 1 failed" in caplog.text and "an effect in Item" in caplog.text
+    assert any("seen 1" in t for m in sent for t in op_texts(m["ops"]))
+
+
+def test_updates_from_worker_threads_arrive_complete_and_in_order():
+    """Updates from threads are queued and the loop drains them in bursts: each
+    thread's updates still apply in the order it made them, and none are lost."""
+    setters = {}
+
+    @component
+    def App():
+        digits, set_digits = use_state("")
+        count, set_count = use_state(0)
+        setters.update(digits=set_digits, count=set_count)
+        return html.p(f"{digits}|{count}")
+
+    async def main():
+        root = Root(App())
+        root.attach(lambda m: None)
+
+        def ordered():
+            for d in "0123456789" * 30:
+                setters["digits"](lambda s, d=d: s + d)
+
+        def counted():
+            for _ in range(500):
+                setters["count"](lambda c: c + 1)
+
+        await asyncio.gather(root._in_thread(ordered), root._in_thread(counted), root._in_thread(counted))
+        root.flush()
+        text = root.container.children[0].children[0].text
+        root.close()
+        return text
+
+    digits, count = asyncio.run(main()).split("|")
+    assert digits == "0123456789" * 30, "one thread's updates keep their order"
+    assert count == "1000", "updates from two threads at once are all applied"

@@ -298,51 +298,79 @@ def _event_name(prop: str) -> str | None:
 _CAPTURE_NAMED = frozenset({"gotpointercapture", "lostpointercapture"})
 
 
+# What a prop name means, worked out once per name: (kind, the attribute or event
+# name it becomes). Names come from code, so few repeat endlessly; the cap keeps
+# names built at runtime (data-{x}) from growing the cache without bound.
+_ATTR, _EVENT, _PROPERTY, _KEY, _REF, _RAW, _FORM_ACTION = range(7)
+_PROP_KINDS: dict[str, tuple[int, str]] = {}
+_PROP_KINDS_MAX = 10_000
+
+
+def _classify_prop(name: str) -> tuple[int, str]:
+    if name == "key":
+        return _KEY, name
+    if name == "ref":
+        return _REF, name
+    if name in ("dangerously_set_inner_html", "dangerouslySetInnerHTML"):
+        return _RAW, name
+    attr = _ATTR_ALIASES.get(name, name)
+    if attr in PROPERTY_PROPS:
+        return _PROPERTY, attr
+    if attr.endswith("_"):
+        attr = attr[:-1]
+    if "_" in attr:
+        attr = attr.replace("_", "-")
+    if name in ("form_action", "formAction"):
+        return _FORM_ACTION, attr  # an attribute unless its value is a function
+    ev = _event_name(name)
+    if ev is not None:
+        return _EVENT, ev
+    return _ATTR, attr
+
+
 def _split_props(props: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], dict[str, EventHandler]]:
     key = None
     ref = None
     attrs: dict[str, Any] = {}
     events: dict[str, EventHandler] = {}
+    kinds = _PROP_KINDS
     for name, value in props.items():
-        if name == "key":
-            key = value
-            continue
-        if name == "ref":
-            ref = value
-            continue
-        if name in ("dangerously_set_inner_html", "dangerouslySetInnerHTML"):
-            if value is not None:
-                attrs[RAW_HTML] = str(value)
-                attrs[RAW_MARK] = ""
-            continue
-        if name in ("form_action", "formAction") and callable(value):
-            events["click"] = _form_action(value)
-            continue
-        ev = _event_name(name)
-        if ev is not None:
+        found = kinds.get(name)
+        if found is None:
+            found = _classify_prop(name)
+            if len(kinds) < _PROP_KINDS_MAX:
+                kinds[name] = found
+        kind, target = found
+        if kind == _ATTR:
+            if value is None or value is False:
+                continue
+            if value is True:
+                attrs[target] = ""
+            elif target == "style" and isinstance(value, dict):
+                attrs[target] = _style_to_str(value)
+            else:
+                attrs[target] = str(value)
+        elif kind == _EVENT:
             if value is None:
                 continue
             if not isinstance(value, EventHandler):
                 # A form submit would otherwise navigate away from the live page.
-                value = EventHandler(value, prevent_default=ev == "submit")
-            events[ev] = value
-            continue
-        name = _ATTR_ALIASES.get(name, name)
-        if name in PROPERTY_PROPS:
-            attrs[name] = "" if value is None else value
-            continue
-        if name.endswith("_"):
-            name = name[:-1]
-        if "_" in name:
-            name = name.replace("_", "-")
-        if value is None or value is False:
-            continue
-        if value is True:
-            attrs[name] = ""
-        elif name == "style" and isinstance(value, dict):
-            attrs[name] = _style_to_str(value)
-        else:
-            attrs[name] = str(value)
+                value = EventHandler(value, prevent_default=target == "submit")
+            events[target] = value
+        elif kind == _PROPERTY:
+            attrs[target] = "" if value is None else value
+        elif kind == _KEY:
+            key = value
+        elif kind == _REF:
+            ref = value
+        elif kind == _RAW:
+            if value is not None:
+                attrs[RAW_HTML] = str(value)
+                attrs[RAW_MARK] = ""
+        elif callable(value):  # _FORM_ACTION
+            events["click"] = _form_action(value)
+        elif value is not None and value is not False:
+            attrs[target] = "" if value is True else str(value)
     return key, ref, attrs, events
 
 

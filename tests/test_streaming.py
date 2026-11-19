@@ -99,3 +99,37 @@ def test_streaming_stops_at_data_timeout():
     whole = "".join(text for _, text in chunks)
     assert time.monotonic() - start < 2
     assert "still loading" in whole and "late" not in whole and "client.js" in whole
+
+
+def test_the_live_connection_takes_over_a_streamed_render():
+    """The streamed page's render is handed to its WebSocket, like an unstreamed one:
+    the data is not loaded again and the browser adopts the HTML it has."""
+    import json
+
+    loads = []
+
+    @component
+    def Counted():
+        async def load():
+            loads.append(1)
+            await asyncio.sleep(0.1)
+            return "sales: 42"
+
+        return html.p(use_data(load), class_name="loaded")
+
+    @component
+    def App():
+        return html.main(Suspense(Counted(), fallback=html.p("Loading...")))
+
+    with TestClient(create_app(App)) as client:
+        whole = "".join(text for _, text in read_chunks(client))
+        assert "sales: 42" in whole and len(loads) == 1
+        token = re.search(r'data-handoff="([^"]*)"', whole).group(1)
+        assert token
+        with client.websocket_connect(f"/_pyreaction/ws?p=/&h=1&k={token}") as ws:
+            first = json.loads(ws.receive_text())
+        assert first["init"] == "hydrate"
+        assert {"#text": "sales: 42", "class": "loaded"}.items() <= next(
+            op[3] for op in first["ops"] if op[0] == "c" and op[2] == "p"
+        ).items()
+        assert len(loads) == 1, "the data was not loaded a second time"

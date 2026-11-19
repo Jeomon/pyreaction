@@ -57,6 +57,14 @@ logger = logging.getLogger("reaction")
 # (a component that sets state every time it renders), as React does.
 MAX_RENDERS = 50
 
+
+def _too_many_renders(name: str) -> RuntimeError:
+    return RuntimeError(
+        f"Too many re-renders in {name}: it sets state every time it renders. "
+        "Set state in an event handler or effect; pass the handler itself "
+        "(on_click=vote), not its result (on_click=vote())."
+    )
+
 __all__ = ["ElementHandle", "Event", "FormFields", "Location", "Reply", "Root", "UploadedFile"]
 
 _SKIP = object()
@@ -104,7 +112,7 @@ class TextNode:
 class HostNode:
     __slots__ = (
         "id", "type", "key", "parent", "element", "attrs", "events", "children", "dom", "depth", "ns",
-        "ref_cleanup", "text",
+        "ref_cleanup", "text", "reshaped",
     )
 
     def __init__(self, id: int, element: Element, key: Any, parent: Any) -> None:
@@ -122,6 +130,9 @@ class HostNode:
         self.ns = _namespace(self.type, parent)
         # Its only child as text, kept here instead of as a TextNode (None: it has children).
         self.text: str | None = None
+        # Its DOM children may have changed order or membership in this pass (a child
+        # list under it, or under a component inside it, reshaped): see Root._mark_reshaped.
+        self.reshaped = False
 
 
 # Elements inside <svg> or <math> must be created in that XML namespace, or the
@@ -627,6 +638,9 @@ class Root:
         # Whether this pass changed something under a ViewTransition, and the types
         # add_transition_type gave it.
         self._animate = False
+        # Mounted ViewTransition components: while there are none, a dirty component
+        # need not look up through its ancestors for one.
+        self._view_transitions = 0
         self._transition_types: list[str] = []
         # Components that called browser() before the page was live, and how to make
         # the Suspense boundaries showing their fallbacks show them once it is.
@@ -644,8 +658,9 @@ class Root:
         self.uploads: dict[str, UploadedFile] = {}
         self._ids = itertools.count(1)
         # Bumped whenever a child list gains, loses or reorders a node. A pass that
-        # leaves it alone cannot have moved any DOM node, so DOM order is not recomputed.
-        self._reshapes = 0
+        # Hosts whose DOM children reshaped (gained, lost or reordered a node) during
+        # this pass and still need their DOM order synced; only those are recomputed.
+        self._reshaped: list[HostNode] = []
         # For use_id: handed out in render order, the same on the server and live.
         self.next_id = itertools.count(1)
         # Element calls waiting for the browser's answer, by reply id.
@@ -668,9 +683,16 @@ class Root:
         self._queue: asyncio.Queue[tuple[str, Any]] | None = None
         self.pending_events = 0  # browser events queued and not yet started
         self._busy = False
+        # State updates from worker threads, waiting to run on the loop. A burst of them
+        # wakes the loop once (see call), not once per update.
+        self._from_threads: list[Callable[[], None]] = []
+        self._from_threads_lock = threading.Lock()
+        self._drain_scheduled = False
         with _gc_paused():
+            self.container.reshaped = True  # its order is computed whole below
             self.container.children = self._reconcile(self.container, [], (element,))
             self.container.dom = self._dom_ids(self.container.children)
+            self.container.reshaped = False
         # An error boundary that caught during the first render re-renders now,
         # so the first paint already shows its fallback.
         self._render_dirty()
@@ -788,17 +810,32 @@ class Root:
         """Run ``fn`` on this root's event loop; state setters go through here."""
         if self._loop is not None and threading.get_ident() != self._loop_thread:
             seq = getattr(_handling, "seq", None)
-            if seq is None:
-                self._loop.call_soon_threadsafe(fn)
-            else:
+            if seq is not None:
                 # From an event handler in a worker thread: acknowledge the event in
                 # the same step, so the render this update causes carries the ack.
-                def apply() -> None:
-                    self._ack(seq)
-                    fn()
+                update = fn
 
-                self._loop.call_soon_threadsafe(apply)
+                def fn() -> None:
+                    self._ack(seq)
+                    update()
+
+            # Queued, with one wake-up per burst. Order still holds: an update joins a
+            # drain scheduled before it, or schedules one before anything this thread
+            # sends the loop next (the ack, or _in_thread's "landed").
+            with self._from_threads_lock:
+                self._from_threads.append(fn)
+                if self._drain_scheduled:
+                    return
+                self._drain_scheduled = True
+            self._loop.call_soon_threadsafe(self._drain_from_threads)
         else:
+            fn()
+
+    def _drain_from_threads(self) -> None:
+        with self._from_threads_lock:
+            pending, self._from_threads = self._from_threads, []
+            self._drain_scheduled = False
+        for fn in pending:
             fn()
 
     def schedule(self, node: ComponentNode) -> None:
@@ -852,14 +889,9 @@ class Root:
             if count > MAX_RENDERS:
                 # A component that sets state on every render would loop forever.
                 node.dirty = False
-                self._render_failed(node, RuntimeError(
-                    f"Too many re-renders in {node.name}: it sets state every time it renders. "
-                    "Set state in an event handler or effect; pass the handler itself "
-                    "(on_click=vote), not its result (on_click=vote())."
-                ))
+                self._render_failed(node, _too_many_renders(node.name))
                 continue
-            reshapes = self._reshapes
-            if not self._animate:
+            if self._view_transitions and not self._animate:
                 self._animate = self._under_view_transition(node)
             start = time.perf_counter() if self._profiling else 0.0
             self._render(node, node.element)
@@ -871,8 +903,14 @@ class Root:
                     if isinstance(above, ComponentNode) and above.profile is not None:
                         self._add_profile(above, "update", elapsed, start)
                     above = above.parent
-            if self._reshapes != reshapes:
-                self._sync_dom(self._host_of(node))
+            # Hosts diffed in this render synced themselves; what is left is the host
+            # around this component, whose own diff did not run.
+            if self._reshaped:
+                for host in self._reshaped:
+                    if host.reshaped:
+                        host.reshaped = False
+                        self._sync_dom(host)
+                self._reshaped.clear()
 
     def _render_failed(self, node: ComponentNode, exc: BaseException) -> None:
         """An error while rendering ``node``: to the nearest error boundary, else logged."""
@@ -1073,15 +1111,54 @@ class Root:
             slot.cleanup = result
 
     async def _run_effects_async(self, effects: list[tuple[EffectSlot, Any]]) -> None:
-        for slot, fn in effects:
+        i, n = 0, len(effects)
+        while i < n:
+            if self.threaded and not inspect.iscoroutinefunction(effects[i][1]):
+                j = i + 1
+                while j < n and not inspect.iscoroutinefunction(effects[j][1]):
+                    j += 1
+                await self._run_effects_in_thread(effects[i:j])
+                i = j
+                continue
+            slot, fn = effects[i]
+            i += 1
             if not slot.node.mounted:
                 continue
             self._cleanup(slot)
             try:
-                in_thread = self.threaded and not inspect.iscoroutinefunction(fn)
-                result = await self._in_thread(fn) if in_thread else fn()
+                result = fn()
                 if self._strict_rerun(slot, result):
-                    result = await self._in_thread(fn) if in_thread else fn()
+                    result = fn()
+            except Exception as exc:
+                self.report(exc, f"an effect in {slot.node.name}")
+                continue
+            self._keep_effect_result(slot, result)
+
+    async def _run_effects_in_thread(self, effects: list[tuple[EffectSlot, Any]]) -> None:
+        """Plain effects in one worker-thread hop, not one each (a hop costs more than
+        most effects). As React does, every cleanup runs first, then every setup;
+        results are kept here on the loop, where a returned coroutine becomes a task."""
+        live = [(slot, fn) for slot, fn in effects if slot.node.mounted]
+        if not live:
+            return
+        for slot, _ in live:
+            self._cleanup(slot)
+
+        def run_all() -> list[tuple[Any, Exception | None]]:
+            outcomes: list[tuple[Any, Exception | None]] = []
+            for _, fn in live:
+                try:
+                    outcomes.append((fn(), None))
+                except Exception as exc:
+                    outcomes.append((None, exc))
+            return outcomes
+
+        for (slot, fn), (result, error) in zip(live, await self._in_thread(run_all)):
+            try:
+                if error is not None:
+                    raise error
+                if self._strict_rerun(slot, result):
+                    result = await self._in_thread(fn)
             except Exception as exc:
                 self.report(exc, f"an effect in {slot.node.name}")
                 continue
@@ -1497,7 +1574,7 @@ class Root:
                 seen.add(key)
                 result.append(self._mount(item, key, parent))
             if result:
-                self._reshapes += 1
+                self._mark_reshaped(parent)
             return result
         n_old, n_new = len(old), len(pairs)
         # Children that kept their key and type at either end need no lookup table:
@@ -1568,7 +1645,7 @@ class Root:
         for leftover in leftovers:
             self._unmount(leftover, emit=True)
         if reshaped:
-            self._reshapes += 1
+            self._mark_reshaped(parent)
         return result
 
     def _mount(self, item: Any, key: Any, parent: Any) -> Any:
@@ -1584,8 +1661,10 @@ class Root:
                 self.ops.append(["P", host.id, item.attrs["target"]])
             else:
                 self.ops.append(self._js_create(host))
+            host.reshaped = True  # its order is computed whole below
             host.children = self._reconcile(host, [], item.children)
             host.dom = self._dom_ids(host.children)
+            host.reshaped = False
             if host.dom:
                 self.ops.append(["A", host.id, host.dom])
             self._attach_ref(host, item.ref)
@@ -1599,8 +1678,10 @@ class Root:
                 self.ops.append(self._create_op(host))
             else:
                 self.ops.append(self._create_op(host))
+                host.reshaped = True  # its order is computed whole below
                 host.children = self._reconcile(host, [], item.children)
                 host.dom = self._dom_ids(host.children)
+                host.reshaped = False
                 if host.dom:
                     self.ops.append(["A", host.id, host.dom])
             self._attach_ref(host, item.ref)
@@ -1639,9 +1720,9 @@ class Root:
             node.element = item
             node.attrs = new_attrs
             node.events = item.events
-            reshapes = self._reshapes
             node.children = self._reconcile(node, node.children, item.children)
-            if self._reshapes != reshapes:
+            if node.reshaped:
+                node.reshaped = False
                 self._sync_dom(node)
             return
         if old_attrs != new_attrs:
@@ -1680,9 +1761,9 @@ class Root:
             if node.text:
                 ops.append(["p", node.id, TEXT, None])
             node.text = None
-        reshapes = self._reshapes
         node.children = self._reconcile(node, node.children, item.children)
-        if self._reshapes != reshapes:
+        if node.reshaped:
+            node.reshaped = False
             self._sync_dom(node)
 
     def _render(self, node: ComponentNode, item: Element, timed: bool = False) -> None:
@@ -1715,6 +1796,22 @@ class Root:
                     node.pending_effects.clear()
                 out = kind.fn(*item.args, **item.kwargs)
                 self._check_hook_count(node)
+                reruns = 0
+                while node.dirty and node.mounted:
+                    # It set its own state while rendering (deriving state from a
+                    # prop, as React's docs show): run it again before diffing, so
+                    # its children see only the final output.
+                    reruns += 1
+                    if reruns > MAX_RENDERS:
+                        node.dirty = False  # reported once, not rendered again from the queue
+                        raise _too_many_renders(node.name)
+                    node.dirty = False
+                    for slot in node.pending_effects:
+                        slot.fn, slot.deps = slot.before
+                    node.pending_effects.clear()
+                    node.hook_index = 0
+                    out = kind.fn(*item.args, **item.kwargs)
+                    self._check_hook_count(node)
             except Suspended as waiting:
                 # Waiting for data: show the nearest Suspense fallback meanwhile. The
                 # hook re-renders this component when the data arrives.
@@ -1905,12 +2002,16 @@ class Root:
             if emit or node.type == PORTAL:
                 self.ops.append(["r", node.id])
             del self.hosts[node.id]
+            node.reshaped = False  # gone: nothing to sync, even if it was waiting for it
             self._release_ref(node)
             for child in node.children:
                 self._unmount(child, emit=False)
             node.children = []  # no parent <-> child cycle left for the garbage collector
             return
         node.mounted = False
+        if node.view_transition:
+            node.view_transition = False
+            self._view_transitions -= 1
         node.dirty = False
         for child in node.children:
             self._unmount(child, emit)
@@ -1968,6 +2069,16 @@ class Root:
         while not isinstance(parent, HostNode):
             parent = parent.parent
         return parent
+
+    def _mark_reshaped(self, parent: Any) -> None:
+        """A child list under ``parent`` gained, lost or reordered a node: the nearest
+        host's DOM order needs syncing. Only that host, not every host above it."""
+        host = parent
+        while not isinstance(host, HostNode):
+            host = host.parent
+        if not host.reshaped:
+            host.reshaped = True
+            self._reshaped.append(host)
 
 # ---- the tree as plain dicts ---------------------------------------------------------
 #

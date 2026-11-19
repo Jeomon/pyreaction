@@ -156,6 +156,11 @@
     return out;
   }
 
+  // Events whose listeners can block scrolling until they return.
+  const PASSIVE = new Set(["wheel", "touchstart", "touchmove"]);
+  // js() handler code, compiled once however many elements share it.
+  const compiled = new Map();
+
   function listen(el, name, spec) {
     const events = el.__ev || (el.__ev = {});
     // "click:capture" listens to click on the way down, before the target's handlers.
@@ -177,7 +182,12 @@
       send([s, el.__id, name, data]);
     };
     // A js() handler runs here and sends nothing.
-    const local = code ? new Function("event", "element", code) : null;
+    // A js() handler runs here and sends nothing; one function per distinct code.
+    let local = null;
+    if (code) {
+      local = compiled.get(code);
+      if (!local) compiled.set(code, (local = new Function("event", "element", code)));
+    }
     const handler = (e) => {
       // Other keys stay entirely in the browser: not sent, default not prevented.
       if (keys && !keys.includes(e.key)) return;
@@ -226,7 +236,11 @@
       } else fire(data, e);
     };
     events[name] = handler;
-    el.addEventListener(type, handler, capture);
+    // A wheel or touch listener that cannot cancel the event is passive, so the browser
+    // scrolls at once instead of waiting for it (as React does). One that prevents the
+    // default, or runs js() code that might, stays active.
+    const passive = PASSIVE.has(type) && !preventDefault && !code;
+    el.addEventListener(type, handler, passive ? { capture, passive } : capture);
   }
 
   // ---- JavaScript components -------------------------------------------------------

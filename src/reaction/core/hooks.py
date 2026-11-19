@@ -75,17 +75,30 @@ def active_root() -> Any:
         raise RuntimeError("only callable while a page renders, or from its event handlers and effects")
     return root
 
-_PRIMITIVES = (int, float, str, bytes, bool, type(None), tuple, frozenset)
+_SCALARS = (int, float, str, bytes, bool, type(None), frozenset)
 
 
 def same(a: Any, b: Any) -> bool:
     """Whether a state change can be skipped: identity, or equality for immutable values.
 
     Mutable containers compare by identity, as in React: mutate-and-set does not re-render.
+    A tuple is compared item by item with the same rule, so a rebuilt tuple of plain
+    values is equal while one holding elements or lists is equal only if those are the
+    same objects: ``==`` on elements would ignore new event handlers, and compares whole
+    trees.
     """
     if a is b:
         return True
-    if type(a) is type(b) and isinstance(a, _PRIMITIVES):
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, tuple):
+        if len(a) != len(b):
+            return False
+        for x, y in zip(a, b):
+            if x is not y and not same(x, y):
+                return False
+        return True
+    if isinstance(a, _SCALARS):
         try:
             return bool(a == b)
         except Exception:
@@ -96,7 +109,10 @@ def same(a: Any, b: Any) -> bool:
 def _deps_changed(old: Sequence[Any] | None, new: Sequence[Any] | None) -> bool:
     if old is None or new is None or len(old) != len(new):
         return True
-    return any(not same(a, b) for a, b in zip(old, new))
+    for a, b in zip(old, new):
+        if a is not b and not same(a, b):
+            return True
+    return False
 
 
 def _slot(kind: Callable[..., T], *args: Any) -> tuple[T, bool]:
@@ -225,7 +241,7 @@ def use_callback(fn: T, deps: Sequence[Any] | None = None) -> T:
 
 
 class EffectSlot:
-    __slots__ = ("node", "fn", "deps", "cleanup", "ran")
+    __slots__ = ("node", "fn", "deps", "cleanup", "ran", "before")
 
     def __init__(self, node: ComponentNode) -> None:
         self.node = node
@@ -233,6 +249,9 @@ class EffectSlot:
         self.deps: Sequence[Any] | None = None
         self.cleanup: Callable[[], Any] | None = None
         self.ran = False  # StrictMode sets up, cleans up and sets up again the first time
+        # (fn, deps) before this render queued it: a render that is thrown away and
+        # run again (it set its own state) puts them back, so the rerun decides.
+        self.before: tuple[Any, Any] = (None, None)
 
 
 def use_effect(fn: Callable[[], Any], deps: Sequence[Any] | None = None) -> None:
@@ -244,6 +263,7 @@ def use_effect(fn: Callable[[], Any], deps: Sequence[Any] | None = None) -> None
     """
     slot, new = _slot(EffectSlot)
     if new or deps is None or _deps_changed(slot.deps, deps):
+        slot.before = (slot.fn, slot.deps)
         slot.fn = fn
         slot.deps = None if deps is None else tuple(deps)
         slot.node.pending_effects.append(slot)

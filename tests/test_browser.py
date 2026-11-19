@@ -765,3 +765,48 @@ def test_elements_holding_their_own_text_hydrate_and_update_in_chrome(page):
         page.click("#inc")
         page.wait_for_function(f"{cell}.innerHTML === '<b>bold 3</b> tail'")
         assert page.evaluate("document.querySelectorAll('td')[2].textContent") == "x < y"
+
+
+def test_scroll_listeners_are_passive_unless_they_may_cancel_in_chrome(page):
+    @component
+    def App():
+        return html.div(
+            html.div("plain", id="plain", on_wheel=lambda: None, on_touch_move=lambda: None),
+            html.div("cancels", id="cancels", on_wheel=event(lambda: None, prevent_default=True)),
+            html.div("js", id="js", on_wheel=js("element.dataset.seen = 1")),
+            html.button("click", id="click", on_click=lambda: None),
+        )
+
+    # Record each listener's options as the client script adds it.
+    page.add_init_script("""
+        window.__listeners = [];
+        const add = EventTarget.prototype.addEventListener;
+        EventTarget.prototype.addEventListener = function (type, fn, options) {
+          if (this.id) window.__listeners.push([this.id, type, typeof options === "object" && !!options.passive]);
+          return add.call(this, type, fn, options);
+        };
+    """)
+    with serve(App) as server:
+        open_page(page, server)
+        listeners = page.evaluate("window.__listeners")
+        assert ["plain", "wheel", True] in listeners and ["plain", "touchmove", True] in listeners
+        assert ["cancels", "wheel", False] in listeners, "prevent_default needs an active listener"
+        assert ["js", "wheel", False] in listeners, "js() code might call preventDefault"
+        assert ["click", "click", False] in listeners
+
+
+def test_js_handlers_with_the_same_code_compile_once_in_chrome(page):
+    @component
+    def App():
+        return html.ul([html.li(str(i), id=f"li{i}", on_click=js("element.dataset.hit = 1")) for i in range(50)])
+
+    page.add_init_script("""
+        window.__compiles = 0;
+        const Real = Function;
+        window.Function = function (...args) { window.__compiles++; return Real(...args); };
+    """)
+    with serve(App) as server:
+        open_page(page, server)
+        assert page.evaluate("window.__compiles") == 1
+        page.click("#li7")
+        assert page.get_attribute("#li7", "data-hit") == "1"
