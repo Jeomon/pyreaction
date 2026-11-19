@@ -39,7 +39,9 @@ redis = ["redis>=5"]
 [dependency-groups]
 dev = [
     "fakeredis>=2.20",
+    "fastapi>=0.115",
     "httpx2>=2.16.2",
+    "itsdangerous>=2",
     "mypy>=2.4.1",
     "playwright>=1.50",
     "pytest>=8",

@@ -56,7 +56,9 @@ def Link(*children: Any, to: str, replace: bool = False, **props: Any) -> Elemen
 
     Ctrl/Cmd-click and middle-click still open it in a new tab.
     """
-    return html.a(*children, href=to, data_pyreaction_link="replace" if replace else "push", **props)
+    node = CURRENT.get()
+    href = node.root.location.href(to) if node is not None else to  # under a mount: its prefix first
+    return html.a(*children, href=href, data_pyreaction_link="replace" if replace else "push", **props)
 
 
 @component

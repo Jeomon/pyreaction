@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - depends on the optional extra
     def _dumps(data: Any) -> str:
         return _encoder.encode(data)
 
-__all__ = ["create_app", "embed", "prerender", "run"]
+__all__ = ["create_app", "embed", "mount", "prerender", "run"]
 
 logger = logging.getLogger("reaction")
 
@@ -123,6 +123,28 @@ async def _stream_page(
         yield parts[1]
     finally:
         root.close()
+
+
+def _app_path(scope: Any) -> tuple[str, str]:
+    """(where the app is mounted, the path within it). Under ``Mount("/ui", ...)``
+    a request for /ui/users/7 is ("/ui", "/users/7")."""
+    base = scope.get("root_path", "").rstrip("/")
+    path = scope.get("path", "/")
+    if base and (path == base or path.startswith(base + "/")):
+        path = path[len(base):] or "/"
+    return base, path
+
+
+class _MountableApp(Starlette):
+    """A Starlette app that, when mounted in another (FastAPI, Starlette), leaves
+    ``request.app`` as that host app, so components reach its ``app.state``."""
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if "app" not in scope:
+            scope["app"] = self
+        if self.middleware_stack is None:
+            self.middleware_stack = self.build_middleware_stack()
+        await self.middleware_stack(scope, receive, send)
 
 
 def _origin_allowed(conn: HTTPConnection, allowed: Sequence[str]) -> bool:
@@ -334,12 +356,14 @@ def create_app(
     """
     make = _as_factory(app)
 
-    def new_root(url: str, connection: Any) -> Root:
+    def new_root(url: str, connection: Any, base: str = "") -> Root:
         def report(exc: BaseException, where: str) -> None:
             if on_error is not None:
                 on_error(exc, where, root.connection)
 
-        root = Root(make(), location=url, connection=connection, debug=debug, threaded=threaded, on_error=report)
+        root = Root(
+            make(), location=url, connection=connection, debug=debug, threaded=threaded, on_error=report, base=base
+        )
         return root
 
     # Pages whose connection dropped, kept for a reconnect: id -> (root, expiry timer).
@@ -356,8 +380,9 @@ def create_app(
             discard(entry[0])
 
     async def page(request: Request) -> Response:
-        url = request.url.path + (f"?{request.url.query}" if request.url.query else "")
-        root = new_root(url, request)
+        base, path = _app_path(request.scope)
+        url = path + (f"?{request.url.query}" if request.url.query else "")
+        root = new_root(url, request, base)
         handed_off = False
         try:
             loop = asyncio.get_running_loop()
@@ -366,7 +391,7 @@ def create_app(
             if not await root.settle(data_timeout, suspense=not stream):
                 logger.warning("Rendering %s before its data loaded (data_timeout=%ss)", url, data_timeout)
             if root.redirect is not None:
-                return RedirectResponse(root.redirect, status_code=307)
+                return RedirectResponse(root.location.href(root.redirect), status_code=307)
             boundaries: dict[Any, int] = {}
             body = render_to_string(root, boundaries if stream else None)
             portals = render_portals(root, boundaries if stream else None)
@@ -387,6 +412,7 @@ def create_app(
                 portals=portals,
                 stream=_STREAM_SPLIT,
                 base=escape(root_path + prefix),
+                app_base=escape(base),
                 reconnect_max=int(reconnect_max),
             ).split(_STREAM_SPLIT)
             waiting = {n for node, n in boundaries.items() if node.waiting}
@@ -412,8 +438,17 @@ def create_app(
             return
         await ws.accept()
         url = ws.query_params.get("p", "/")
-        if not url.startswith("/"):
+        if not url.startswith("/") or url.startswith("//"):
             url = "/"
+        # The page says where the app is mounted (not the socket's own mount: an
+        # embedded app sees the host page's URL).
+        base = ws.query_params.get("b", "").rstrip("/")
+        if base and (not base.startswith("/") or base.startswith("//")):
+            base = ""
+        if base and (url == base or url.startswith(base + "/") or url.startswith(base + "?")):
+            url = url[len(base):] or "/"
+            if url.startswith("?"):
+                url = "/" + url
         outbox = _Outbox(max_pending_ops)
         root: Root | None = None
         uploads: _Uploads | None = None
@@ -444,7 +479,7 @@ def create_app(
                 root.set_location(url)
                 root.attach(send, hydrate=True)
             else:
-                root = new_root(url, ws)
+                root = new_root(url, ws, base)
                 # Load data as the page's HTML did, so this render matches it and the
                 # browser can adopt the HTML instead of rebuilding it.
                 await root.settle(data_timeout)
@@ -485,7 +520,35 @@ def create_app(
     if static_dir is not None:
         table.append(Mount(static_path, StaticFiles(directory=static_dir), name="static"))
     table += [Route("/", page), Route("/{path:path}", page)]
-    return Starlette(debug=debug, routes=table)
+    return _MountableApp(debug=debug, routes=table)
+
+
+def mount(
+    host: Any,
+    app: Component | Element | Callable[[], Element],
+    path: str = "/",
+    **options: Any,
+) -> Starlette:
+    """Serve ``app`` inside an existing FastAPI or Starlette app ``host``, at ``path``.
+
+    At ``"/"`` the pages take every URL the host's own routes do not, whatever order
+    the routes are defined in, so ``/api/...`` keeps working. Elsewhere
+    (``mount(api, App, "/ui")``) it is a normal sub-app: the components see paths
+    inside it (``/users/7`` for ``/ui/users/7``) and links, redirects and static
+    files get the prefix. Components reach the host through ``use_request()``:
+    ``.app.state``, ``.state`` (lifespan state), ``.session``, ``.cookies``.
+    ``options`` go to :func:`create_app`. Returns the pyreaction ASGI app.
+    """
+    asgi = create_app(app, **options)
+    if path.rstrip("/") == "":
+        router = getattr(host, "router", host)
+        if not hasattr(router, "default"):
+            raise TypeError("mount() needs a FastAPI or Starlette app")
+        # Called when none of the host's routes match.
+        router.default = asgi
+    else:
+        host.mount(path.rstrip("/"), asgi)
+    return asgi
 
 
 def run(

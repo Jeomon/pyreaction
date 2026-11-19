@@ -506,12 +506,38 @@ complete version.
 ## Serving
 
 `run(App, host=, port=, ...)` starts uvicorn; other options go to `create_app`.
-`create_app(App, ...)` returns the Starlette app, to mount in FastAPI or any ASGI
-server:
+`create_app(App, ...)` returns the ASGI app (a Starlette app) for any ASGI server.
+
+### With FastAPI
+
+`mount` serves the pages inside a FastAPI (or Starlette) app, next to its API:
 
 ```python
-api.mount("/ui", create_app(App, static_dir="public", stylesheets=["app.css"]))
+from fastapi import FastAPI
+from reaction import mount
+
+api = FastAPI()
+
+@api.get("/api/todos")
+def todos(): ...
+
+mount(api, App)                                # pages at /, the API keeps /api and /docs
+mount(api, App, "/ui", static_dir="public")    # or pages under /ui
 ```
+
+Run it as usual: `uvicorn main:api`. At `"/"` the pages answer every URL the
+host's routes do not, whatever order they are defined in. Under a path, the
+components see paths inside it (`use_location().path` is `/users/7` for
+`/ui/users/7`), and links, redirects, static files, resource hints and
+JavaScript modules get the prefix. `api.mount("/ui", create_app(App))` does
+the same as `mount(api, App, "/ui")`.
+
+Components reach the FastAPI app through `use_request()`: `request.app` is the
+FastAPI app (`request.app.state`), `request.state` holds what the lifespan
+yielded, and `request.session` and `request.cookies` work with FastAPI's
+middleware. FastAPI's `Depends` does not apply to components; share database
+pools and settings through `app.state` or the lifespan. `examples/fastapi_app.py`
+is a complete app.
 
 Options: `title`, `head`, `lang`, `static_dir`, `static_path`, `stylesheets`,
 `routes` (extra Starlette routes), `data_timeout`, `stream`, `max_upload_size`,

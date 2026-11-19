@@ -22,7 +22,11 @@ def _attrs(**values: Any) -> dict[str, str]:
 
 
 def _add(key: tuple[str, str], tag: str, attrs: dict[str, str]) -> None:
-    active_root().add_resource(key, Element(tag, None, attrs))
+    root = active_root()
+    for name in ("href", "src"):  # "/static/x" is inside the app, also under a mount
+        if name in attrs:
+            attrs[name] = root.location.href(attrs[name])
+    root.add_resource(key, Element(tag, None, attrs))
 
 
 def prefetch_dns(href: str) -> None:

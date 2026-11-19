@@ -421,3 +421,60 @@ def test_flush_sync_form_reset_and_transition_types_in_chrome(page):
         page.wait_for_function("document.querySelector('#status').textContent === 'saved'")
         page.wait_for_function("document.querySelector('#q').value === 'start'")
         assert ["done"] in page.evaluate("window.__types")
+
+
+def test_fastapi_app_with_pages_under_ui_in_chrome(page):
+    from fastapi import FastAPI
+
+    from reaction import Link, Navigate, Router, js_component, mount, use_location
+
+    Bars = js_component("/static/bars.js", "mount")
+
+    @component
+    def Home():
+        return html.div(
+            html.p(f"at {use_location().path}", id="at"),
+            Link("user 7", to="/users/7", id="to-user"),
+            Link("old link", to="/old", id="to-old"),
+            Bars(values=[2, 4], color="teal"),
+        )
+
+    @component
+    def User(id):
+        n, set_n = use_state(0)
+        return html.div(html.p(f"user {id}", id="user"), html.button(f"n={n}", id="inc", on_click=lambda: set_n(n + 1)))
+
+    @component
+    def App():
+        return Router({"/": Home, "/users/{id}": User, "/old": lambda: Navigate("/users/1")})
+
+    api = FastAPI()
+
+    @api.get("/api/hello")
+    def hello():
+        return {"hello": "world"}
+
+    mount(api, App, "/ui", static_dir=STATIC)
+    with serve(api, asgi=True) as server:
+        assert page.request.get(server.url + "/api/hello").json() == {"hello": "world"}
+        page.goto(server.url + "/ui/")
+        page.wait_for_selector(server.READY, state="attached")
+        assert page.text_content("#at") == "at /"
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+        page.wait_for_selector("main button[title], div button[title]")  # bars.js loaded from /ui/static
+        page.click("#to-user")
+        page.wait_for_selector("#user")
+        assert page.text_content("#user") == "user 7"
+        assert page.evaluate("location.pathname") == "/ui/users/7"
+        page.click("#inc")
+        page.wait_for_function("document.querySelector('#inc').textContent === 'n=1'")
+        page.go_back()
+        page.wait_for_selector("#at")
+        assert page.evaluate("location.pathname") == "/ui/"
+        page.click("#to-old")  # a live Navigate keeps the prefix
+        page.wait_for_selector("#user")
+        assert page.evaluate("location.pathname") == "/ui/users/1"
+        page.reload()  # served directly at its own URL
+        page.wait_for_selector(server.READY, state="attached")
+        assert page.text_content("#user") == "user 1"
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"

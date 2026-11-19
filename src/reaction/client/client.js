@@ -6,6 +6,9 @@
   const script = document.currentScript;
   const mount = document.getElementById(script.dataset.mount || "pyreaction-root");
   const wsPath = script.dataset.ws;
+  // Where the app is mounted ("/ui"), or "" at the root of the site. The server
+  // works with paths inside the app; the browser shows them with this in front.
+  const base = (script.dataset.base || "").replace(/\/$/, "");
 
   // Set as DOM properties: they hold live state, which attributes do not.
   const PROPS = new Set(["value", "checked", "selected", "indeterminate", "muted"]);
@@ -229,7 +232,7 @@
       const payload = data !== null && typeof data === "object" && !Array.isArray(data) ? data : { value: data };
       send([++seq, el.__id, name, payload]);
     };
-    import(new URL(module, location.href).href)
+    import(new URL(toBrowser(module), location.href).href) // "/static/x.js" is inside the app
       .then((mod) => {
         if (state.gone) return;
         const mountFn = mod[exportName];
@@ -484,7 +487,15 @@
 
   // ---- navigation ----------------------------------------------------------------
 
-  const here = () => location.pathname + location.search;
+  // The page's URL as the browser shows it, and as the app sees it (without base).
+  const browserHere = () => location.pathname + location.search;
+  const here = () => {
+    const path = location.pathname;
+    const inside = base && (path === base || path.startsWith(base + "/")) ? path.slice(base.length) || "/" : path;
+    return inside + location.search;
+  };
+  // An app path from the server ("/users/7"), as the browser needs it.
+  const toBrowser = (to) => (base && to.startsWith("/") && !to.startsWith("//") ? base + to : to);
 
   function navigated() {
     send([++seq, 0, "#navigate", { to: here() }]);
@@ -497,7 +508,7 @@
     if (a.target && a.target !== "_self") return;
     const url = new URL(a.href, location.href);
     if (url.origin !== location.origin) return;
-    if (url.pathname + url.search === here() && url.hash) return; // in-page anchor
+    if (url.pathname + url.search === browserHere() && url.hash) return; // in-page anchor
     e.preventDefault();
     if (a.dataset.pyreactionLink === "replace") history.replaceState(null, "", url);
     else {
@@ -512,14 +523,14 @@
   function followServer(nav) {
     if (nav.reload) {
       // A full load, so the server sees new cookies (after login or logout).
-      if (nav.replace) location.replace(nav.to);
-      else location.assign(nav.to);
+      if (nav.replace) location.replace(toBrowser(nav.to));
+      else location.assign(toBrowser(nav.to));
       return;
     }
     if (nav.to === here()) return;
-    if (nav.replace) history.replaceState(null, "", nav.to);
+    if (nav.replace) history.replaceState(null, "", toBrowser(nav.to));
     else {
-      history.pushState(null, "", nav.to);
+      history.pushState(null, "", toBrowser(nav.to));
       scrollTo(0, 0);
     }
   }
@@ -589,6 +600,7 @@
     const url = new URL(wsPath, location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("p", here());
+    if (base) url.searchParams.set("b", base);
     // Offer to adopt what is on the page: the server's HTML, or the last session's tree.
     if (mount.firstChild) url.searchParams.set("h", "1");
     // Ask to resume the last session, which the server keeps for a while.

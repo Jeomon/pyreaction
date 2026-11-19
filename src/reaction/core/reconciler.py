@@ -257,14 +257,24 @@ class UploadedFile:
 
 
 class Location:
-    """The page's path and query string, as the browser shows them."""
+    """The page's path and query string, as the app sees them. When the app is
+    mounted under a path (``api.mount("/ui", create_app(App))``), ``path`` leaves
+    that prefix out and ``base`` holds it: the browser shows ``base + path``."""
 
-    __slots__ = ("path", "search")
+    __slots__ = ("path", "search", "base")
 
-    def __init__(self, url: str = "/") -> None:
+    def __init__(self, url: str = "/", base: str = "") -> None:
         path, sep, query = url.partition("?")
         self.path = path or "/"
         self.search = sep + query if query else ""
+        self.base = base
+
+    def href(self, to: str) -> str:
+        """The URL the browser needs for the app's own path ``to`` (``/static/logo.png``
+        or ``/users/7``): with the mount prefix in front. Other URLs are returned as is."""
+        if to.startswith("/") and not to.startswith("//"):
+            return self.base + to
+        return to
 
     @property
     def query(self) -> dict[str, str]:
@@ -498,11 +508,14 @@ class Root:
         debug: bool = False,
         threaded: bool = True,
         on_error: Callable[[BaseException, str], None] | None = None,
+        base: str = "",
     ) -> None:
         self.container = HostNode(0, Element("#root"), None, None)
         self.hosts: dict[int, HostNode] = {}
         self.ops: list[list[Any]] = []
-        self.location = Location(location)
+        # Where the app is mounted ("/ui"), or "" at the root of the site.
+        self.base = base.rstrip("/")
+        self.location = Location(location, self.base)
         self.connection = connection
         self.debug = debug
         self.threaded = threaded
@@ -1137,7 +1150,7 @@ class Root:
 
     def set_location(self, url: str) -> None:
         """The browser moved to ``url`` (a link or the back button): re-render what reads it."""
-        location = Location(url)
+        location = Location(url, self.base)
         if location == self.location:
             return
         self.location = location
