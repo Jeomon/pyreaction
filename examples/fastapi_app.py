@@ -2,14 +2,16 @@
 
     uv run --with fastapi --with uvicorn uvicorn examples.fastapi_app:api --reload
 
-Then open http://127.0.0.1:8000/ (pages) and http://127.0.0.1:8000/docs (the API).
+Then open http://127.0.0.1:8000/ (pages), http://127.0.0.1:8000/todos/0 (a @page
+route using Depends) and http://127.0.0.1:8000/docs (the API).
 """
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
+from starlette.requests import HTTPConnection
 
-from reaction import Link, Router, component, html, mount, use_request, use_state
+from reaction import Link, Router, component, html, mount, page, use_request, use_state
 
 TODOS = ["Write the API", "Write the pages"]
 
@@ -70,6 +72,30 @@ def App():
     return Router({"/": Todos, "/about": About})
 
 
-# At "/", the pages answer every URL the API routes do not: /api/... and /docs stay
-# FastAPI's. mount(api, App, "/ui") would put them under /ui instead.
+# A page that is a FastAPI route: its function gets Depends and path parameters,
+# on the first load and again when the page goes live.
+def todo_list(conn: HTTPConnection) -> list[str]:
+    return conn.app.state.todos  # HTTPConnection works for the page and its WebSocket
+
+
+@component
+def TodoDetail(index, text, total):
+    return html.main(
+        html.h1(f"Todo {index + 1} of {total}"),
+        html.p(text),
+        html.p(Link("Previous", to=f"/todos/{index - 1}") if index else None, " ",
+               Link("Next", to=f"/todos/{index + 1}") if index + 1 < total else None),
+        Link("All todos", to="/"),
+    )
+
+
+@page(api, "/todos/{index}", title="Todo")
+def todo_detail(index: int, todos: list[str] = Depends(todo_list)):
+    if not 0 <= index < len(todos):
+        raise HTTPException(404, "no such todo")
+    return TodoDetail(index=index, text=todos[index], total=len(todos))
+
+
+# At "/", the pages answer every URL the API routes (and the @page above) do not:
+# /api/... and /docs stay FastAPI's. mount(api, App, "/ui") would put them under /ui.
 mount(api, App, title="FastAPI + pyreaction")

@@ -278,3 +278,107 @@ def test_no_warning_when_mounted_under_a_path(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="reaction"):
         TestClient(api).get("/ui/")
     assert not [r for r in caplog.records if "answers" in r.getMessage()]
+
+
+# ---- @page: FastAPI routes with Depends ---------------------------------------------------
+
+
+def _page_api(log):
+    from typing import Annotated
+
+    from fastapi import Cookie, Depends, HTTPException
+    from starlette.requests import HTTPConnection
+
+    from reaction import page, use_state
+
+    def current_user(conn: HTTPConnection):
+        user = conn.cookies.get("user")
+        if not user:
+            raise HTTPException(401, "sign in")
+        return user
+
+    def get_db():
+        log.append("open")
+        yield {"7": "Pizza", "8": "Sushi"}
+        log.append("close")
+
+    @component
+    def OrderPage(order, user):
+        n, set_n = use_state(0)
+        return html.div(
+            html.p(f"{user} ordered {order} at {use_location().path}"),
+            html.button(f"n={n}", on_click=lambda: set_n(n + 1)),
+        )
+
+    api = FastAPI()
+
+    @api.get("/api/ping")
+    def ping():
+        return {"ok": True}
+
+    @page(api, "/orders/{order_id}", title="Order")
+    def order(order_id: str, user: str = Depends(current_user), db=Depends(get_db)):
+        if order_id not in db:
+            raise HTTPException(404, "no such order")
+        return OrderPage(order=db[order_id], user=user)
+
+    @page(api, "/hello")
+    async def hello(name: Annotated[str | None, Cookie()] = None):
+        return html.p(f"hello {name}")
+
+    return api
+
+
+def test_page_renders_with_dependencies_and_path_params():
+    log = []
+    api = _page_api(log)
+    client = TestClient(api, cookies={"user": "ada", "name": "bob"})
+    body = client.get("/orders/7").text
+    assert "<p>ada ordered Pizza at /orders/7</p>" in body and "<title>Order</title>" in body
+    assert 'src="/orders/7/_pyreaction/client.js"' in body and 'data-ws="/orders/7/_pyreaction/ws"' in body
+    assert 'data-page="/orders/7"' in body
+    assert client.get("/orders/7/_pyreaction/client.js").status_code == 200
+    assert log == ["open", "close"], "a yield dependency closes after the response"
+    assert "<p>hello bob</p>" in client.get("/hello").text, "async function, Cookie parameter"
+    assert list(client.get("/openapi.json").json()["paths"]) == ["/api/ping"], "pages stay out of the schema"
+
+
+def test_page_errors_come_from_dependencies_and_the_function():
+    api = _page_api([])
+    assert TestClient(api).get("/orders/7").status_code == 401
+    assert TestClient(api, cookies={"user": "ada"}).get("/orders/9").status_code == 404
+
+
+def test_page_live_connection_resolves_the_dependencies_again():
+    log = []
+    api = _page_api(log)
+    client = TestClient(api, cookies={"user": "ada"})
+    with client.websocket_connect("/orders/7/_pyreaction/ws?p=/orders/7&h=1") as ws:
+        first = json.loads(ws.receive_text())
+        dom = FakeDom()
+        dom.apply(first["ops"])
+        assert dom.html() == "<div><p>ada ordered Pizza at /orders/7</p><button>n=0</button></div>"
+        assert log == ["open"], "the yield dependency stays open while the page is live"
+        button = next(op[1] for op in first["ops"] if op[0] == "c" and op[2] == "button")
+        ws.send_text(json.dumps([1, button, "click", {}]))
+        dom.apply(json.loads(ws.receive_text())["ops"])
+        assert "<button>n=1</button>" in dom.html()
+    assert log == ["open", "close"]
+    with pytest.raises(Exception):
+        with TestClient(api).websocket_connect("/orders/7/_pyreaction/ws?p=/orders/7") as ws:
+            ws.receive_text()
+
+
+def test_page_rejects_static_dir_and_non_elements():
+    from reaction import page
+
+    api = FastAPI()
+    with pytest.raises(TypeError, match="static"):
+        page(api, "/x", static_dir="public")
+
+    @page(api, "/bad")
+    def bad():
+        return "not an element"
+
+    with pytest.raises(TypeError, match="must return an element"):
+        TestClient(api).get("/bad")

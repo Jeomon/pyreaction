@@ -478,3 +478,51 @@ def test_fastapi_app_with_pages_under_ui_in_chrome(page):
         page.wait_for_selector(server.READY, state="attached")
         assert page.text_content("#user") == "user 1"
         assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+
+
+def test_fastapi_page_routes_in_chrome(page):
+    from fastapi import Depends, FastAPI
+    from starlette.requests import HTTPConnection
+
+    from reaction import Link, page as pyreaction_page, use_location
+
+    def current_user(conn: HTTPConnection):
+        return conn.cookies.get("user", "guest")
+
+    api = FastAPI()
+
+    @pyreaction_page(api, "/orders/{order_id}")
+    def order(order_id: str, user: str = Depends(current_user)):
+        return Order(order_id=order_id, user=user)
+
+    @component
+    def Order(order_id, user):
+        n, set_n = use_state(0)
+        return html.div(
+            html.p(f"{user}: order {order_id} {use_location().search}", id="title"),
+            html.button(f"n={n}", id="inc", on_click=lambda: set_n(n + 1)),
+            Link("sorted", to=f"/orders/{order_id}?sort=price", id="same"),
+            Link("next order", to="/orders/8", id="other"),
+        )
+
+    with serve(api, asgi=True) as server:
+        page.context.add_cookies([{"name": "user", "value": "ada", "url": server.url}])
+        open_page(page, server, "/orders/7")
+        assert page.text_content("#title").strip() == "ada: order 7"
+        assert page.get_attribute("#pyreaction-root", "data-hydration") == "adopted"
+        page.click("#inc")
+        page.wait_for_function("document.querySelector('#inc').textContent === 'n=1'")
+        page.evaluate("window.__same_document = true")
+        page.click("#same")  # same path, new query: stays live, keeps state
+        page.wait_for_function("document.querySelector('#title').textContent.includes('?sort=price')")
+        assert page.evaluate("window.__same_document") is True
+        assert page.text_content("#inc") == "n=1"
+        page.click("#other")  # another @page URL: a full page load
+        page.wait_for_function("location.pathname === '/orders/8'")
+        page.wait_for_selector(server.READY, state="attached")
+        assert page.text_content("#title").strip() == "ada: order 8"
+        assert page.evaluate("window.__same_document === undefined")
+        page.go_back()
+        page.wait_for_function("location.pathname === '/orders/7'")
+        page.wait_for_selector("#title")
+        assert "order 7" in page.text_content("#title")

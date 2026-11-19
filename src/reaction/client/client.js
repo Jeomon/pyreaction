@@ -9,6 +9,11 @@
   // Where the app is mounted ("/ui"), or "" at the root of the site. The server
   // works with paths inside the app; the browser shows them with this in front.
   const base = (script.dataset.base || "").replace(/\/$/, "");
+  // Set when the page is a FastAPI @page route: it shows that one path, and other
+  // paths are other pages, which the browser loads itself.
+  const pagePath = script.dataset.page || "";
+  const leavesPage = (pathname) =>
+    pagePath !== "" && pathname.replace(/\/$/, "") !== pagePath.replace(/\/$/, "");
 
   // Set as DOM properties: they hold live state, which attributes do not.
   const PROPS = new Set(["value", "checked", "selected", "indeterminate", "muted"]);
@@ -508,6 +513,7 @@
     if (a.target && a.target !== "_self") return;
     const url = new URL(a.href, location.href);
     if (url.origin !== location.origin) return;
+    if (leavesPage(url.pathname)) return; // another @page: the browser loads it
     if (url.pathname + url.search === browserHere() && url.hash) return; // in-page anchor
     e.preventDefault();
     if (a.dataset.pyreactionLink === "replace") history.replaceState(null, "", url);
@@ -518,7 +524,10 @@
     navigated();
   });
 
-  addEventListener("popstate", navigated);
+  addEventListener("popstate", () => {
+    if (leavesPage(location.pathname)) location.reload();
+    else navigated();
+  });
 
   function followServer(nav) {
     if (nav.reload) {
@@ -528,6 +537,12 @@
       return;
     }
     if (nav.to === here()) return;
+    if (leavesPage(new URL(toBrowser(nav.to), location.href).pathname)) {
+      // A @page shows one route; another URL is another page, loaded afresh.
+      if (nav.replace) location.replace(toBrowser(nav.to));
+      else location.assign(toBrowser(nav.to));
+      return;
+    }
     if (nav.replace) history.replaceState(null, "", toBrowser(nav.to));
     else {
       history.pushState(null, "", toBrowser(nav.to));

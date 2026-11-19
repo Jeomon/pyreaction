@@ -535,9 +535,10 @@ the same as `mount(api, App, "/ui")`.
 Components reach the FastAPI app through `use_request()`: `request.app` is the
 FastAPI app (`request.app.state`), `request.state` holds what the lifespan
 yielded, and `request.session` and `request.cookies` work with FastAPI's
-middleware. FastAPI's `Depends` does not apply to components; share database
-pools and settings through `app.state` or the lifespan. `examples/fastapi_app.py`
-is a complete app.
+middleware. Components cannot use FastAPI's `Depends` themselves; share database
+pools and settings through `app.state` or the lifespan, or make the page a
+`@page` route (below), whose function can. `examples/fastapi_app.py` is a
+complete app.
 
 `raise HTTPException(...)` in a component works as in a route: the first
 response gets its status and headers (a 3xx with a `Location` header redirects),
@@ -547,6 +548,41 @@ and the nearest `ErrorBoundary` shows its fallback with the exception
 If the FastAPI app already serves `/static`, pages mounted at `/` cannot use that
 path for their own files; pyreaction logs a warning on the first request. Pass
 `static_path="/assets"`, or mount the pages under a path.
+
+#### Pages with `Depends`
+
+`page` turns a FastAPI route into a pyreaction page, so its function can use
+`Depends`, path and query parameters and `Cookie` like any route:
+
+```python
+from fastapi import Depends
+from starlette.requests import HTTPConnection
+from reaction import page
+
+def current_user(conn: HTTPConnection):        # HTTPConnection, not Request (see below)
+    ...
+
+@page(api, "/orders/{order_id}", title="Order")
+def order(order_id: int, user=Depends(current_user), db=Depends(get_db)):
+    return OrderPage(order=db.order(order_id, user))
+```
+
+FastAPI resolves the parameters when the page loads and again when its live
+connection opens, so both renders get the same values; an `HTTPException` from a
+dependency or the function gives that status. A dependency with `yield` (a
+database session) stays open while the page is live. The function may be
+`async`; a plain one runs in a worker thread.
+
+The live connection is a WebSocket, so there is no `Request` there: write
+dependencies that read cookies, headers or `.state` with `HTTPConnection`, which
+FastAPI fills in for both (a dependency typed `Request` fails on the WebSocket).
+Browsers cannot add headers to a WebSocket, so log in with cookies, not an
+`Authorization` header.
+
+Each `@page` shows one route: links to other URLs load them afresh, while a new
+query string on the same path stays live. For a whole app with its own routing,
+use `mount`. Pages are left out of the OpenAPI schema, and `@page` does not serve
+static files (mount them on the FastAPI app).
 
 Checked against FastAPI 0.165: routers and OpenAPI, a proxy root path
 (`fastapi run --root-path`), CORS, TrustedHost, GZip and `@api.middleware("http")`

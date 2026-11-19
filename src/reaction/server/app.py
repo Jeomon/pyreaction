@@ -10,11 +10,13 @@ requests and any worker process can serve either one.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
 import secrets
 import tempfile
+from contextvars import ContextVar
 from collections.abc import AsyncIterator, Callable, Sequence
 from html import escape
 from pathlib import Path
@@ -45,7 +47,7 @@ except ImportError:  # pragma: no cover - depends on the optional extra
     def _dumps(data: Any) -> str:
         return _encoder.encode(data)
 
-__all__ = ["create_app", "embed", "mount", "prerender", "run"]
+__all__ = ["create_app", "embed", "mount", "page", "prerender", "run"]
 
 logger = logging.getLogger("reaction")
 
@@ -453,8 +455,10 @@ def create_app(
                 body=body,
                 portals=portals,
                 stream=_STREAM_SPLIT,
-                base=escape(root_path + prefix),
+                # @page routes serve the script and socket next to their own URL.
+                base=escape(request.scope.get(_SCRIPT_BASE, root_path + prefix)),
                 app_base=escape(base),
+                page=escape(request.scope.get(_PAGE_PATH, "")),
                 reconnect_max=int(reconnect_max),
             ).split(_STREAM_SPLIT)
             waiting = {n for node, n in boundaries.items() if node.waiting}
@@ -593,6 +597,124 @@ def mount(
     else:
         host.mount(path.rstrip("/"), asgi)
     return asgi
+
+
+# Scope keys a @page route sets for its pyreaction app: where the browser finds the
+# script and socket (next to the page's own URL), and the page's path, outside which
+# links load the page afresh.
+_SCRIPT_BASE = "reaction.script_base"
+_PAGE_PATH = "reaction.page_path"
+# The element a @page function returned, for the pyreaction app to render.
+_PAGE_ELEMENT: ContextVar[Element | None] = ContextVar("reaction_page_element", default=None)
+
+
+def _page_element() -> Element:
+    element = _PAGE_ELEMENT.get()
+    if element is None:
+        raise RuntimeError("a @page app was called outside its route")
+    return element
+
+
+class _PageResponse(Response):
+    """What a @page GET route returns: renders the element as a pyreaction page."""
+
+    def __init__(self, app: Any, element: Element) -> None:
+        self.app = app
+        self.element = element
+        self.background = None
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        base, path = _app_path(scope)
+        url = (base + path).rstrip("/") or ""
+        inner = {**scope, _SCRIPT_BASE: url + "/_pyreaction", _PAGE_PATH: base + path}
+        token = _PAGE_ELEMENT.set(self.element)
+        try:
+            await self.app(inner, receive, send)
+        finally:
+            _PAGE_ELEMENT.reset(token)
+
+
+def page(host: Any, path: str, **options: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """A FastAPI route whose function returns a pyreaction page, with ``Depends``::
+
+        @page(api, "/orders/{order_id}")
+        def order(order_id: int, user: User = Depends(current_user), db=Depends(get_db)):
+            return OrderPage(order=db.order(order_id, user))
+
+    FastAPI resolves the function's parameters (path and query parameters,
+    ``Depends``, ``Cookie``...) when the page is loaded, and again when its live
+    connection opens, so both renders get the same values. A dependency with
+    ``yield`` stays open while the page is live. The function may be ``async``;
+    a plain one runs in a worker thread, as FastAPI runs routes.
+
+    On the live connection there is no ``Request``: dependencies that need the
+    connection should take ``HTTPConnection`` (cookies, headers, ``.state``,
+    ``.session``, ``.user``), which FastAPI fills in for both. Browsers cannot add
+    headers to a WebSocket, so use cookies for login, not ``Authorization``.
+
+    Each @page is its own page: links to other URLs load them afresh. Within it,
+    the query string can change without a reload. ``options`` go to
+    :func:`create_app`, except ``static_dir``: serve static files from the host app
+    (``mount`` or ``StaticFiles``). The page is left out of the OpenAPI schema.
+    """
+    from fastapi import WebSocket
+    from fastapi.requests import Request as FastAPIRequest
+    from starlette.concurrency import run_in_threadpool
+
+    if "static_dir" in options:
+        raise TypeError("@page does not serve static files; mount them on the app itself")
+    sub_app = create_app(_page_element, **options)
+    route = "/" + path.strip("/") if path.strip("/") else "/"
+    under = route.rstrip("/")
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        signature = inspect.signature(fn, eval_str=True)
+        params = [
+            p.replace(kind=inspect.Parameter.KEYWORD_ONLY)
+            for p in signature.parameters.values()
+            if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        ]
+
+        async def element_of(values: dict[str, Any]) -> Element:
+            if inspect.iscoroutinefunction(fn):
+                result = await fn(**values)
+            else:
+                result = await run_in_threadpool(fn, **values)
+            if not isinstance(result, Element):
+                raise TypeError(f"@page function {fn.__name__} must return an element, got {type(result).__name__}")
+            return result
+
+        async def http_endpoint(_reaction_conn: Any, **values: Any) -> Response:
+            return _PageResponse(sub_app, await element_of(values))
+
+        async def ws_endpoint(_reaction_conn: Any, **values: Any) -> None:
+            element = await element_of(values)
+            scope = dict(_reaction_conn.scope)
+            root = scope.get("root_path", "")
+            scope["path"] = root + "/_pyreaction/ws"
+            scope["raw_path"] = scope["path"].encode()
+            token = _PAGE_ELEMENT.set(element)
+            try:
+                await sub_app(scope, _reaction_conn._receive, _reaction_conn._send)
+            finally:
+                _PAGE_ELEMENT.reset(token)
+
+        async def client_js(request: Request) -> FileResponse:
+            return FileResponse(CLIENT_JS, media_type="text/javascript", headers={"Cache-Control": "no-cache"})
+
+        def with_conn(endpoint: Any, kind: Any) -> Any:
+            conn = inspect.Parameter("_reaction_conn", inspect.Parameter.KEYWORD_ONLY, annotation=kind)
+            endpoint.__signature__ = inspect.Signature([conn, *params])
+            endpoint.__name__ = fn.__name__
+            return endpoint
+
+        host.add_api_route(route, with_conn(http_endpoint, FastAPIRequest), methods=["GET"],
+                           include_in_schema=False, name=fn.__name__)
+        host.add_api_websocket_route(under + "/_pyreaction/ws", with_conn(ws_endpoint, WebSocket))
+        host.add_api_route(under + "/_pyreaction/client.js", client_js, methods=["GET"], include_in_schema=False)
+        return fn
+
+    return decorate
 
 
 def run(
