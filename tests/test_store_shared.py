@@ -124,3 +124,36 @@ def test_unchanged_writes_are_skipped_and_a_name_is_required(backends):
     assert seen == []
     with pytest.raises(TypeError):
         Store(0, backend=backends())
+
+
+def test_an_unmounted_reader_leaves_the_store_and_is_never_run_again():
+    """The store's refresh loop relies on this: it does not check whether a reader is
+    still mounted, because unmounting removes the reader."""
+    from reaction import Root, Store, component, html, use_state, use_store
+
+    store = Store(0)
+    calls = []
+    setters = {}
+
+    @component
+    def Reader(i):
+        value = use_store(store, lambda v: (calls.append(i), v)[1])
+        return html.li(f"{i}:{value}")
+
+    @component
+    def App():
+        shown, set_shown = use_state([0, 1, 2])
+        setters["shown"] = set_shown
+        return html.ul([Reader(i, key=i) for i in shown])
+
+    root = Root(App())
+    assert len(store._readers[root]) == 3
+    setters["shown"]([0, 2])
+    root.flush()
+    assert len(store._readers[root]) == 2, "the unmounted reader left"
+    calls.clear()
+    store.set(5)
+    root.flush()
+    assert set(calls) == {0, 2}, "only mounted readers' selectors ran (again when they re-render)"
+    root.close()
+    assert root not in store._readers, "a closed page leaves no readers"

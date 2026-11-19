@@ -24,7 +24,7 @@ logger = logging.getLogger("reaction")
 
 # One page's components reading a store (a module-level name: inside Store, `set`
 # would mean Store.set).
-_Readers = set["_StoreSlot"]
+_Readers = dict["_StoreSlot", None]
 
 
 class StoreBackend(Protocol):
@@ -165,28 +165,33 @@ class Store(Generic[T]):
     def _refresh(self, readers: _Readers) -> None:
         """On a page's event loop: re-render the readers whose selected value changed."""
         value = self._value
+        # Every reader here is mounted: unmounting disposes its slot, which leaves
+        # the readers, and schedule() ignores a node that is gone. So a reader's
+        # node is touched only when its value changed: the loop over thousands of
+        # rows reads the slots alone.
         for slot in list(readers):
-            node = slot.node
-            if not node.mounted:
-                continue
+            selector = slot.selector
             try:
-                selected = value if slot.selector is None else slot.selector(value)
+                selected = value if selector is None else selector(value)
             except Exception as exc:
+                node = slot.node
                 node.root.report(exc, f"a store selector in {node.name}")
                 continue
-            if not same(selected, slot.value):
+            before = slot.value
+            if selected is not before and not same(selected, before):
                 slot.value = selected
+                node = slot.node
                 node.root.schedule(node)
 
     def _watch(self, slot: _StoreSlot) -> None:
         with self._lock:
-            self._readers.setdefault(slot.node.root, set()).add(slot)
+            self._readers.setdefault(slot.node.root, {})[slot] = None
 
     def _unwatch(self, slot: _StoreSlot) -> None:
         with self._lock:
             readers = self._readers.get(slot.node.root)
             if readers is not None:
-                readers.discard(slot)
+                readers.pop(slot, None)
                 if not readers:
                     del self._readers[slot.node.root]
 
