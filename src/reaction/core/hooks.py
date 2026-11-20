@@ -570,7 +570,7 @@ def use(resource: Any) -> Any:
         def ready(_: Any) -> None:
             root.call(rerender)
 
-        resource.add_done_callback(ready)
+        root.when_done(resource, ready)
         raise Suspended(resource)
     if inspect.iscoroutine(resource):
         resource.close()
@@ -616,9 +616,9 @@ def cache(fn: Callable[..., T]) -> Callable[..., T]:
         if key not in store:
             if is_async:
                 coro: Any = fn(*args, **kwargs)
-                task: asyncio.Task[Any] = asyncio.get_running_loop().create_task(coro)
+                task: asyncio.Task[Any] = root.create_task(coro)
                 root.track(task)
-                root.signal.on_abort(task.cancel)  # the page closed: stop loading
+                root.signal.on_abort(lambda: root.cancel(task))  # the page closed: stop loading
                 store[key] = (True, task)
             else:
                 try:
@@ -690,8 +690,6 @@ def lazy(load: Callable[[], Any]) -> Any:
 
         Settings = lazy(lambda: importlib.import_module("app.settings").Settings)
     """
-    import asyncio
-
     from .element import Component
 
     state: dict[str, Any] = {}
@@ -702,7 +700,7 @@ def lazy(load: Callable[[], Any]) -> Any:
             if inspect.iscoroutinefunction(load):
                 task = state.get("task")
                 if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
-                    task = asyncio.ensure_future(load())
+                    task = _current().root.create_task(load())
                     state["task"] = task
                 target = use(task)
             else:
@@ -830,7 +828,7 @@ class _AsyncSlot:
         self.version += 1
         version = self.version
         if self.task is not None:
-            self.task.cancel()
+            self.node.root.cancel(self.task)
         self.loading = True
         self.error = None
         node = self.node
@@ -852,7 +850,7 @@ class _AsyncSlot:
     def dispose(self) -> None:
         self.version += 1
         if self.task is not None:
-            self.task.cancel()
+            self.node.root.cancel(self.task)
 
 
 def _async_slot(fn: Callable[[], Any], deps: Sequence[Any]) -> _AsyncSlot:

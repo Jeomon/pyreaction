@@ -242,8 +242,10 @@ vulnerability, see [SECURITY.md](https://github.com/Jeomon/pyreaction/blob/main/
   an input's text.
 - **Each open page holds state on the server.** Memory grows with open tabs, and a
   10,000-row page holds about 20 MB. Long lists should use `VirtualList`.
-- **Rendering runs on the server's event loop.** A very large page (10,000 rows)
-  takes about 80 ms to serve, during which other pages on that process wait.
+- **Rendering shares one interpreter.** A very large page (10,000 rows) takes about
+  85 ms to serve. Its first render runs in a worker thread, so other pages on that
+  process are held up for at most about 20 ms at a time rather than the whole
+  render; re-renders after an event still run on the event loop.
 - **Resuming after a drop needs the same process.** With several workers, route a
   page's connections to the worker that served it (sticky sessions).
 - **Before 1.0**, the API may still change between minor versions; see the

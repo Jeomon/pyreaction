@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import gc
 import heapq
 import inspect
@@ -635,6 +636,10 @@ class Root:
     first HTML): mounting then builds no create operations, which nothing would
     read, since a browser that connects gets a snapshot of the tree. They start
     with :meth:`attach`.
+
+    ``mount=False`` leaves the tree unrendered until :meth:`mount`, or
+    :meth:`mount_async`, which renders in a worker thread so a large page does not
+    hold up the other pages on the event loop.
     """
 
     def __init__(
@@ -648,6 +653,7 @@ class Root:
         on_error: Callable[[BaseException, str], None] | None = None,
         base: str = "",
         ops: bool = True,
+        mount: bool = True,
     ) -> None:
         self.container = HostNode(0, Element("#root"), None, None)
         self.hosts: dict[int, HostNode] = {}
@@ -748,9 +754,29 @@ class Root:
         # Set when this tree's HTML went to the browser unchanged (a handed-off GET
         # render): its first hydrate message can then leave out what the HTML holds.
         self._html_matches = False
+        # While mount_async renders in a worker thread: that thread, the loop it hops
+        # to for asyncio work, and updates from elsewhere held until it is done.
+        self._off_loop = False
+        self._render_thread: int | None = None
+        self._render_loop: asyncio.AbstractEventLoop | None = None
+        self._held: list[Callable[[], None]] = []
+        # Whether off_loop uses a worker thread (the server turns it off for pages it
+        # has seen render quickly), and the seconds off_loop's work has taken.
+        self.offload = True
+        self.render_time = 0.0
+        # The loop that serves this page and its thread, once known (off_loop or
+        # attach): closing from another thread cancels tasks through it.
+        self._home_loop: asyncio.AbstractEventLoop | None = None
+        self._home_thread: int | None = None
+        self._element = element
+        if mount:
+            self.mount()
+
+    def mount(self) -> None:
+        """Render the tree (the constructor does, unless given ``mount=False``)."""
         with _gc_paused():
             self.container.reshaped = True  # its order is computed whole below
-            self.container.children = self._reconcile(self.container, [], (element,))
+            self.container.children = self._reconcile(self.container, [], (self._element,))
             self.container.dom = self._dom_ids(self.container.children)
             self.container.reshaped = False
         # An error boundary that caught during the first render re-renders now,
@@ -758,6 +784,93 @@ class Root:
         self._render_dirty()
         self._report_profiles()
 
+    async def mount_async(self) -> None:
+        """:meth:`mount` in a worker thread when ``threaded``, so a large page (10,000
+        rows: about 70 ms) does not hold up the other pages on this event loop. React
+        yields to the browser every 5 ms while it renders; CPython hands the loop's
+        thread the interpreter every 5 ms (``sys.getswitchinterval``)."""
+        await self.off_loop(self.mount)
+
+    async def off_loop(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Run ``fn(*args)``, which renders or reads this tree, in a worker thread
+        (when ``threaded``), for a page that is not live yet. Asyncio work it starts
+        is handed to this loop (see :meth:`_loopside`), and updates that reach the
+        page meanwhile (a load that finished, a store that changed) wait until it
+        returns, so the tree never changes under it."""
+        assert self._sink is None, "only before the page is live"
+        loop = asyncio.get_running_loop()
+        self._home_loop, self._home_thread = loop, threading.get_ident()
+        if not (self.threaded and self.offload):
+            start = time.perf_counter()
+            try:
+                return fn(*args)
+            finally:
+                self.render_time += time.perf_counter() - start
+
+        def run() -> Any:
+            self._render_thread = threading.get_ident()
+            start = time.perf_counter()
+            try:
+                return fn(*args)
+            finally:
+                self.render_time += time.perf_counter() - start
+                self._render_thread = None
+
+        self._off_loop = True
+        self._render_loop = loop
+        work = asyncio.ensure_future(asyncio.to_thread(run))
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            # The request went away: the render must still finish before the page
+            # can be closed, or closing would unmount the tree under it.
+            await asyncio.wait([work])
+            raise
+        finally:
+            with self._from_threads_lock:
+                self._off_loop = False
+                held, self._held = self._held, []
+            self._render_loop = None
+            for update in held:
+                self.call(update)
+
+    def _loopside(self, fn: Callable[[], Any]) -> Any:
+        """``fn()``, on the event loop when called from :meth:`off_loop`'s thread (which
+        waits for it), so asyncio objects are only touched there. It runs in a copy
+        of the render's context, as a task created during the render would."""
+        if self._render_thread != threading.get_ident():
+            return fn()
+        loop = self._render_loop
+        assert loop is not None
+        context = contextvars.copy_context()
+        result: concurrent.futures.Future[Any] = concurrent.futures.Future()
+
+        def run() -> None:
+            try:
+                result.set_result(context.run(fn))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the waiting thread
+                result.set_exception(exc)
+
+        loop.call_soon_threadsafe(run)
+        return result.result()
+
+    def when_done(self, future: asyncio.Future[Any], fn: Callable[[Any], None]) -> None:
+        """``future.add_done_callback(fn)``, safe during :meth:`off_loop`."""
+        self._loopside(lambda: future.add_done_callback(fn))
+
+    def create_task(self, coro: Any) -> asyncio.Task[Any]:
+        """A task for ``coro`` on the page's event loop, also from :meth:`off_loop`."""
+        return self._loopside(lambda: asyncio.get_running_loop().create_task(coro))
+
+    def cancel(self, task: asyncio.Future[Any]) -> None:
+        """``task.cancel()`` from any thread: asyncio objects are not thread-safe, so
+        from off the page's loop (off_loop's render, or close() after a response,
+        which Starlette runs in a worker thread) it is handed to that loop."""
+        loop, thread = (self._loop, self._loop_thread) if self._loop is not None else (self._home_loop, self._home_thread)
+        if loop is not None and threading.get_ident() != thread and not loop.is_closed():
+            loop.call_soon_threadsafe(task.cancel)
+        else:
+            task.cancel()
     # ---- lifecycle -------------------------------------------------------------
 
     def attach(self, sink: Callable[[dict[str, Any]], None], hydrate: bool = False) -> None:
@@ -829,7 +942,7 @@ class Root:
         self.container.children = []
         self.ops = []  # operations never sent, e.g. a first-HTML render's
         for task in list(self._tasks):
-            task.cancel()
+            self.cancel(task)
         replies, self._replies = self._replies, {}
         for future in replies.values():
             if not future.done():
@@ -1015,6 +1128,11 @@ class Root:
 
     def call(self, fn: Callable[[], None]) -> None:
         """Run ``fn`` on this root's event loop; state setters go through here."""
+        if self._off_loop and threading.get_ident() != self._render_thread:
+            with self._from_threads_lock:
+                if self._off_loop:  # re-checked: off_loop may have just finished
+                    self._held.append(fn)
+                    return
         if self._loop is not None and threading.get_ident() != self._loop_thread:
             seq = getattr(_handling, "seq", None)
             if seq is not None:
@@ -1251,7 +1369,7 @@ class Root:
         """Count ``future`` as work the page is waiting for (see :meth:`settle`)."""
         if not future.done():
             self._pending.add(future)  # type: ignore[arg-type]
-            future.add_done_callback(self._pending.discard)
+            self.when_done(future, self._pending.discard)
 
     def add_resource(self, key: tuple[str, str], element: Element) -> None:
         def apply() -> None:
@@ -1444,10 +1562,14 @@ class Root:
 
     def spawn(self, coro: Any) -> asyncio.Task[Any]:
         """Run a coroutine as a task owned by this root, cancelled on close."""
-        task = asyncio.ensure_future(coro, loop=self._loop)
-        self._tasks.add(task)
-        task.add_done_callback(self._task_done)
-        return task
+
+        def start() -> asyncio.Task[Any]:
+            task = asyncio.ensure_future(coro, loop=self._loop)
+            self._tasks.add(task)
+            task.add_done_callback(self._task_done)
+            return task
+
+        return self._loopside(start)
 
     def _task_done(self, task: asyncio.Task[Any]) -> None:
         self._tasks.discard(task)
@@ -1469,7 +1591,7 @@ class Root:
         Outside any running loop (a plain unit test) a sync ``fn`` runs at once.
         """
         try:
-            running = self._loop or asyncio.get_running_loop()
+            running = self._loop or self._render_loop or asyncio.get_running_loop()
         except RuntimeError:
             running = None
         if running is None:
@@ -1502,12 +1624,14 @@ class Root:
             except Exception as exc:
                 result, error = None, exc
             if done is not None:
-                done(result, error)
+                # Through call: held while off_loop renders, so the tree it updates
+                # does not change under that render.
+                self.call(lambda: done(result, error))
             return result
 
         task = self.spawn(job())
         self._pending.add(task)
-        task.add_done_callback(self._pending.discard)
+        self.when_done(task, self._pending.discard)
         return task
 
     async def settle(self, timeout: float = 5.0, suspense: bool = True) -> bool:
@@ -1528,7 +1652,11 @@ class Root:
 
         while True:
             if self._dirty:
-                self._render_dirty() if self._sink is None else self.flush()
+                if self._sink is not None:
+                    self.flush()
+                else:
+                    # Data arrived: the page renders again, as large as its mount can be.
+                    await self.off_loop(self._render_dirty)
             if not waiting_on() and not queued():
                 await asyncio.sleep(0)  # done-callbacks and thread hand-offs land
                 if not self._dirty and not waiting_on() and not queued():
@@ -2185,7 +2313,7 @@ class Root:
                 elif boundary is not None:
                     if waiting.task is not None:
                         self._suspense_tasks.add(waiting.task)
-                        waiting.task.add_done_callback(self._suspense_tasks.discard)
+                        self.when_done(waiting.task, self._suspense_tasks.discard)
                     boundary.suspend(waiting.task)  # type: ignore[misc]
                 if node.children:
                     return

@@ -163,7 +163,7 @@ async def _stream_page(
                 break
             await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
             await asyncio.sleep(0)  # let the loaded data's state updates land
-            root._render_dirty()
+            await root.off_loop(root._render_dirty)  # as large as the page can be
             by_number = {n: node for node, n in boundaries.items()}
             ready = sorted(n for n in waiting if by_number[n].mounted and not by_number[n].waiting)
             done: set[Any] = set()
@@ -209,6 +209,12 @@ async def _stream_page(
 # The most a page's Link header may hold (React's default, maxHeadersLength): proxies
 # and servers limit header sizes, and the first few hints matter most.
 _LINK_HEADER_MAX = 2000
+
+# A first-HTML render that took at least this long (seconds) is done in a worker
+# thread the next time its path is requested: React's scheduler yields every 5 ms.
+_OFFLOAD_AFTER = 0.005
+# Paths whose render time is remembered, the most recently rendered kept.
+_RENDER_COSTS_MAX = 1000
 
 
 def _link_url(url: str) -> str | None:
@@ -613,11 +619,29 @@ def create_app(
             if on_error is not None:
                 on_error(exc, where, root.connection)
 
+        # Not mounted yet: the caller renders it with mount_async, off the event loop.
+        # (Built first, so an error in that render reaches on_error with this root.)
         root = Root(
             make(), location=url, connection=connection, debug=debug, threaded=threaded, on_error=report, base=base,
             ops=False,  # a browser that connects gets a snapshot, not the mount's operations
+            mount=False,
         )
         return root
+
+    # How long each path's last first-HTML render took (seconds), so one known to be
+    # quick renders on the loop: a worker thread costs about 0.2 ms per page, worth
+    # it only for renders longer than React's 5 ms slice. A path not seen yet renders
+    # in a thread, as it may be large.
+    render_costs: dict[str, float] = {}
+
+    def plan_render(root: Root, path: str) -> None:
+        root.offload = render_costs.get(path, _OFFLOAD_AFTER) >= _OFFLOAD_AFTER
+
+    def note_render(root: Root, path: str) -> None:
+        render_costs.pop(path, None)
+        render_costs[path] = root.render_time
+        if len(render_costs) > _RENDER_COSTS_MAX:
+            del render_costs[next(iter(render_costs))]  # the least recently rendered
 
     # Pages whose connection dropped, kept for a reconnect: id -> (root, expiry timer).
     parked: dict[str, tuple[Root, asyncio.TimerHandle]] = {}
@@ -726,6 +750,8 @@ def create_app(
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + data_timeout
+            plan_render(root, path)
+            await root.mount_async()
             # With streaming, data a Suspense boundary waits for is sent later.
             if not await root.settle(data_timeout, suspense=not stream):
                 logger.warning("Rendering %s before its data loaded (data_timeout=%ss)", url, data_timeout)
@@ -738,10 +764,15 @@ def create_app(
                 )
             boundaries: dict[Any, int] = {}
             images: list[Any] = []
-            body = render_to_string(root, boundaries if stream else None, images)
+
+            def html() -> tuple[str, str]:
+                body = render_to_string(root, boundaries if stream else None, images)
+                return body, render_portals(root, boundaries if stream else None)
+
+            body, portals = await root.off_loop(html)
+            note_render(root, path)
             for key, link in image_preloads(images):
                 root.add_resource(key, link)
-            portals = render_portals(root, boundaries if stream else None)
             page_title = root.title if root.title is not None else title
             head_parts = root.head_parts()
             head_tags = "".join(head_parts)
@@ -875,6 +906,8 @@ def create_app(
                 root.attach(send, hydrate=ws.query_params.get("h") == "1")
             else:
                 root = new_root(url, ws, base)
+                plan_render(root, url.partition("?")[0])
+                await root.mount_async()
                 # Load data as the page's HTML did, so this render matches it and the
                 # browser can adopt the HTML instead of rebuilding it.
                 await root.settle(data_timeout)

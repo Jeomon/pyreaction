@@ -3,7 +3,9 @@
 What happens between the first request and a live, updating page.
 
 1. A GET renders the component tree at the requested URL, waits for its data, and
-   returns the HTML. The `<head>` preloads the client script and the page's first
+   returns the HTML. The render runs in a worker thread, so a large page does not
+   hold up the other pages on the event loop (a path that rendered in under 5 ms
+   last time stays on the loop, where it is quicker). The `<head>` preloads the client script and the page's first
    images, and a `Link` header lists the same hints for CDNs that send 103 Early
    Hints. Content waiting in a `Suspense` boundary is streamed into the same
    response when ready, with any stylesheet it needs: the content shows once that

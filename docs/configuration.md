@@ -24,7 +24,7 @@ variables. Code wins over `[tool.pyreaction]`, which wins over the environment.
 | `max_pending_ops` | `100000` | `PYREACTION_MAX_PENDING_OPS` | updates a slow browser may fall behind (queued behind the one being sent, which goes however large) before it starts over |
 | `data_timeout` | `5.0` | `PYREACTION_DATA_TIMEOUT` | seconds the first HTML waits for data |
 | `stream` | `True` | `PYREACTION_STREAM` | stream Suspense content into the first response |
-| `threaded` | `True` | `PYREACTION_THREADED` | run plain handlers and effects in worker threads |
+| `threaded` | `True` | `PYREACTION_THREADED` | run plain handlers, effects and the first render of a page in worker threads |
 | `reconnect_max` | `8000` | `PYREACTION_RECONNECT_MAX` | longest delay between reconnect attempts, in ms |
 | `reconnect_attempts` | `0` (no limit) | `PYREACTION_RECONNECT_ATTEMPTS` | failed attempts in a row before the page gives up |
 | `resume_timeout` | `30.0` | `PYREACTION_RESUME_TIMEOUT` | seconds a dropped page's state is kept for a reconnect |

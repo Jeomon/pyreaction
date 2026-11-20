@@ -7,6 +7,20 @@ between minor versions.
 
 ## [Unreleased]
 
+### Changed
+
+- A page's first render (and its HTML) runs in a worker thread when `threaded`, so
+  a large page no longer holds up the other pages on the event loop: while a
+  10,000-row page renders, the loop's longest pause drops from about 67 ms to
+  about 19 ms. A path that rendered in under 5 ms last time stays on the loop.
+  Components may now render in a thread other than the event loop's; asyncio work
+  they start (`cache`, `use`, `use_data`, `lazy`) is handed to the loop.
+
+### Fixed
+
+- An error in a page's first render made `on_error` itself fail (`NameError`), so
+  the handler never saw it.
+
 ## [0.1.0] - 2026-11-20
 
 The first public version.

@@ -258,7 +258,7 @@ def Suspense(*children: Any, fallback: Any = None) -> Any:
         if task is None or task.done():
             set_waiting(lambda n: n - 1)
         else:
-            task.add_done_callback(lambda _: set_waiting(lambda n: n - 1))
+            node.root.when_done(task, lambda _: set_waiting(lambda n: n - 1))
 
     node.suspend = suspend
     hidden = waiting > 0
