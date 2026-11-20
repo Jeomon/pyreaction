@@ -25,6 +25,9 @@ between minor versions.
 
 ### Fixed
 
+- A ref's `focus()` or `blur()` called from an event handler did nothing: the
+  browser put the focus back where it was before the update (a regression in
+  0.1.0, from keeping the focus when a list reorders).
 - An error in a page's first render made `on_error` itself fail (`NameError`), so
   the handler never saw it.
 

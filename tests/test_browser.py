@@ -1144,3 +1144,30 @@ def test_a_streamed_page_opens_its_socket_before_the_stream_ends_in_chrome(page)
         assert page.text_content("#slow") == "loaded" and loads == [1], "the data loaded once"
         page.click("#inc")
         page.wait_for_function("document.querySelector('#inc').textContent === 'n=1'")
+
+
+def test_a_refs_focus_from_a_handler_moves_the_focus_in_chrome(page):
+    """Keeping the focus across a message (for moves) must not undo a focus the
+    server asked for: clicking a button that calls box.current.focus() leaves the
+    focus in the box, and on_focus sees it, as in React."""
+    from reaction import use_ref
+
+    focused = []
+
+    @component
+    def App():
+        box = use_ref()
+        return html.div(
+            html.input(id="box", ref=box, on_focus=lambda: focused.append(1)),
+            html.button("focus", id="go", on_click=lambda: box.current.focus()),
+            html.button("blur", id="away", on_click=lambda: box.current.blur()),
+        )
+
+    with serve(App) as server:
+        open_page(page, server)
+        page.click("#go")
+        page.wait_for_function("document.activeElement.id === 'box'", timeout=2000)
+        page.wait_for_timeout(100)
+        assert focused, "the focus event reached the server"
+        page.eval_on_selector("#away", "e => e.click()")  # a click that leaves the focus in the box
+        page.wait_for_function("document.activeElement.id !== 'box'", timeout=2000)

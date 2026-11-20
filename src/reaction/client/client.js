@@ -238,6 +238,9 @@
   // client moved the focused element are not the person's (React turns its event
   // system off during a commit).
   let applying = false;
+  // Set when a message called an element method (a ref's focus()): the focus that
+  // call left is kept, instead of the one from before the message.
+  let focusAfterCall = null;
   const FOCUS_EVENTS = new Set(["focus", "blur", "focusin", "focusout"]);
 
   function dispatchFromRoot(e, root, name, capture) {
@@ -602,9 +605,21 @@
         case "e":
           listen(nodes.get(op[1]), op[2], op[3]);
           break;
-        case "m":
-          callElement(nodes.get(op[1]), op[2], op[3], op[4]);
+        case "m": {
+          // A method the server called on purpose (a ref's focus() or blur()): its
+          // focus events are the page's own, and the focus it leaves is the one to
+          // keep after this message, not the one from before it.
+          const before = document.activeElement;
+          const was = applying;
+          applying = false;
+          try {
+            callElement(nodes.get(op[1]), op[2], op[3], op[4]);
+          } finally {
+            applying = was;
+          }
+          if (document.activeElement !== before) focusAfterCall = document.activeElement;
           break;
+        }
       }
     }
   }
@@ -995,11 +1010,14 @@
         }
       } catch (_) {} // selectionStart throws on some input types
       applying = true;
+      focusAfterCall = null;
       try {
         handleMessage(data);
       } finally {
         applying = false;
-        if (focused && focused !== document.body && focused.isConnected && document.activeElement !== focused) {
+        const called = focusAfterCall !== null;
+        focusAfterCall = null;
+        if (!called && focused && focused !== document.body && focused.isConnected && document.activeElement !== focused) {
           focused.focus({ preventScroll: true });
           if (range) {
             try {
