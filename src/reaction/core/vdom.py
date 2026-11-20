@@ -120,10 +120,30 @@ class TextNode:
         self.parent = parent
 
 
+class _HostExtra:
+    """What few hosts need: a ref, the cleanup its callback returned, and a JS
+    component's fallback. Kept apart so the many hosts without them pay nothing."""
+
+    __slots__ = ("cleanup", "fallback", "ref")
+
+    def __init__(self) -> None:
+        self.ref: Any = None
+        self.cleanup: Callable[[], Any] | None = None
+        self.fallback: Any = None
+
+
+# Numbers that tell elements apart (Element._serial): unique in the process, so a
+# host can recognise the element it last took without keeping it alive.
+_serials = itertools.count(1)
+
+
 class HostNode:
+    # No reference to the element it was made from: on a large page those elements
+    # (with their children tuples) were a fifth of the memory. ``serial`` recognises
+    # an unchanged element; attrs, events, text and children are kept as they were.
     __slots__ = (
-        "id", "type", "key", "parent", "element", "attrs", "events", "children", "dom", "depth", "ns",
-        "ref_cleanup", "text", "reshaped",
+        "id", "type", "key", "parent", "serial", "attrs", "events", "children", "dom", "depth", "ns",
+        "extra", "text", "reshaped",
     )
     memo = False
 
@@ -132,10 +152,18 @@ class HostNode:
         self.type = element.type
         self.key = key
         self.parent = parent
-        self.element = element
+        serial = element._serial
+        if not serial:
+            serial = element._serial = next(_serials)
+        self.serial = serial
         self.attrs = element.attrs
         self.events = element.events
-        self.ref_cleanup: Callable[[], Any] | None = None
+        self.extra: _HostExtra | None = None
+        if type(self.type) is JsComponent:
+            fallback = element.kwargs.get("fallback")
+            if fallback is not None:
+                self.extra = _HostExtra()
+                self.extra.fallback = fallback
         self.children: Any = ()  # a list once it has child nodes
         self.dom: Any = ()
         self.depth = parent.depth + 1 if parent is not None else 0
@@ -2177,8 +2205,8 @@ class Root:
                 self.ops.append(["x", node.id, item])
             return
         if isinstance(node, HostNode):
-            if node.element is item:
-                return
+            if node.serial == item._serial:
+                return  # the element it was made from or last diffed against
             self._diff_host(node, item)
             return
         if not node.dirty:
@@ -2197,7 +2225,10 @@ class Root:
             if old_attrs != new_attrs:
                 ops.append(["J", node.id, new_attrs])
             self._swap_ref(node, item)
-            node.element = item
+            self._took(node, item)
+            fallback = item.kwargs.get("fallback")
+            if fallback is not None or node.extra is not None:
+                self._extra(node).fallback = fallback
             node.attrs = new_attrs
             node.events = item.events
             node.children = self._reconcile(node, node.children, item.children)
@@ -2227,7 +2258,7 @@ class Root:
             for name in old_events.keys() - new_events.keys():
                 ops.append(["e", node.id, name, None])
         self._swap_ref(node, item)
-        node.element = item
+        self._took(node, item)
         node.attrs = new_attrs
         node.events = new_events
         text = _only_text(item)
@@ -2430,6 +2461,8 @@ class Root:
         is called with it, and may return a cleanup for when it is detached."""
         if ref is None:
             return
+        extra = self._extra(node)
+        extra.ref = ref
         handle = ElementHandle(self, node.id)
         if hasattr(ref, "current"):
             ref.current = handle
@@ -2439,32 +2472,51 @@ class Root:
         except Exception as exc:
             self.report(exc, "a callback ref")
             return
-        node.ref_cleanup = result if callable(result) else None
+        extra.cleanup = result if callable(result) else None
 
     def _release_ref(self, node: HostNode) -> None:
-        ref = node.element.ref
+        extra = node.extra
+        ref = extra.ref if extra is not None else None
         if ref is None:
             return
+        extra.ref = None  # type: ignore[union-attr]
         if hasattr(ref, "current"):
             if isinstance(ref.current, ElementHandle) and ref.current.id == node.id:
                 ref.current = None
             return
         # A callback ref: its cleanup if it returned one, else it is called with None.
-        cleanup, node.ref_cleanup = node.ref_cleanup, None
+        cleanup, extra.cleanup = extra.cleanup, None  # type: ignore[union-attr]
         try:
             cleanup() if cleanup is not None else ref(None)
         except Exception as exc:
             self.report(exc, "a callback ref")
 
     def _swap_ref(self, node: HostNode, item: Element) -> None:
-        if node.element.ref is not item.ref:
+        extra = node.extra
+        if (extra.ref if extra is not None else None) is not item.ref:
             self._release_ref(node)
             self._attach_ref(node, item.ref)
 
     @staticmethod
+    def _extra(node: HostNode) -> _HostExtra:
+        extra = node.extra
+        if extra is None:
+            extra = node.extra = _HostExtra()
+        return extra
+
+    @staticmethod
+    def _took(node: HostNode, item: Element) -> None:
+        """``node`` now matches ``item``: an unchanged ``item`` next time is skipped."""
+        serial = item._serial
+        if not serial:
+            serial = item._serial = next(_serials)
+        node.serial = serial
+
+    @staticmethod
     def _js_create(host: HostNode) -> list[Any]:
         js: JsComponent = host.type
-        return ["j", host.id, js.tag, js.module, js.export, host.attrs, host.element.kwargs.get("fallback")]
+        fallback = host.extra.fallback if host.extra is not None else None
+        return ["j", host.id, js.tag, js.module, js.export, host.attrs, fallback]
 
     @staticmethod
     def _create_op(host: HostNode) -> list[Any]:
@@ -2502,7 +2554,7 @@ class Root:
         node.reshaped = False
         if node.type == PORTAL:
             self.portals -= 1
-        if node.element.ref is not None:
+        if node.extra is not None and node.extra.ref is not None:
             self._release_ref(node)
         children = node.children
         if children:
@@ -2639,6 +2691,20 @@ def to_vdom(target: Root | Element) -> dict[str, Any]:
             root.close()
 
 
+def _element_key(key: Any) -> Any:
+    """The key an element was given, from the scoped key its node has (see
+    _flatten_items): ``k``, or ``("$", k)`` for a tuple ``k``, among an element's own
+    arguments; ``(prefix, "$", k)`` inside a list. Unkeyed children have positions,
+    ``("#", i)`` or a tuple of indexes, so they read as None."""
+    if type(key) is not tuple:
+        return key
+    if len(key) == 2 and key[0] == "$":
+        return key[1]
+    if len(key) == 3 and key[1] == "$":
+        return key[2]
+    return None
+
+
 def _children(nodes: list[Any]) -> list[Any]:
     out: list[Any] = []
     for node in nodes:
@@ -2673,8 +2739,9 @@ def _host(node: HostNode) -> dict[str, Any]:
             out["attributes"] = attrs
         if RAW_HTML in node.attrs:
             out["dangerouslySetInnerHTML"] = {"__html": node.attrs[RAW_HTML]}
-    if node.element.key is not None:
-        out["key"] = node.element.key
+    key = _element_key(node.key)
+    if key is not None:
+        out["key"] = key
     if node.events:
         out["eventHandlers"] = {
             name: {k: v for k, v in zip(_SPEC_NAMES, handler.spec()) if v not in (None, False)}

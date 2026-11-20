@@ -16,6 +16,13 @@ between minor versions.
   Components may now render in a thread other than the event loop's; asyncio work
   they start (`cache`, `use`, `use_data`, `lazy`) is handed to the loop.
 
+### Performance
+
+- A mounted page no longer keeps the elements it rendered: each HTML node keeps
+  its attributes, events and children, and a serial number to recognise an
+  unchanged element. A 10,000-row page holds about 16.2 MB on the server, from
+  19.9 MB; update times are unchanged.
+
 ### Fixed
 
 - An error in a page's first render made `on_error` itself fail (`NameError`), so

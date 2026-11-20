@@ -320,7 +320,7 @@ def _host(node: HostNode, out: list[str], boundaries: dict[Any, int] | None = No
         # the fallback; Python children sit in a slot the module places later.
         tag = node.type.tag
         out.append(f"<{tag}>")
-        fallback = node.element.kwargs.get("fallback")
+        fallback = node.extra.fallback if node.extra is not None else None
         if static:
             out.append(str(fallback or ""))
             _children(node.children, out, raw=False, static=True)

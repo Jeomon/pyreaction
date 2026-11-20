@@ -225,7 +225,9 @@ _EMPTY: dict[str, Any] = _EmptyDict()
 class Element:
     """One node of a description tree: a DOM tag, a component call, or a fragment."""
 
-    __slots__ = ("type", "key", "attrs", "events", "children", "args", "kwargs", "ref")
+    # _serial: 0, or the number a mounted node took from this element, so the node can
+    # tell this element again (an unchanged child is skipped) without keeping it.
+    __slots__ = ("type", "key", "attrs", "events", "children", "args", "kwargs", "ref", "_serial")
 
     def __init__(
         self,
@@ -246,6 +248,7 @@ class Element:
         self.args = args
         self.kwargs = kwargs if kwargs else _EMPTY
         self.ref = ref
+        self._serial = 0
 
     def __eq__(self, other: object) -> bool:
         if self is other:

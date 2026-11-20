@@ -19,6 +19,7 @@ from reaction import (
     use_ref,
     use_state,
 )
+from reaction.core.ssr import render_children
 
 from .fakedom import FakeDom, tree_html
 
@@ -54,7 +55,7 @@ class Harness:
 
     def find(self, tag, text=None):
         for node_id, host in self.root.hosts.items():
-            if host.type == tag and (text is None or text in render_to_string(host.element)):
+            if host.type == tag and (text is None or text in render_children([host], {})):
                 return node_id
         raise LookupError(tag)
 
@@ -910,3 +911,45 @@ def test_a_render_made_before_any_browser_records_no_ops_until_attached():
         return dom.html()
 
     assert asyncio.run(live()) == "<ul><li><b>3</b> row</li><li><b>4</b> row</li><li><b>1</b> row</li><p>end</p></ul>"
+
+
+# ---- what a mounted page keeps -----------------------------------------------------
+
+
+def test_a_mounted_page_does_not_keep_the_elements_it_rendered():
+    """Hosts keep their attributes, events and children, not the element they came
+    from: on a large page those elements were a fifth of the server's memory."""
+    import gc
+
+    from reaction.core.element import Element
+
+    @component
+    def App():
+        return html.ul([html.li(f"item {i}", class_name="row", key=i) for i in range(500)])
+
+    root = Root(App())
+    gc.collect()
+    alive = sum(1 for o in gc.get_objects() if type(o) is Element and o.type == "li")
+    assert alive == 0
+    assert render_to_string(root).count('<li class="row">') == 500
+    root.close()
+
+
+def test_an_element_reused_in_several_places_is_still_diffed_where_it_changed():
+    shared = html.b("same")
+    setters = {}
+
+    @component
+    def App():
+        flip, set_flip = use_state(False)
+        setters["flip"] = set_flip
+        return html.div(html.p(shared), html.p(html.i("other") if flip else shared), html.p(shared))
+
+    h = Harness(App())
+    assert h.html() == "<div><p><b>same</b></p><p><b>same</b></p><p><b>same</b></p></div>"
+    setters["flip"](True)
+    h.flush()
+    assert h.html() == "<div><p><b>same</b></p><p><i>other</i></p><p><b>same</b></p></div>"
+    setters["flip"](False)
+    h.flush()
+    assert h.html() == "<div><p><b>same</b></p><p><b>same</b></p><p><b>same</b></p></div>"

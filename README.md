@@ -241,7 +241,7 @@ vulnerability, see [SECURITY.md](https://github.com/Jeomon/pyreaction/blob/main/
   follows the network; use `js()` for what must react instantly, such as selecting
   an input's text.
 - **Each open page holds state on the server.** Memory grows with open tabs, and a
-  10,000-row page holds about 20 MB. Long lists should use `VirtualList`.
+  10,000-row page holds about 16 MB. Long lists should use `VirtualList`.
 - **Rendering shares one interpreter.** A very large page (10,000 rows) takes about
   85 ms to serve. Its first render runs in a worker thread, so other pages on that
   process are held up for at most about 20 ms at a time rather than the whole
